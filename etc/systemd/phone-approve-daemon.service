@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 User=phonefprint
-ExecStart=/usr/local/libexec/phone-approve-daemon -addr :8766 -base-url http://localhost:8766
+ExecStart=/usr/local/libexec/phone-approve-daemon -addr :8766
 Restart=on-failure
 
 [Install]

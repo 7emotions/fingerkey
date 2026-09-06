@@ -91,6 +91,11 @@ func pair(name, pubkeyB64 string) error {
 	if err := os.MkdirAll(keysDir, 0700); err != nil {
 		return err
 	}
+	// MkdirAll also creates missing parents with the same 0700 mode; the
+	// parent /var/lib/phone-fprint-auth must be world-traversable (0755) so
+	// the daemon, running as phonefprint, can reach the keys dir. The keys
+	// dir itself stays 0700.
+	_ = os.Chmod(filepath.Dir(keysDir), 0755)
 	if ok {
 		if err := os.Chown(keysDir, uid, gid); err != nil {
 			return fmt.Errorf("chown %s: %v", keysDir, err)

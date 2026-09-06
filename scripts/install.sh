@@ -21,10 +21,34 @@ HELPER_BIN="/usr/local/libexec/phone-approve-t0"
 PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_phone_approve.so"
 UNIT_SRC="etc/systemd/phone-approve-daemon.service"
 UNIT_DST="/etc/systemd/system/phone-approve-daemon.service"
+KEYS_PARENT="/var/lib/phone-fprint-auth"
 KEYS_DIR="/var/lib/phone-fprint-auth/keys"
 DAEMON_USER="phonefprint"
-PAM_FILE="/etc/pam.d/sudo"
 PAM_LINE="auth sufficient pam_phone_approve.so"
+
+# wire_pam_file inserts the approval module line into a PAM service file
+# as the FIRST auth line, above @include common-auth. Idempotent.
+wire_pam_file() {
+    local file="$1"
+    local backup
+
+    if grep -q 'pam_phone_approve.so' "${file}"; then
+        echo "pam: '${PAM_LINE}' already present in ${file} — skipping"
+        return 0
+    fi
+    backup="${file}.orig-$(date +%s)"
+    if [[ ! -e "${backup}" ]]; then
+        cp -p "${file}" "${backup}"
+        echo "pam: backed up ${file} -> ${backup}"
+    fi
+    # Insert as the FIRST auth line, above @include common-auth.
+    sed -i "/^@include[[:space:]]\\+common-auth\$/i ${PAM_LINE}" "${file}"
+    if ! grep -q 'pam_phone_approve.so' "${file}"; then
+        echo "error: failed to insert '${PAM_LINE}' into ${file}" >&2
+        exit 1
+    fi
+    echo "pam: inserted '${PAM_LINE}' into ${file}"
+}
 
 echo "== build =="
 mkdir -p /usr/local/libexec
@@ -45,6 +69,8 @@ else
 fi
 
 echo "== key store dir =="
+install -d -m 0755 "${KEYS_PARENT}"
+echo "ensured ${KEYS_PARENT} (0755, traversable by ${DAEMON_USER})"
 install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${KEYS_DIR}"
 echo "ensured ${KEYS_DIR} (${DAEMON_USER} 0700)"
 
@@ -59,23 +85,9 @@ systemctl daemon-reload
 systemctl enable --now phone-approve-daemon
 echo "enabled + started phone-approve-daemon"
 
-echo "== PAM wiring (${PAM_FILE}) =="
-if grep -q 'pam_phone_approve.so' "${PAM_FILE}"; then
-    echo "pam: '${PAM_LINE}' already present in ${PAM_FILE} — skipping"
-else
-    backup="${PAM_FILE}.orig-$(date +%s)"
-    if [[ ! -e "${backup}" ]]; then
-        cp -p "${PAM_FILE}" "${backup}"
-        echo "pam: backed up ${PAM_FILE} -> ${backup}"
-    fi
-    # Insert as the FIRST auth line, above @include common-auth.
-    sed -i "/^@include[[:space:]]\\+common-auth\\$/i ${PAM_LINE}" "${PAM_FILE}"
-    if ! grep -q 'pam_phone_approve.so' "${PAM_FILE}"; then
-        echo "error: failed to insert '${PAM_LINE}' into ${PAM_FILE}" >&2
-        exit 1
-    fi
-    echo "pam: inserted '${PAM_LINE}' into ${PAM_FILE}"
-fi
+echo "== PAM wiring =="
+wire_pam_file /etc/pam.d/sudo
+wire_pam_file /etc/pam.d/polkit-1
 
 echo
 echo "== install complete =="
@@ -83,5 +95,5 @@ echo "  daemon:   ${DAEMON_BIN} (running as ${DAEMON_USER})"
 echo "  helper:   ${HELPER_BIN}"
 echo "  module:   ${PAM_MODULE}"
 echo "  unit:     ${UNIT_DST} (enabled + started)"
-echo "  key dir:  ${KEYS_DIR} (${DAEMON_USER} 0700)"
-echo "  pam:      ${PAM_FILE} -> ${PAM_LINE} above @include common-auth"
+echo "  key dir:  ${KEYS_DIR} (${DAEMON_USER} 0700; parent ${KEYS_PARENT} 0755)"
+echo "  pam:      /etc/pam.d/sudo + /etc/pam.d/polkit-1 -> ${PAM_LINE} above @include common-auth"
