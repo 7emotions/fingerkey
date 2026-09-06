@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -98,6 +100,25 @@ func TestApproveOnceOnly(t *testing.T) {
 	}
 }
 
+func TestDecideDeny(t *testing.T) {
+	st := NewStore()
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	ok, found := st.Decide(s.ID, StatusDenied)
+	if !found || !ok {
+		t.Fatal("Decide(deny) should succeed on a pending session")
+	}
+	if s.Status != StatusDenied {
+		t.Fatalf("status = %q, want %q", s.Status, StatusDenied)
+	}
+	// deny is also once-only
+	if ok, found := st.Decide(s.ID, StatusDenied); found && ok {
+		t.Fatal("second Decide must not succeed (once-only)")
+	}
+}
+
 func TestUnknownSession(t *testing.T) {
 	st := NewStore()
 	if _, ok := st.Get("deadbeef"); ok {
@@ -110,10 +131,26 @@ func TestUnknownSession(t *testing.T) {
 
 // ---- HTTP handler tests ----
 
-func newTestServer(t *testing.T) (*httptest.Server, *Store) {
+// newTestServer starts a handler wired with one freshly generated paired key
+// and returns the server, its store, and the private key for signing requests.
+func newTestServer(t *testing.T) (*httptest.Server, *Store, ed25519.PrivateKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	st := NewStore()
+	ts := httptest.NewServer(newHandler(st, []ed25519.PublicKey{pub}))
+	t.Cleanup(ts.Close)
+	return ts, st, priv
+}
+
+// newTestServerNoKeys starts a handler with NO paired keys (empty keys dir
+// case): every /decision must be 401.
+func newTestServerNoKeys(t *testing.T) (*httptest.Server, *Store) {
 	t.Helper()
 	st := NewStore()
-	ts := httptest.NewServer(newHandler(st, "http://localhost:8766"))
+	ts := httptest.NewServer(newHandler(st, nil))
 	t.Cleanup(ts.Close)
 	return ts, st
 }
@@ -138,7 +175,7 @@ func decodeJSON(t *testing.T, resp *http.Response) map[string]interface{} {
 }
 
 func TestHealthz(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	resp, err := http.Get(ts.URL + "/healthz")
 	if err != nil {
 		t.Fatalf("GET /healthz: %v", err)
@@ -154,7 +191,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestHandlerCreateSession(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	resp := postJSON(t, ts.URL+"/v1/session", `{"user":"alice","service":"sudo","tty":"/dev/pts/0"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -172,26 +209,25 @@ func TestHandlerCreateSession(t *testing.T) {
 	if len(nonce) != 32 {
 		t.Errorf("nonce decodes to %d bytes, want 32", len(nonce))
 	}
-	want := "http://localhost:8766/approve/" + id
-	if m["approve_url"] != want {
-		t.Errorf("approve_url = %v, want %q", m["approve_url"], want)
+	if _, has := m["approve_url"]; has {
+		t.Errorf("approve_url must be gone from the signed-protocol response: %v", m)
 	}
 }
 
 func TestHandlerCreateSessionDefaults(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	resp := postJSON(t, ts.URL+"/v1/session", "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	m := decodeJSON(t, resp)
-	if m["id"] == nil || m["nonce"] == nil || m["approve_url"] == nil {
+	if m["id"] == nil || m["nonce"] == nil {
 		t.Errorf("missing fields in response: %v", m)
 	}
 }
 
 func TestHandlerGetSession(t *testing.T) {
-	ts, st := newTestServer(t)
+	ts, st, _ := newTestServer(t)
 	s, err := st.Create("alice", "sudo", "/dev/pts/0")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -209,7 +245,7 @@ func TestHandlerGetSession(t *testing.T) {
 }
 
 func TestHandlerGetUnknownSession(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	resp, err := http.Get(ts.URL + "/v1/session/doesnotexist")
 	if err != nil {
 		t.Fatalf("GET: %v", err)
@@ -220,13 +256,30 @@ func TestHandlerGetUnknownSession(t *testing.T) {
 	}
 }
 
-func TestHandlerApprove(t *testing.T) {
-	ts, st := newTestServer(t)
+// The T0 unsigned approve endpoint must be GONE.
+func TestHandlerNoUnsignedApprove(t *testing.T) {
+	ts, st, _ := newTestServer(t)
 	s, err := st.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/approve", "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("POST /v1/session/{id}/approve status = %d, want 404 (endpoint removed)", resp.StatusCode)
+	}
+}
+
+func decisionBody(priv ed25519.PrivateKey, action string, s *Session) string {
+	return `{"decision":"` + action + `","sig":"` + signDecision(priv, action, s) + `"}`
+}
+
+func TestHandlerDecisionApprove(t *testing.T) {
+	ts, st, priv := newTestServer(t)
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", decisionBody(priv, "approve", s))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -236,24 +289,131 @@ func TestHandlerApprove(t *testing.T) {
 	}
 }
 
-func TestHandlerApproveTwice(t *testing.T) {
-	ts, st := newTestServer(t)
+func TestHandlerDecisionDeny(t *testing.T) {
+	ts, st, priv := newTestServer(t)
 	s, err := st.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	postJSON(t, ts.URL+"/v1/session/"+s.ID+"/approve", "")
-	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/approve", "")
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("second approve status = %d, want 409", resp.StatusCode)
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", decisionBody(priv, "deny", s))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	m := decodeJSON(t, resp)
+	if m["status"] != StatusDenied {
+		t.Errorf("body = %v, want status %q", m, StatusDenied)
+	}
+	if s.Status != StatusDenied {
+		t.Errorf("session status = %q, want %q", s.Status, StatusDenied)
 	}
 }
 
-func TestHandlerApproveUnknown(t *testing.T) {
-	ts, _ := newTestServer(t)
-	resp := postJSON(t, ts.URL+"/v1/session/doesnotexist/approve", "")
+// Replay: once decided, a second /decision — even with the valid signature —
+// is a conflict.
+func TestHandlerDecisionTwice(t *testing.T) {
+	ts, st, priv := newTestServer(t)
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", decisionBody(priv, "approve", s))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first decision status = %d, want 200", resp.StatusCode)
+	}
+	resp = postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", decisionBody(priv, "approve", s))
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second decision status = %d, want 409", resp.StatusCode)
+	}
+}
+
+func TestHandlerDecisionUnknown(t *testing.T) {
+	ts, _, priv := newTestServer(t)
+	s := &Session{Nonce: make([]byte, 32), User: "x", Service: "y", TTY: ""}
+	resp := postJSON(t, ts.URL+"/v1/session/doesnotexist/decision", decisionBody(priv, "approve", s))
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestHandlerDecisionWrongKey(t *testing.T) {
+	ts, st, _ := newTestServer(t)
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, otherPriv := newKey(t) // unpaired key
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", decisionBody(otherPriv, "approve", s))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	if s.Status != StatusPending {
+		t.Fatalf("session status = %q, want %q (unchanged)", s.Status, StatusPending)
+	}
+}
+
+func TestHandlerDecisionNoKeys(t *testing.T) {
+	ts, st := newTestServerNoKeys(t)
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, priv := newKey(t) // signature from a valid key, but nothing is paired
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", decisionBody(priv, "approve", s))
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (no paired keys)", resp.StatusCode)
+	}
+}
+
+func TestHandlerDecisionMissingSig(t *testing.T) {
+	ts, st, _ := newTestServer(t)
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", `{"decision":"approve"}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestHandlerDecisionGarbageSig(t *testing.T) {
+	ts, st, _ := newTestServer(t)
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", `{"decision":"approve","sig":"!!!not-base64!!!"}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestHandlerDecisionBadDecision(t *testing.T) {
+	ts, st, _ := newTestServer(t)
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", `{"decision":"maybe","sig":""}`)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestHandlerDecisionExpired(t *testing.T) {
+	old := sessionTTL
+	sessionTTL = 20 * time.Millisecond
+	defer func() { sessionTTL = old }()
+
+	ts, st, priv := newTestServer(t)
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision", decisionBody(priv, "approve", s))
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (expired session cannot be decided)", resp.StatusCode)
 	}
 }
 
@@ -262,7 +422,7 @@ func TestHandlerSessionExpiredStatus(t *testing.T) {
 	sessionTTL = 20 * time.Millisecond
 	defer func() { sessionTTL = old }()
 
-	ts, st := newTestServer(t)
+	ts, st, _ := newTestServer(t)
 	s, err := st.Create("alice", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -280,7 +440,7 @@ func TestHandlerSessionExpiredStatus(t *testing.T) {
 }
 
 func TestHandlerRateLimit(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, _, _ := newTestServer(t)
 	last := 0
 	for i := 0; i < 15; i++ {
 		resp := postJSON(t, ts.URL+"/v1/session", `{}`)
@@ -288,5 +448,106 @@ func TestHandlerRateLimit(t *testing.T) {
 	}
 	if last != http.StatusTooManyRequests {
 		t.Fatalf("status after limit exceeded = %d, want 429", last)
+	}
+}
+
+// ---- /v1/pending long-poll tests ----
+
+func TestHandlerPendingReturnsNewSession(t *testing.T) {
+	ts, st, _ := newTestServer(t)
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		resp, err := http.Get(ts.URL + "/v1/pending?wait=5")
+		ch <- result{resp, err}
+	}()
+
+	// Give the poller a moment to register its wait.
+	time.Sleep(50 * time.Millisecond)
+
+	s, err := st.Create("alice", "sudo", "/dev/pts/0")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			t.Fatalf("pending poll: %v", res.err)
+		}
+		defer res.resp.Body.Close()
+		if res.resp.StatusCode != http.StatusOK {
+			t.Fatalf("pending poll status = %d, want 200", res.resp.StatusCode)
+		}
+		m := decodeJSON(t, res.resp)
+		if m["id"] != s.ID || m["user"] != "alice" || m["service"] != "sudo" || m["tty"] != "/dev/pts/0" {
+			t.Errorf("pending body = %v, want the new session", m)
+		}
+		nonce, err := base64.StdEncoding.DecodeString(m["nonce"].(string))
+		if err != nil || len(nonce) != 32 {
+			t.Errorf("pending nonce is not 32 bytes of standard base64: %v", m["nonce"])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("poller did not return after a session was created")
+	}
+}
+
+// Multiple concurrent pollers must EACH receive the new session (broadcast,
+// not consume).
+func TestHandlerPendingMultiplePollers(t *testing.T) {
+	ts, st, _ := newTestServer(t)
+
+	const pollers = 3
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	ch := make(chan result, pollers)
+	for i := 0; i < pollers; i++ {
+		go func() {
+			resp, err := http.Get(ts.URL + "/v1/pending?wait=5")
+			ch <- result{resp, err}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	s, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	for i := 0; i < pollers; i++ {
+		select {
+		case res := <-ch:
+			if res.err != nil {
+				t.Fatalf("poller %d: %v", i, res.err)
+			}
+			defer res.resp.Body.Close()
+			if res.resp.StatusCode != http.StatusOK {
+				t.Fatalf("poller %d status = %d, want 200", i, res.resp.StatusCode)
+			}
+			m := decodeJSON(t, res.resp)
+			if m["id"] != s.ID {
+				t.Errorf("poller %d got id %v, want %q", i, m["id"], s.ID)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("poller %d did not return", i)
+		}
+	}
+}
+
+func TestHandlerPendingTimeout(t *testing.T) {
+	ts, _, _ := newTestServer(t)
+	resp, err := http.Get(ts.URL + "/v1/pending?wait=0")
+	if err != nil {
+		t.Fatalf("GET /v1/pending: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (no new session)", resp.StatusCode)
 	}
 }

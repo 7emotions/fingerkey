@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,17 +17,18 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":8766", "listen address")
-	baseURL := flag.String("base-url", "http://localhost:8766", "public base URL used in approve links")
+	keysDir := flag.String("keys-dir", "/var/lib/phone-fprint-auth/keys", "directory of <name>.pub Ed25519 public keys (base64)")
 	flag.Parse()
 
-	log.Printf("T0 UNSIGNED approve endpoint exposed on LAN — LAB USE ONLY (listening on %s)", *addr)
-	if err := http.ListenAndServe(*addr, newHandler(NewStore(), *baseURL)); err != nil {
+	keys := loadPubKeys(*keysDir)
+	log.Printf("phone-fprint-auth daemon listening on %s (%d paired key(s))", *addr, len(keys))
+	if err := http.ListenAndServe(*addr, newHandler(NewStore(), keys)); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// newHandler wires the HTTP surface around the given store.
-func newHandler(store *Store, baseURL string) http.Handler {
+// newHandler wires the HTTP surface around the given store and paired keys.
+func newHandler(store *Store, keys []ed25519.PublicKey) http.Handler {
 	mux := http.NewServeMux()
 	limiter := newRateLimiter(10, time.Minute)
 
@@ -40,10 +43,18 @@ func newHandler(store *Store, baseURL string) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		handleCreateSession(w, r, store, limiter, baseURL)
+		handleCreateSession(w, r, store, limiter)
 	})
 
-	// Subtree dispatch: one segment = session id, two = {id}/approve.
+	mux.HandleFunc("/v1/pending", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		handlePending(w, r, store)
+	})
+
+	// Subtree dispatch: one segment = session id, two = {id}/decision.
 	mux.HandleFunc("/v1/session/", func(w http.ResponseWriter, r *http.Request) {
 		suffix := strings.TrimPrefix(r.URL.Path, "/v1/session/")
 		parts := strings.Split(strings.Trim(suffix, "/"), "/")
@@ -55,12 +66,12 @@ func newHandler(store *Store, baseURL string) http.Handler {
 			handleGetSession(w, r, store, parts[0])
 			return
 		}
-		if len(parts) == 2 && parts[1] == "approve" {
+		if len(parts) == 2 && parts[1] == "decision" {
 			if r.Method != http.MethodPost {
 				http.NotFound(w, r)
 				return
 			}
-			handleApproveSession(w, r, store, parts[0])
+			handleDecisionSession(w, r, store, keys, parts[0])
 			return
 		}
 		http.NotFound(w, r)
@@ -69,7 +80,7 @@ func newHandler(store *Store, baseURL string) http.Handler {
 	return mux
 }
 
-func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store, limiter *rateLimiter, baseURL string) {
+func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store, limiter *rateLimiter) {
 	if !limiter.allow(clientIP(r)) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
 		return
@@ -87,9 +98,8 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store, l
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
-		"id":          s.ID,
-		"nonce":       base64.StdEncoding.EncodeToString(s.Nonce),
-		"approve_url": baseURL + "/approve/" + s.ID,
+		"id":    s.ID,
+		"nonce": base64.StdEncoding.EncodeToString(s.Nonce),
 	})
 }
 
@@ -108,17 +118,76 @@ func handleGetSession(w http.ResponseWriter, r *http.Request, store *Store, id s
 	})
 }
 
-func handleApproveSession(w http.ResponseWriter, r *http.Request, store *Store, id string) {
-	approved, found := store.Approve(id)
-	if !found {
+// handleDecisionSession verifies an Ed25519 signature over the pinned decision
+// message against any paired pubkey and, on success, transitions the session.
+// Responses: 200 decided, 400 bad decision value, 401 bad/absent sig or no
+// matching key, 404 unknown id, 409 not pending (already decided or expired).
+func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store, keys []ed25519.PublicKey, id string) {
+	s, ok := store.Get(id)
+	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown session"})
 		return
 	}
-	if !approved {
+	var req struct {
+		Decision string `json:"decision"`
+		Sig      string `json:"sig"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	switch req.Decision {
+	case "approve", "deny":
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "decision must be approve or deny"})
+		return
+	}
+	if s.CurrentStatus() != StatusPending {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not pending"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "approved"})
+	sig, err := base64.StdEncoding.Strict().DecodeString(req.Sig)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid signature"})
+		return
+	}
+	msg := signedMessage(req.Decision, s.User, s.Service, s.TTY, s.Nonce)
+	for _, key := range keys {
+		if ed25519.Verify(key, msg, sig) {
+			status := StatusDenied
+			if req.Decision == "approve" {
+				status = StatusApproved
+			}
+			if ok, _ := store.Decide(id, status); !ok {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not pending"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": s.CurrentStatus()})
+			return
+		}
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "signature verification failed"})
+}
+
+// handlePending is the long-poll endpoint: it holds up to wait seconds and
+// returns 200 with the new session as soon as one is created, or 204 when the
+// wait elapses. wait is given in seconds (?wait=<sec>), default 60.
+func handlePending(w http.ResponseWriter, r *http.Request, store *Store) {
+	wait := 60 * time.Second
+	if v := r.URL.Query().Get("wait"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			wait = time.Duration(secs) * time.Second
+		}
+	}
+	s := store.WaitPending(wait)
+	if s == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":      s.ID,
+		"nonce":   base64.StdEncoding.EncodeToString(s.Nonce),
+		"user":    s.User,
+		"service": s.Service,
+		"tty":     s.TTY,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
