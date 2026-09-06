@@ -23,13 +23,13 @@
 #   PAM_SERVICE   (set by pam_exec for auth runs)
 #   PAM_TTY       (set by pam_exec for auth runs)
 #   TIMEOUT       poll deadline in seconds (default 60)
-#   DAEMON_URL    daemon base URL (default http://127.0.0.1:8765)
+#   DAEMON_URL    daemon base URL (default http://127.0.0.1:8766)
 #
 # Requires: curl, jq
 
 set -u
 
-DAEMON_URL="${DAEMON_URL:-http://127.0.0.1:8765}"
+DAEMON_URL="${DAEMON_URL:-http://127.0.0.1:8766}"
 TIMEOUT="${TIMEOUT:-60}"
 
 # pam_exec sets PAM_* only for auth runs; default them so the helper also
