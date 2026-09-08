@@ -19,14 +19,19 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
+	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/mdp/qrterminal/v3"
 )
 
 // keysDir is where the daemon loads <name>.pub files from (daemon default
@@ -59,6 +64,8 @@ func main() {
 		err = remove(os.Args[2])
 	case "tls-fingerprint":
 		err = tlsFingerprint()
+	case "pair-qr":
+		err = pairQR(os.Args[2:])
 	default:
 		usage()
 		os.Exit(1)
@@ -74,7 +81,8 @@ func usage() {
   pair <name> <pubkey_b64>   pair a phone: store its Ed25519 public key
   list                       list paired key names
   remove <name>              unpair a phone
-  tls-fingerprint            print the daemon TLS cert sha256 (64 hex)`)
+  tls-fingerprint            print the daemon TLS cert sha256 (64 hex)
+  pair-qr [-url <url>]       print daemon url + cert pin as an ASCII QR code`)
 }
 
 // pair validates the public key and stores it under keysDir as <name>.pub,
@@ -165,22 +173,93 @@ func remove(name string) error {
 	return nil
 }
 
-// tlsFingerprint prints the SHA-256 of the DER-encoded daemon TLS certificate
-// as 64 lowercase hex characters with no separators. This matches the digest
-// the app pins against (Dart's X509Certificate.sha256) and the
+// tlsFingerprintHex returns the SHA-256 of the DER-encoded daemon TLS
+// certificate as 64 lowercase hex characters with no separators. This matches
+// the digest the app pins against (Dart's X509Certificate.sha256) and the
 // `openssl x509 -outform DER | sha256sum` value.
-func tlsFingerprint() error {
+func tlsFingerprintHex() (string, error) {
 	raw, err := os.ReadFile(tlsCertPath)
 	if err != nil {
-		return fmt.Errorf("read %s: %v", tlsCertPath, err)
+		return "", fmt.Errorf("read %s: %v", tlsCertPath, err)
 	}
 	block, _ := pem.Decode(raw)
 	if block == nil {
-		return fmt.Errorf("no PEM certificate found in %s", tlsCertPath)
+		return "", fmt.Errorf("no PEM certificate found in %s", tlsCertPath)
 	}
 	sum := sha256.Sum256(block.Bytes)
-	fmt.Printf("%x\n", sum)
+	return fmt.Sprintf("%x", sum), nil
+}
+
+// tlsFingerprint prints the daemon TLS cert sha256 (64 hex) to stdout.
+func tlsFingerprint() error {
+	hex, err := tlsFingerprintHex()
+	if err != nil {
+		return err
+	}
+	fmt.Println(hex)
 	return nil
+}
+
+// pairQR prints the daemon pairing info (URL + cert pin) as an ASCII QR code
+// so an operator can scan it with the phone app instead of typing it. The QR
+// encodes the exact JSON the app's pairing scanner expects: {"url":...,"pin":...}.
+func pairQR(args []string) error {
+	fs := flag.NewFlagSet("pair-qr", flag.ExitOnError)
+	urlFlag := fs.String("url", "", "daemon URL override (default: https://<first LAN ip>:8766)")
+	fs.Usage = usage
+	fs.Parse(args)
+	if fs.NArg() != 0 {
+		usage()
+		os.Exit(1)
+	}
+
+	u := *urlFlag
+	if u == "" {
+		ip, err := lanIP()
+		if err != nil {
+			return err
+		}
+		u = "https://" + ip + ":8766"
+	}
+	pin, err := tlsFingerprintHex()
+	if err != nil {
+		return err
+	}
+
+	payload := struct {
+		URL string `json:"url"`
+		Pin string `json:"pin"`
+	}{URL: u, Pin: pin}
+	qrJSON, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	// Human-readable fallback so the values stay copyable even if the
+	// terminal is too small for a phone to read the QR.
+	fmt.Printf("url=%s pin=%s\n", u, pin)
+	qrterminal.GenerateWithConfig(string(qrJSON), qrterminal.Config{
+		Level:     qrterminal.M,
+		Writer:    os.Stdout,
+		BlackChar: qrterminal.BLACK,
+		WhiteChar: qrterminal.WHITE,
+		QuietZone: qrterminal.QUIET_ZONE,
+	})
+	return nil
+}
+
+// lanIP returns the first address reported by `hostname -I`, i.e. the
+// machine's primary LAN IP as configured by the network stack.
+func lanIP() (string, error) {
+	out, err := exec.Command("hostname", "-I").Output()
+	if err != nil {
+		return "", fmt.Errorf("hostname -I: %v", err)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("hostname -I reported no addresses")
+	}
+	return fields[0], nil
 }
 
 // requireRoot rejects operations that write into the root/phonefprint-owned
