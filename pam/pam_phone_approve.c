@@ -1,6 +1,6 @@
 /*
  * pam_phone_approve.c - PAM authentication module backed by a local
- * phone-approval daemon listening on http://127.0.0.1:8766.
+ * phone-approval daemon listening on a root-only UNIX socket.
  *
  * Flow:
  *   1. resolve PAM_USER / PAM_SERVICE / PAM_TTY (NULL or "unknown" -> "")
@@ -16,24 +16,25 @@
 
 #include <security/pam_modules.h>
 
-#include <arpa/inet.h>
 #include <errno.h>
-#include <netinet/in.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
-#define SERVER_HOST      "127.0.0.1"
-#define SERVER_PORT      8766
+#define SOCKET_PATH      "/run/phone-fprint-auth/daemon.sock"
 #define POLL_INTERVAL_NS 500000000L /* 500 ms */
 #define POLL_TIMEOUT_S   60
 #define IO_TIMEOUT_S     5
 #define RESP_BUF_SIZE    8192
+
+/* Module argument `socket=<path>` overrides the default daemon socket. */
+static const char *socket_path = SOCKET_PATH;
 
 /* Escape '"' and '\\' so usernames cannot break the JSON body. */
 static int json_escape(const char *src, char *dst, size_t dst_cap)
@@ -56,28 +57,30 @@ static int json_escape(const char *src, char *dst, size_t dst_cap)
     return 0;
 }
 
-static int tcp_connect(void)
+static int unix_connect(void)
 {
     int fd;
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(SERVER_PORT),
-    };
+    struct sockaddr_un addr;
     struct timeval tv = { .tv_sec = IO_TIMEOUT_S, .tv_usec = 0 };
+    socklen_t addrlen;
 
-    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (strlen(socket_path) >= sizeof(addr.sun_path))
+        return -1;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, socket_path, strlen(socket_path) + 1);
+    addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+                          strlen(socket_path) + 1);
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
-
-    if (inet_pton(AF_INET, SERVER_HOST, &addr.sin_addr) != 1) {
-        close(fd);
-        return -1;
-    }
 
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    if (connect(fd, (struct sockaddr *)&addr, addrlen) != 0) {
         close(fd);
         return -1;
     }
@@ -157,25 +160,25 @@ static int http_exchange(const char *method, const char *path, const char *body,
     if (body != NULL) {
         reqlen = snprintf(req, sizeof(req),
                           "%s %s HTTP/1.1\r\n"
-                          "Host: " SERVER_HOST ":%d\r\n"
+                          "Host: localhost\r\n"
                           "Content-Type: application/json\r\n"
                           "Content-Length: %zu\r\n"
                           "Connection: close\r\n"
                           "\r\n"
                           "%s",
-                          method, path, SERVER_PORT, strlen(body), body);
+                          method, path, strlen(body), body);
     } else {
         reqlen = snprintf(req, sizeof(req),
                           "%s %s HTTP/1.1\r\n"
-                          "Host: " SERVER_HOST ":%d\r\n"
+                          "Host: localhost\r\n"
                           "Connection: close\r\n"
                           "\r\n",
-                          method, path, SERVER_PORT);
+                          method, path);
     }
     if (reqlen < 0 || (size_t)reqlen >= sizeof(req))
         return -1;
 
-    fd = tcp_connect();
+    fd = unix_connect();
     if (fd < 0)
         return -1;
     if (send_all(fd, req, (size_t)reqlen) != 0) {
@@ -299,11 +302,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc,
 {
     const char *user = NULL, *service = NULL, *tty = NULL;
     char id[128];
+    int i;
     int rc;
 
     (void)flags;
-    (void)argc;
-    (void)argv;
+
+    for (i = 0; i < argc; i++) {
+        if (argv[i] != NULL && strncmp(argv[i], "socket=", 7) == 0 &&
+            argv[i][7] != '\0')
+            socket_path = argv[i] + 7;
+    }
 
     if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS || user == NULL ||
         *user == '\0')
