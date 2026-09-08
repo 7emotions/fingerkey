@@ -90,7 +90,21 @@ echo "installed ${HELPER_BIN}, ${PAM_MODULE}, ${UNIT_DST}"
 echo "== systemd =="
 systemctl daemon-reload
 systemctl enable --now phone-approve-daemon
-echo "enabled + started phone-approve-daemon"
+systemctl restart phone-approve-daemon
+echo "enabled + restarted phone-approve-daemon"
+
+if [[ ! -S /run/phone-fprint-auth/daemon.sock ]]; then
+    for _ in $(seq 1 25); do
+        [[ -S /run/phone-fprint-auth/daemon.sock ]] && break
+        sleep 0.2
+    done
+fi
+if [[ ! -S /run/phone-fprint-auth/daemon.sock ]]; then
+    echo "error: /run/phone-fprint-auth/daemon.sock not found after start" >&2
+    echo "error: check 'systemctl status phone-approve-daemon' and 'journalctl -u phone-approve-daemon'" >&2
+    exit 1
+fi
+echo "verified unix socket /run/phone-fprint-auth/daemon.sock"
 
 echo "== PAM wiring =="
 wire_pam_file /etc/pam.d/sudo

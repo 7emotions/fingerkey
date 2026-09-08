@@ -4,7 +4,9 @@ After=network.target
 
 [Service]
 User=phonefprint
-ExecStart=/usr/local/libexec/phone-approve-daemon -addr :8766
+RuntimeDirectory=phone-fprint-auth
+RuntimeDirectoryMode=0700
+ExecStart=/usr/local/libexec/phone-approve-daemon -addr :8766 -socket /run/phone-fprint-auth/daemon.sock
 Restart=on-failure
 
 [Install]
