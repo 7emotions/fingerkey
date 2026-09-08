@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -32,6 +33,7 @@ import (
 	"strings"
 
 	"github.com/mdp/qrterminal/v3"
+	"rsc.io/qr"
 )
 
 // keysDir is where the daemon loads <name>.pub files from (daemon default
@@ -238,14 +240,94 @@ func pairQR(args []string) error {
 	// Human-readable fallback so the values stay copyable even if the
 	// terminal is too small for a phone to read the QR.
 	fmt.Printf("url=%s pin=%s\n", u, pin)
-	qrterminal.GenerateWithConfig(string(qrJSON), qrterminal.Config{
-		Level:     qrterminal.M,
-		Writer:    os.Stdout,
-		BlackChar: qrterminal.BLACK,
-		WhiteChar: qrterminal.WHITE,
-		QuietZone: qrterminal.QUIET_ZONE,
-	})
+
+	// Encode once to learn the module count before picking a render mode.
+	code, err := qr.Encode(string(qrJSON), qr.M)
+	if err != nil {
+		return err
+	}
+	// rsc.io/qr's Code.Size is the raw module grid — it does NOT include
+	// any quiet zone (qrterminal adds the border itself). The wide block
+	// render prints 2 columns per module; the half-block render prints 1.
+	blockCols := 2 * (code.Size + 2*qrQuietZone)
+	halfCols := code.Size + 2*qrQuietZone
+
+	width := terminalWidth()
+	if width >= blockCols {
+		qrterminal.GenerateWithConfig(string(qrJSON), qrterminal.Config{
+			Level:     qrterminal.M,
+			Writer:    os.Stdout,
+			BlackChar: qrterminal.BLACK,
+			WhiteChar: qrterminal.WHITE,
+			QuietZone: qrterminal.QUIET_ZONE,
+		})
+		return nil
+	}
+	if width < halfCols {
+		fmt.Printf("terminal too narrow (%d cols) — QR may not scan; widen the terminal\n", width)
+	}
+	renderHalfBlockQR(os.Stdout, code, qrQuietZone)
 	return nil
+}
+
+// qrQuietZone is the white border around the code, matching the quiet zone
+// qrterminal's wide block render uses (qrterminal.QUIET_ZONE).
+const qrQuietZone = 4
+
+// renderHalfBlockQR prints a QR code as half-block characters, two module
+// rows per terminal row: "█" = both rows black, "▀" = top row black only,
+// "▄" = bottom row black only, " " = both rows white. One column per
+// module, so the code stays square and fits in half the block-render width.
+func renderHalfBlockQR(w io.Writer, code *qr.Code, quiet int) {
+	width := code.Size + 2*quiet
+	// Each half-block row spans 2 module rows, so the vertical quiet zone
+	// of `quiet` module rows becomes quiet/2 output rows.
+	blank := func() {
+		w.Write([]byte(strings.Repeat(" ", width) + "\n"))
+	}
+	for i := 0; i < quiet/2; i++ {
+		blank()
+	}
+	for y := 0; y < code.Size; y += 2 {
+		b := make([]byte, 0, width+1)
+		b = append(b, strings.Repeat(" ", quiet)...)
+		for x := 0; x < code.Size; x++ {
+			top := code.Black(x, y)
+			bottom := y+1 < code.Size && code.Black(x, y+1)
+			switch {
+			case top && bottom:
+				b = append(b, "█"...)
+			case top:
+				b = append(b, "▀"...)
+			case bottom:
+				b = append(b, "▄"...)
+			default:
+				b = append(b, ' ')
+			}
+		}
+		b = append(b, strings.Repeat(" ", quiet)...)
+		b = append(b, '\n')
+		w.Write(b)
+	}
+	for i := 0; i < quiet/2; i++ {
+		blank()
+	}
+}
+
+// terminalWidth reports the terminal width in columns: $COLUMNS when set
+// and positive, else `tput cols`, else 80.
+func terminalWidth() int {
+	if s := strings.TrimSpace(os.Getenv("COLUMNS")); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			return n
+		}
+	}
+	if out, err := exec.Command("tput", "cols").Output(); err == nil {
+		if n, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 80
 }
 
 // lanIP returns the first address reported by `hostname -I`, i.e. the
