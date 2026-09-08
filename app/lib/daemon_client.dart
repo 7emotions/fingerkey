@@ -59,9 +59,17 @@ class DaemonClient {
 
   /// Builds the client: an [IOClient] whose [HttpClient] pins the leaf
   /// certificate by SHA-256 when [pin] is present, or a plain client.
+  ///
+  /// A non-null [pin] that is not a valid 64-lowercase-hex fingerprint
+  /// throws [ArgumentError]: pinning is never silently downgraded to an
+  /// unpinned connection.
   static http.Client _pinnedClient(String? pin) {
-    final pinBytes = pin == null ? null : decodeHexPin(pin);
-    if (pinBytes == null) return http.Client();
+    if (pin == null) return http.Client();
+    final pinBytes = decodeHexPin(pin);
+    if (pinBytes == null) {
+      throw ArgumentError.value(
+          pin, 'pin', 'must be a 64-lowercase-hex SHA-256 fingerprint');
+    }
     final inner = HttpClient()
       ..badCertificateCallback = (X509Certificate cert, String host, int port) =>
           _bytesEqual(sha256.convert(cert.der).bytes, pinBytes);

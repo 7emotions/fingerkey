@@ -216,6 +216,25 @@ void main() {
       expect(KeyStore.needsPairing('https://192.168.1.5:8766', ''), isTrue);
       expect(
           KeyStore.needsPairing('https://192.168.1.5:8766', pin), isFalse);
+      // A corrupt non-empty pin must not silently disable pinning.
+      expect(KeyStore.needsPairing('https://x:8766', 'abc'), isTrue);
+      expect(KeyStore.needsPairing('https://x:8766', 'A' * 64), isTrue);
+      expect(KeyStore.needsPairing('https://x:8766', '0' * 64), isFalse);
+    });
+
+    test('a non-null malformed pin throws instead of silently unpinning', () {
+      expect(
+        () => DaemonClient(baseUrl: 'https://x:8766', pin: 'abc'),
+        throwsArgumentError,
+      );
+      expect(
+        () => DaemonClient(baseUrl: 'https://x:8766', pin: ''),
+        throwsArgumentError,
+      );
+      expect(
+        () => DaemonClient(baseUrl: 'https://x:8766', pin: 'A' * 64),
+        throwsArgumentError,
+      );
     });
   });
 }

@@ -7,6 +7,8 @@ import 'dart:convert';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'daemon_client.dart';
+
 class DeviceIdentity {
   const DeviceIdentity({required this.keyPair, required this.publicKeyBase64});
 
@@ -84,10 +86,13 @@ class KeyStore {
     return stored.trim();
   }
 
-  /// True when pairing (re-entry) is required: no URL stored, no pin
-  /// stored, or the stored URL is not `https://`.
+  /// True when pairing (re-entry) is required: no URL stored, no VALID pin
+  /// stored (a corrupt non-empty pin must not silently disable pinning), or
+  /// the stored URL is not `https://`.
   static bool needsPairing(String? storedUrl, String? pin) {
-    if (storedUrl == null || pin == null || pin.isEmpty) return true;
+    if (storedUrl == null || pin == null || !DaemonClient.isHexPin(pin)) {
+      return true;
+    }
     return !isHttpsUrl(storedUrl);
   }
 }
