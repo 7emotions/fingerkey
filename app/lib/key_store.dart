@@ -1,5 +1,5 @@
 /// Device identity: Ed25519 keypair persisted in Android Keystore-backed
-/// secure storage, plus the daemon base URL setting.
+/// secure storage, plus the daemon base URL and TLS certificate pin.
 library;
 
 import 'dart:convert';
@@ -20,7 +20,8 @@ class DeviceIdentity {
 class KeyStore {
   static const String _kPrivateKey = 'ed25519_private_key';
   static const String _kDaemonUrl = 'daemon_url';
-  static const String defaultDaemonUrl = 'http://192.168.112.239:8766';
+  static const String _kCertPin = 'daemon_cert_pin';
+  static const String defaultDaemonUrl = 'https://192.168.112.239:8766';
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
@@ -49,9 +50,44 @@ class KeyStore {
     );
   }
 
+  /// The raw stored daemon URL (null when never configured). Callers that
+  /// must distinguish "unset" from "leftover non-https" (e.g. pairing
+  /// re-entry) use this instead of [daemonUrl].
+  Future<String?> daemonUrlStored() async => await _storage.read(key: _kDaemonUrl);
+
   Future<String> daemonUrl() async =>
-      await _storage.read(key: _kDaemonUrl) ?? defaultDaemonUrl;
+      effectiveDaemonUrl(await _storage.read(key: _kDaemonUrl));
 
   Future<void> setDaemonUrl(String url) =>
       _storage.write(key: _kDaemonUrl, value: url.trim());
+
+  /// 64-lowercase-hex SHA-256 fingerprint of the daemon's TLS leaf
+  /// certificate (SHA-256 of the DER encoding). Entered at pairing.
+  Future<String?> certPin() async => await _storage.read(key: _kCertPin);
+
+  Future<void> setCertPin(String pin) =>
+      _storage.write(key: _kCertPin, value: pin);
+
+  /// True when [url] parses as an `https://` URL.
+  static bool isHttpsUrl(String url) {
+    final uri = Uri.tryParse(url.trim());
+    return uri != null && uri.scheme == 'https';
+  }
+
+  /// The daemon URL to use given a stored value.
+  ///
+  /// A stored non-`https` URL (e.g. a leftover `http://` from before the
+  /// TLS hardening) is NOT silently kept — it is treated as unset so the
+  /// user must re-enter it at pairing.
+  static String effectiveDaemonUrl(String? stored) {
+    if (stored == null || !isHttpsUrl(stored)) return defaultDaemonUrl;
+    return stored.trim();
+  }
+
+  /// True when pairing (re-entry) is required: no URL stored, no pin
+  /// stored, or the stored URL is not `https://`.
+  static bool needsPairing(String? storedUrl, String? pin) {
+    if (storedUrl == null || pin == null || pin.isEmpty) return true;
+    return !isHttpsUrl(storedUrl);
+  }
 }

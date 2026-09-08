@@ -1,12 +1,13 @@
 /// First-launch pairing: generate (or show) the Ed25519 device key, present
 /// the public key as a QR code + copy button for registration on the daemon,
-/// and configure the daemon URL.
+/// and configure the HTTPS daemon URL plus the TLS certificate fingerprint.
 library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import 'daemon_client.dart';
 import 'key_store.dart';
 
 class PairingScreen extends StatefulWidget {
@@ -15,13 +16,16 @@ class PairingScreen extends StatefulWidget {
     required this.keyStore,
     required this.identity,
     required this.initialUrl,
+    required this.initialPin,
     required this.onPaired,
   });
 
   final KeyStore keyStore;
   final DeviceIdentity identity;
   final String initialUrl;
-  final void Function(DeviceIdentity identity, String daemonUrl) onPaired;
+  final String initialPin;
+  final void Function(DeviceIdentity identity, String daemonUrl, String certPin)
+      onPaired;
 
   @override
   State<PairingScreen> createState() => _PairingScreenState();
@@ -29,16 +33,19 @@ class PairingScreen extends StatefulWidget {
 
 class _PairingScreenState extends State<PairingScreen> {
   late final TextEditingController _urlController;
+  late final TextEditingController _pinController;
 
   @override
   void initState() {
     super.initState();
     _urlController = TextEditingController(text: widget.initialUrl);
+    _pinController = TextEditingController(text: widget.initialPin);
   }
 
   @override
   void dispose() {
     _urlController.dispose();
+    _pinController.dispose();
     super.dispose();
   }
 
@@ -53,15 +60,26 @@ class _PairingScreenState extends State<PairingScreen> {
 
   Future<void> _continue() async {
     final url = _urlController.text.trim();
-    final uri = Uri.tryParse(url);
-    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+    if (!KeyStore.isHttpsUrl(url)) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter a valid http(s) daemon URL')),
+        const SnackBar(content: Text('Enter a valid https:// daemon URL')),
+      );
+      return;
+    }
+    // The normative pin form is 64 lowercase hex; accept mixed case input
+    // and normalize.
+    final pin = _pinController.text.trim().toLowerCase();
+    if (!DaemonClient.isHexPin(pin)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Enter the 64-character certificate fingerprint '
+                '(SHA-256, hex)')),
       );
       return;
     }
     await widget.keyStore.setDaemonUrl(url);
-    widget.onPaired(widget.identity, url);
+    await widget.keyStore.setCertPin(pin);
+    widget.onPaired(widget.identity, url, pin);
   }
 
   @override
@@ -124,8 +142,22 @@ class _PairingScreenState extends State<PairingScreen> {
               controller: _urlController,
               keyboardType: TextInputType.url,
               decoration: const InputDecoration(
-                labelText: 'Daemon URL',
+                labelText: 'Daemon URL (https)',
                 hintText: KeyStore.defaultDaemonUrl,
+                border: OutlineInputBorder(),
+              ),
+              style: const TextStyle(fontFamily: 'monospace'),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _pinController,
+              keyboardType: TextInputType.text,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                labelText: 'Certificate fingerprint (64 hex)',
+                hintText: 'SHA-256 of the daemon TLS certificate',
+                helperText: 'phone-approve tls-fingerprint',
                 border: OutlineInputBorder(),
               ),
               style: const TextStyle(fontFamily: 'monospace'),

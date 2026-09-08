@@ -9,11 +9,20 @@ void main() {
 }
 
 class _Bootstrap {
-  const _Bootstrap(this.keyStore, this.identity, this.daemonUrl);
+  const _Bootstrap(
+      this.keyStore, this.identity, this.daemonUrl, this.storedUrl, this.certPin);
 
   final KeyStore keyStore;
   final DeviceIdentity? identity;
+
+  /// Effective (sanitized, https) daemon URL.
   final String daemonUrl;
+
+  /// Raw stored daemon URL (may be null or a leftover non-https value).
+  final String? storedUrl;
+
+  /// 64-hex TLS certificate pin, or null when not yet paired.
+  final String? certPin;
 }
 
 class PhoneFprintApp extends StatefulWidget {
@@ -27,12 +36,30 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
   final Future<_Bootstrap> _bootstrap = _load();
   DeviceIdentity? _identity;
   String? _daemonUrl;
+  String? _storedUrl;
+  String? _certPin;
 
   static Future<_Bootstrap> _load() async {
     final keyStore = KeyStore();
     final identity = await keyStore.load();
-    final daemonUrl = await keyStore.daemonUrl();
-    return _Bootstrap(keyStore, identity, daemonUrl);
+    final storedUrl = await keyStore.daemonUrlStored();
+    final certPin = await keyStore.certPin();
+    return _Bootstrap(
+      keyStore,
+      identity,
+      KeyStore.effectiveDaemonUrl(storedUrl),
+      storedUrl,
+      certPin,
+    );
+  }
+
+  void _onPaired(DeviceIdentity identity, String daemonUrl, String certPin) {
+    setState(() {
+      _identity = identity;
+      _daemonUrl = daemonUrl;
+      _storedUrl = daemonUrl;
+      _certPin = certPin;
+    });
   }
 
   @override
@@ -66,6 +93,8 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
           }
           final identity = _identity ?? data.identity;
           final daemonUrl = _daemonUrl ?? data.daemonUrl;
+          final storedUrl = _storedUrl ?? data.storedUrl;
+          final certPin = _certPin ?? data.certPin;
           if (identity == null) {
             return FutureBuilder<DeviceIdentity>(
               future: data.keyStore.generate(),
@@ -80,15 +109,27 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
                   keyStore: data.keyStore,
                   identity: generated,
                   initialUrl: daemonUrl,
-                  onPaired: (id, url) => setState(() {
-                    _identity = id;
-                    _daemonUrl = url;
-                  }),
+                  initialPin: certPin ?? '',
+                  onPaired: _onPaired,
                 );
               },
             );
           }
-          return ApprovalScreen(identity: identity, daemonUrl: daemonUrl);
+          if (KeyStore.needsPairing(storedUrl, certPin)) {
+            // No pin yet, or a leftover non-https URL: re-enter both.
+            return PairingScreen(
+              keyStore: data.keyStore,
+              identity: identity,
+              initialUrl: daemonUrl,
+              initialPin: certPin ?? '',
+              onPaired: _onPaired,
+            );
+          }
+          return ApprovalScreen(
+            identity: identity,
+            daemonUrl: daemonUrl,
+            certPin: certPin!,
+          );
         },
       ),
     );

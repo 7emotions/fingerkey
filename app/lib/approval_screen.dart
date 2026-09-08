@@ -17,10 +17,15 @@ class ApprovalScreen extends StatefulWidget {
     super.key,
     required this.identity,
     required this.daemonUrl,
+    required this.certPin,
   });
 
   final DeviceIdentity identity;
   final String daemonUrl;
+
+  /// 64-lowercase-hex SHA-256 fingerprint of the daemon's TLS certificate;
+  /// the connection is pinned to it.
+  final String certPin;
 
   @override
   State<ApprovalScreen> createState() => _ApprovalScreenState();
@@ -39,7 +44,7 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
   @override
   void initState() {
     super.initState();
-    _client = DaemonClient(baseUrl: widget.daemonUrl);
+    _client = DaemonClient(baseUrl: widget.daemonUrl, pin: widget.certPin);
     unawaited(_pollLoop());
   }
 

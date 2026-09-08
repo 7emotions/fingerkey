@@ -1,12 +1,15 @@
-/// HTTP client for the phone-fprint-auth LAN daemon (default
-/// http://192.168.1.100:8766).
+/// HTTP client for the phone-fprint-auth LAN daemon (HTTPS with an optional
+/// self-signed-certificate SHA-256 pin).
 library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 
 class PendingSession {
   PendingSession({
@@ -44,11 +47,58 @@ class DaemonHttpException implements Exception {
 }
 
 class DaemonClient {
-  DaemonClient({required this.baseUrl, http.Client? client})
-      : _client = client ?? http.Client();
+  /// [pin] is the daemon TLS leaf certificate fingerprint: 64 lowercase hex
+  /// (SHA-256 of the DER-encoded certificate). When set, the connection is
+  /// pinned to that exact certificate regardless of hostname, so DHCP IP
+  /// changes do not break pairing. [baseUrl] must be an `https://` URL.
+  DaemonClient({required this.baseUrl, String? pin, http.Client? client})
+      : _client = client ?? _pinnedClient(pin);
 
   final String baseUrl;
   final http.Client _client;
+
+  /// Builds the client: an [IOClient] whose [HttpClient] pins the leaf
+  /// certificate by SHA-256 when [pin] is present, or a plain client.
+  static http.Client _pinnedClient(String? pin) {
+    final pinBytes = pin == null ? null : decodeHexPin(pin);
+    if (pinBytes == null) return http.Client();
+    final inner = HttpClient()
+      ..badCertificateCallback = (X509Certificate cert, String host, int port) =>
+          _bytesEqual(sha256.convert(cert.der).bytes, pinBytes);
+    return IOClient(inner);
+  }
+
+  /// Decodes a 64-character lowercase-hex fingerprint into 32 raw bytes
+  /// (the SHA-256 digest). Returns null on malformed input.
+  static Uint8List? decodeHexPin(String pin) {
+    if (pin.length != 64) return null;
+    final bytes = Uint8List(32);
+    for (var i = 0; i < 32; i++) {
+      final hi = _hexNibble(pin.codeUnitAt(i * 2));
+      final lo = _hexNibble(pin.codeUnitAt(i * 2 + 1));
+      if (hi < 0 || lo < 0) return null;
+      bytes[i] = (hi << 4) | lo;
+    }
+    return bytes;
+  }
+
+  /// True when [pin] is a valid 64-lowercase-hex fingerprint.
+  static bool isHexPin(String pin) => decodeHexPin(pin) != null;
+
+  static int _hexNibble(int codeUnit) {
+    if (codeUnit >= 0x30 && codeUnit <= 0x39) return codeUnit - 0x30; // 0-9
+    if (codeUnit >= 0x61 && codeUnit <= 0x66) return codeUnit - 0x61 + 10; // a-f
+    return -1;
+  }
+
+  static bool _bytesEqual(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    var diff = 0;
+    for (var i = 0; i < a.length; i++) {
+      diff |= a[i] ^ b[i];
+    }
+    return diff == 0;
+  }
 
   /// Long-polls `GET /v1/pending?wait=<waitSeconds>`.
   ///

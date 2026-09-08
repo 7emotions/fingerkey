@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Cleartext HTTP is permitted app-wide because this is a LAN-only tool: the
-  daemon URL is user-configurable (no single IP can be pinned) and request
-  authenticity comes from the Ed25519 decision signatures, not TLS. See the
-  README threat model.
+  HTTPS-only: the daemon is reached exclusively over TLS (self-signed
+  certificate pinned by SHA-256 fingerprint). Cleartext HTTP is disallowed
+  app-wide.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true" />
+    <base-config cleartextTrafficPermitted="false" />
 </network-security-config>
