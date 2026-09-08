@@ -10,20 +10,16 @@
 //	phone-approve pair <name> <pubkey_b64>
 //	phone-approve list
 //	phone-approve remove <name>
+//	phone-approve bt-pair
 //
 // pair and remove require root (the keys directory is root/phonefprint-owned);
-// list does not.
+// list and bt-pair do not.
 package main
 
 import (
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
-	"encoding/pem"
-	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -31,17 +27,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-
-	"github.com/mdp/qrterminal/v3"
-	"rsc.io/qr"
+	"time"
 )
 
 // keysDir is where the daemon loads <name>.pub files from (daemon default
 // -keys-dir). It must match the daemon's configuration.
 const keysDir = "/var/lib/phone-fprint-auth/keys"
-
-// tlsCertPath is the self-signed daemon certificate installed by install.sh.
-const tlsCertPath = "/var/lib/phone-fprint-auth/tls/cert.pem"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -64,10 +55,8 @@ func main() {
 			os.Exit(1)
 		}
 		err = remove(os.Args[2])
-	case "tls-fingerprint":
-		err = tlsFingerprint()
-	case "pair-qr":
-		err = pairQR(os.Args[2:])
+	case "bt-pair":
+		err = btPair()
 	default:
 		usage()
 		os.Exit(1)
@@ -83,8 +72,7 @@ func usage() {
   pair <name> <pubkey_b64>   pair a phone: store its Ed25519 public key
   list                       list paired key names
   remove <name>              unpair a phone
-  tls-fingerprint            print the daemon TLS cert sha256 (64 hex)
-  pair-qr [-url <url>]       print daemon url + cert pin as an ASCII QR code`)
+  bt-pair                    make this machine discoverable so the phone app can bond (Bluetooth)`)
 }
 
 // pair validates the public key and stores it under keysDir as <name>.pub,
@@ -175,173 +163,54 @@ func remove(name string) error {
 	return nil
 }
 
-// tlsFingerprintHex returns the SHA-256 of the DER-encoded daemon TLS
-// certificate as 64 lowercase hex characters with no separators. This matches
-// the digest the app pins against (Dart's X509Certificate.sha256) and the
-// `openssl x509 -outform DER | sha256sum` value.
-func tlsFingerprintHex() (string, error) {
-	raw, err := os.ReadFile(tlsCertPath)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %v", tlsCertPath, err)
+// btPair makes this machine Bluetooth-discoverable so the phone app can find
+// and bond to it, prints the adapter MAC and hostname for the operator, and
+// turns discoverability back off after ~60 seconds. Pairing stays on (the
+// BlueZ default), so re-pairing later does not need this command again.
+func btPair() error {
+	run := func(args ...string) error {
+		cmd := exec.Command("bluetoothctl", args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
 	}
-	block, _ := pem.Decode(raw)
-	if block == nil {
-		return "", fmt.Errorf("no PEM certificate found in %s", tlsCertPath)
+	if err := run("discoverable", "on"); err != nil {
+		return fmt.Errorf("bluetoothctl discoverable on: %v", err)
 	}
-	sum := sha256.Sum256(block.Bytes)
-	return fmt.Sprintf("%x", sum), nil
-}
+	if err := run("pairable", "on"); err != nil {
+		return fmt.Errorf("bluetoothctl pairable on: %v", err)
+	}
 
-// tlsFingerprint prints the daemon TLS cert sha256 (64 hex) to stdout.
-func tlsFingerprint() error {
-	hex, err := tlsFingerprintHex()
+	out, err := exec.Command("bluetoothctl", "show").Output()
 	if err != nil {
-		return err
+		return fmt.Errorf("bluetoothctl show: %v", err)
 	}
-	fmt.Println(hex)
+	mac := ""
+	for _, line := range strings.Split(string(out), "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == "Controller" {
+			mac = f[1]
+			break
+		}
+	}
+	if mac == "" {
+		return fmt.Errorf("no controller address in bluetoothctl show output")
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("hostname: %v", err)
+	}
+
+	fmt.Printf("Bluetooth adapter: %s\n", mac)
+	fmt.Printf("Hostname: %s\n", host)
+	fmt.Println("Now bond from the phone (app → discover → tap the computer), then run 'sudo phone-approve pair <name> <pubkey>'")
+
+	// ~60s to complete bonding on the phone, then stop advertising.
+	// Best-effort: pairable stays on, which is the BlueZ default.
+	time.Sleep(60 * time.Second)
+	if err := run("discoverable", "off"); err != nil {
+		fmt.Fprintf(os.Stderr, "phone-approve: warning: bluetoothctl discoverable off: %v\n", err)
+	}
 	return nil
-}
-
-// pairQR prints the daemon pairing info (URL + cert pin) as an ASCII QR code
-// so an operator can scan it with the phone app instead of typing it. The QR
-// encodes the exact JSON the app's pairing scanner expects: {"url":...,"pin":...}.
-func pairQR(args []string) error {
-	fs := flag.NewFlagSet("pair-qr", flag.ExitOnError)
-	urlFlag := fs.String("url", "", "daemon URL override (default: https://<first LAN ip>:8766)")
-	fs.Usage = usage
-	fs.Parse(args)
-	if fs.NArg() != 0 {
-		usage()
-		os.Exit(1)
-	}
-
-	u := *urlFlag
-	if u == "" {
-		ip, err := lanIP()
-		if err != nil {
-			return err
-		}
-		u = "https://" + ip + ":8766"
-	}
-	pin, err := tlsFingerprintHex()
-	if err != nil {
-		return err
-	}
-
-	payload := struct {
-		URL string `json:"url"`
-		Pin string `json:"pin"`
-	}{URL: u, Pin: pin}
-	qrJSON, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-
-	// Human-readable fallback so the values stay copyable even if the
-	// terminal is too small for a phone to read the QR.
-	fmt.Printf("url=%s pin=%s\n", u, pin)
-
-	// Encode once to learn the module count before picking a render mode.
-	code, err := qr.Encode(string(qrJSON), qr.M)
-	if err != nil {
-		return err
-	}
-	// rsc.io/qr's Code.Size is the raw module grid — it does NOT include
-	// any quiet zone (qrterminal adds the border itself). The wide block
-	// render prints 2 columns per module; the half-block render prints 1.
-	blockCols := 2 * (code.Size + 2*qrQuietZone)
-	halfCols := code.Size + 2*qrQuietZone
-
-	width := terminalWidth()
-	if width >= blockCols {
-		qrterminal.GenerateWithConfig(string(qrJSON), qrterminal.Config{
-			Level:     qrterminal.M,
-			Writer:    os.Stdout,
-			BlackChar: qrterminal.BLACK,
-			WhiteChar: qrterminal.WHITE,
-			QuietZone: qrterminal.QUIET_ZONE,
-		})
-		return nil
-	}
-	if width < halfCols {
-		fmt.Printf("terminal too narrow (%d cols) — QR may not scan; widen the terminal\n", width)
-	}
-	renderHalfBlockQR(os.Stdout, code, qrQuietZone)
-	return nil
-}
-
-// qrQuietZone is the white border around the code, matching the quiet zone
-// qrterminal's wide block render uses (qrterminal.QUIET_ZONE).
-const qrQuietZone = 4
-
-// renderHalfBlockQR prints a QR code as half-block characters, two module
-// rows per terminal row: "█" = both rows black, "▀" = top row black only,
-// "▄" = bottom row black only, " " = both rows white. One column per
-// module, so the code stays square and fits in half the block-render width.
-func renderHalfBlockQR(w io.Writer, code *qr.Code, quiet int) {
-	width := code.Size + 2*quiet
-	// Each half-block row spans 2 module rows, so the vertical quiet zone
-	// of `quiet` module rows becomes quiet/2 output rows.
-	blank := func() {
-		w.Write([]byte(strings.Repeat(" ", width) + "\n"))
-	}
-	for i := 0; i < quiet/2; i++ {
-		blank()
-	}
-	for y := 0; y < code.Size; y += 2 {
-		b := make([]byte, 0, width+1)
-		b = append(b, strings.Repeat(" ", quiet)...)
-		for x := 0; x < code.Size; x++ {
-			top := code.Black(x, y)
-			bottom := y+1 < code.Size && code.Black(x, y+1)
-			switch {
-			case top && bottom:
-				b = append(b, "█"...)
-			case top:
-				b = append(b, "▀"...)
-			case bottom:
-				b = append(b, "▄"...)
-			default:
-				b = append(b, ' ')
-			}
-		}
-		b = append(b, strings.Repeat(" ", quiet)...)
-		b = append(b, '\n')
-		w.Write(b)
-	}
-	for i := 0; i < quiet/2; i++ {
-		blank()
-	}
-}
-
-// terminalWidth reports the terminal width in columns: $COLUMNS when set
-// and positive, else `tput cols`, else 80.
-func terminalWidth() int {
-	if s := strings.TrimSpace(os.Getenv("COLUMNS")); s != "" {
-		if n, err := strconv.Atoi(s); err == nil && n > 0 {
-			return n
-		}
-	}
-	if out, err := exec.Command("tput", "cols").Output(); err == nil {
-		if n, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 80
-}
-
-// lanIP returns the first address reported by `hostname -I`, i.e. the
-// machine's primary LAN IP as configured by the network stack.
-func lanIP() (string, error) {
-	out, err := exec.Command("hostname", "-I").Output()
-	if err != nil {
-		return "", fmt.Errorf("hostname -I: %v", err)
-	}
-	fields := strings.Fields(string(out))
-	if len(fields) == 0 {
-		return "", fmt.Errorf("hostname -I reported no addresses")
-	}
-	return fields[0], nil
 }
 
 // requireRoot rejects operations that write into the root/phonefprint-owned
