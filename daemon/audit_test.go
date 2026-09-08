@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/base64"
 	"net/http"
 	"strings"
@@ -64,16 +65,17 @@ func TestAuditSessionCreated(t *testing.T) {
 
 func TestAuditDecisionApprove(t *testing.T) {
 	buf := swapAudit(t)
-	env := newTestServer(t)
-	s, err := env.store.Create("alice", "sudo", "")
+	store := NewStore()
+	pub, priv := newKey(t)
+	keys := map[string]ed25519.PublicKey{"alice": pub}
+	s, err := store.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	sig := signDecision(env.priv, "approve", s)
-	resp := postJSON(t, env.phone.URL+"/v1/session/"+s.ID+"/decision",
-		`{"decision":"approve","sig":"`+sig+`"}`)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	sig := signDecision(priv, "approve", s)
+	code, _, key := decide(store, keys, s.ID, "approve", sig)
+	if code != http.StatusOK || key != "alice" {
+		t.Fatalf("decide code = %d, key = %q, want 200/alice", code, key)
 	}
 	got := buf.String()
 	// "event=decision " (trailing space) distinguishes it from
@@ -92,15 +94,16 @@ func TestAuditDecisionApprove(t *testing.T) {
 
 func TestAuditDecisionFailed(t *testing.T) {
 	buf := swapAudit(t)
-	env := newTestServer(t)
-	s, err := env.store.Create("alice", "sudo", "")
+	store := NewStore()
+	pub, _ := newKey(t)
+	keys := map[string]ed25519.PublicKey{"alice": pub}
+	s, err := store.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	resp := postJSON(t, env.phone.URL+"/v1/session/"+s.ID+"/decision",
-		`{"decision":"approve","sig":"!!!not-base64!!!"}`)
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	code, _, _ := decide(store, keys, s.ID, "approve", "!!!not-base64!!!")
+	if code != http.StatusUnauthorized {
+		t.Fatalf("decide code = %d, want 401", code)
 	}
 	got := buf.String()
 	if !strings.Contains(got, "event=decision-failed") {

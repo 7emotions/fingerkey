@@ -10,9 +10,24 @@ import (
 	"time"
 )
 
-// TestSocketSplit asserts the split between the root-only local surface
-// (unix socket) and the phone surface (TCP): each mux 404s the other's
-// endpoints and serves only its own.
+// assertNoCreate fails if a session is delivered to a fresh subscriber within
+// 200ms — the Subscribe-based stand-in for the deleted WaitPending: it proves
+// a request did NOT create a session.
+func assertNoCreate(t *testing.T, store *Store) {
+	t.Helper()
+	ch, unsub := store.Subscribe()
+	defer unsub()
+	select {
+	case s := <-ch:
+		t.Errorf("a session was created (%q), want none", s.ID)
+	case <-time.After(200 * time.Millisecond):
+		// expected: nothing was created
+	}
+}
+
+// TestSocketSplit asserts the local mux's surface after the phone mux was
+// removed: the former phone endpoints (long-poll, decision) are 404 and the
+// root-only session endpoints still serve.
 func TestSocketSplit(t *testing.T) {
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -24,13 +39,12 @@ func TestSocketSplit(t *testing.T) {
 
 	local := httptest.NewServer(newLocalMux(store, keys))
 	defer local.Close()
-	phone := httptest.NewServer(newPhoneMux(store, keys))
-	defer phone.Close()
 
-	// The local mux must not serve phone endpoints.
+	// The local mux must not serve the removed phone endpoints.
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/v1/pending"},
 		{http.MethodPost, "/v1/session/deadbeef/decision"},
+		{http.MethodGet, "/healthz"},
 	} {
 		req, _ := http.NewRequest(tc.method, local.URL+tc.path, strings.NewReader(`{}`))
 		resp, err := http.DefaultClient.Do(req)
@@ -43,70 +57,35 @@ func TestSocketSplit(t *testing.T) {
 		}
 	}
 
-	// The phone mux must not serve local endpoints.
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodPost, "/v1/session"},
-		{http.MethodGet, "/v1/session/deadbeef"},
-	} {
-		req, _ := http.NewRequest(tc.method, phone.URL+tc.path, strings.NewReader(`{}`))
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("phone mux %s %s = %d, want 404", tc.method, tc.path, resp.StatusCode)
-		}
+	// POST /v1/session/.../decision must be a real 404 — no session creation.
+	req, _ := http.NewRequest(http.MethodPost, local.URL+"/v1/session/deadbeef/decision", strings.NewReader(`{}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST decision: %v", err)
 	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+	assertNoCreate(t, store)
 
-	// POST /v1/session on the phone mux must be a real 404 — no 301 redirect
-	// to the subtree pattern and no session creation.
-	t.Run("phone POST /v1/session is a real 404", func(t *testing.T) {
-		client := &http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}
-		req, _ := http.NewRequest(http.MethodPost, phone.URL+"/v1/session", strings.NewReader(`{}`))
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("POST /v1/session: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Errorf("status = %d, want 404", resp.StatusCode)
-		}
-		if loc := resp.Header.Get("Location"); loc != "" {
-			t.Errorf("unexpected Location header %q, want a real 404 with no redirect", loc)
-		}
-
-		// The 404 handler must not have created a session: a short
-		// WaitPending would return it if it had.
-		created := make(chan *Session, 1)
-		go func() { created <- store.WaitPending(200 * time.Millisecond) }()
-		select {
-		case s := <-created:
-			if s != nil {
-				t.Errorf("POST /v1/session created session %q, want none", s.ID)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("WaitPending did not return")
-		}
-	})
-
-	// Each mux serves its own endpoints: a valid create on local, healthz on phone.
-	resp := postJSON(t, local.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)
+	// The local mux still serves its own endpoints: a valid create and a status poll.
+	resp = postJSON(t, local.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("local POST /v1/session = %d, want 200", resp.StatusCode)
 	}
-
-	hresp, err := http.Get(phone.URL + "/healthz")
-	if err != nil {
-		t.Fatalf("GET /healthz: %v", err)
+	m := decodeJSON(t, resp)
+	id, _ := m["id"].(string)
+	if id == "" {
+		t.Fatal("create returned no session id")
 	}
-	defer hresp.Body.Close()
-	if hresp.StatusCode != http.StatusOK {
-		t.Fatalf("phone GET /healthz = %d, want 200", hresp.StatusCode)
+	gresp, err := http.Get(local.URL + "/v1/session/" + id)
+	if err != nil {
+		t.Fatalf("GET session: %v", err)
+	}
+	defer gresp.Body.Close()
+	if gresp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/session/{id} = %d, want 200", gresp.StatusCode)
 	}
 }
 
@@ -121,6 +100,8 @@ func TestLocalSessionCreateNoKeys(t *testing.T) {
 	local := httptest.NewServer(newLocalMux(store, map[string]ed25519.PublicKey{}))
 	defer local.Close()
 
+	ch, unsub := store.Subscribe()
+	defer unsub()
 	resp := postJSON(t, local.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("empty keys: status = %d, want 503", resp.StatusCode)
@@ -128,18 +109,13 @@ func TestLocalSessionCreateNoKeys(t *testing.T) {
 	if m := decodeJSON(t, resp); m["error"] != "no paired keys" {
 		t.Errorf("empty keys: body = %v, want error %q", m, "no paired keys")
 	}
-
-	// The 503 must not have created a session: a short WaitPending would
-	// return it if it had.
-	created := make(chan *Session, 1)
-	go func() { created <- store.WaitPending(200 * time.Millisecond) }()
+	// The 503 must not have created a session: the subscriber registered
+	// above must receive nothing.
 	select {
-	case s := <-created:
-		if s != nil {
-			t.Errorf("empty keys: POST /v1/session created session %q, want none", s.ID)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("WaitPending did not return")
+	case s := <-ch:
+		t.Errorf("empty keys: POST /v1/session created session %q, want none", s.ID)
+	case <-time.After(200 * time.Millisecond):
+		// expected: nothing was created
 	}
 
 	// Control: with a paired key and a connected phone link, the normal path

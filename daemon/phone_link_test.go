@@ -10,12 +10,12 @@ import (
 	"time"
 )
 
-// startPhoneLink wires one phoneLink over a net.Pipe against store/keys,
+// startPipePhoneLink wires one phoneLink over a net.Pipe against store/keys,
 // starts its run loop, and waits until THIS link is registered. run subscribes
 // before registering, so once the counter has moved the subscription is
 // already active: a Create immediately afterwards cannot be missed.
 // It returns the phone side of the pipe; the test acts as the phone.
-func startPhoneLink(t *testing.T, store *Store, keys map[string]ed25519.PublicKey) net.Conn {
+func startPipePhoneLink(t *testing.T, store *Store, keys map[string]ed25519.PublicKey) net.Conn {
 	t.Helper()
 
 	// A previous link's unregister is deferred and therefore asynchronous to
@@ -63,7 +63,7 @@ func startPhoneLink(t *testing.T, store *Store, keys map[string]ed25519.PublicKe
 // user/service/tty context.
 func TestPhoneLinkPendingFrame(t *testing.T) {
 	store := NewStore()
-	phone := startPhoneLink(t, store, nil)
+	phone := startPipePhoneLink(t, store, nil)
 
 	s, err := store.Create("alice", "sudo", "/dev/pts/0")
 	if err != nil {
@@ -114,7 +114,7 @@ func TestPhoneLinkDecision(t *testing.T) {
 			store := NewStore()
 			pub, priv := newKey(t)
 			keys := map[string]ed25519.PublicKey{"alice": pub}
-			phone := startPhoneLink(t, store, keys)
+			phone := startPipePhoneLink(t, store, keys)
 
 			s, err := store.Create("alice", "sudo", "")
 			if err != nil {
@@ -179,7 +179,7 @@ func TestPhoneLinkBadMessage(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := NewStore()
-			phone := startPhoneLink(t, store, nil)
+			phone := startPipePhoneLink(t, store, nil)
 
 			if err := writeFrame(phone, []byte(tc.payload)); err != nil {
 				t.Fatalf("writeFrame: %v", err)
@@ -210,7 +210,7 @@ func TestPhoneLinkBadMessage(t *testing.T) {
 // link is open and turn false after the phone side closes.
 func TestPhoneLinkConnectedLifecycle(t *testing.T) {
 	store := NewStore()
-	phone := startPhoneLink(t, store, nil)
+	phone := startPipePhoneLink(t, store, nil)
 
 	if !phoneConnected() {
 		t.Fatal("phoneConnected() = false while the link is open")

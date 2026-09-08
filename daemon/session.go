@@ -40,26 +40,21 @@ func (s *Session) CurrentStatus() string {
 	return s.Status
 }
 
-// Store is an in-memory session store guarded by a mutex. It broadcasts a
-// signal on every Create so long-pollers of /v1/pending can wait on it, and
-// pushes the new session to every subscriber registered via Subscribe.
+// Store is an in-memory session store guarded by a mutex. It pushes every
+// newly created session to every subscriber registered via Subscribe (the
+// push-based phone link).
 type Store struct {
-	mu          sync.Mutex
-	sessions    map[string]*Session
-	cond        *sync.Cond
-	seq         uint64   // bumped on every Create
-	lastSession *Session // most recently created session
-	subs        map[chan *Session]struct{}
+	mu       sync.Mutex
+	sessions map[string]*Session
+	subs     map[chan *Session]struct{}
 }
 
 // NewStore returns an empty session store.
 func NewStore() *Store {
-	st := &Store{
+	return &Store{
 		sessions: make(map[string]*Session),
 		subs:     make(map[chan *Session]struct{}),
 	}
-	st.cond = sync.NewCond(&st.mu)
-	return st
 }
 
 // Create generates a new pending session with a random 128-bit id (hex
@@ -86,8 +81,6 @@ func (st *Store) Create(user, service, tty string) (*Session, error) {
 	}
 	st.mu.Lock()
 	st.sessions[id] = s
-	st.seq++
-	st.lastSession = s
 	for sub := range st.subs {
 		select {
 		case sub <- s:
@@ -95,7 +88,6 @@ func (st *Store) Create(user, service, tty string) (*Session, error) {
 		}
 	}
 	st.mu.Unlock()
-	st.cond.Broadcast()
 	return s, nil
 }
 
@@ -153,33 +145,6 @@ func (st *Store) Decide(id, status string) (ok, found bool) {
 	}
 	s.Status = status
 	return true, true
-}
-
-// WaitPending blocks until a session is created after the call begins, or
-// until wait elapses. It returns the most recently created session — the
-// session is never consumed, so concurrent waiters each receive it. It
-// returns nil on timeout (caller answers 204).
-func (st *Store) WaitPending(wait time.Duration) *Session {
-	st.mu.Lock()
-	start := st.seq
-	deadline := time.Now().Add(wait)
-	for st.seq == start {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			st.mu.Unlock()
-			return nil
-		}
-		timer := time.AfterFunc(remaining, func() {
-			st.mu.Lock()
-			st.cond.Broadcast()
-			st.mu.Unlock()
-		})
-		st.cond.Wait()
-		timer.Stop()
-	}
-	s := st.lastSession
-	st.mu.Unlock()
-	return s
 }
 
 // randomHex returns the hex encoding of n crypto/rand bytes.

@@ -51,6 +51,14 @@ type decisionResultFrame struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// startPhoneLink wraps an accepted stream (an SPP RFCOMM socket in
+// production, a sim-socket or net.Pipe conn in tests) in a phoneLink and
+// starts its run loop.
+func startPhoneLink(rwc io.ReadWriteCloser, store *Store, keys map[string]ed25519.PublicKey) {
+	l := &phoneLink{rwc: rwc}
+	go l.run(store, keys)
+}
+
 // run drives the link: it subscribes to the store and spawns the pusher and
 // reader goroutines, then blocks until the link dies. It registers the link
 // so phoneConnected() reflects reality for its whole lifetime. The

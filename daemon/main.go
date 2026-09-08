@@ -2,45 +2,26 @@ package main
 
 import (
 	"crypto/ed25519"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
-// maxPendingWaitSecs caps the ?wait= long-poll duration: an unauthenticated
-// LAN peer must not be able to pin a goroutine + timer for arbitrary time,
-// and huge inputs must not overflow the time.Duration conversion. It is a
-// package var (like sessionTTL) so tests can shorten it.
-var maxPendingWaitSecs = 120
-
 func main() {
-	addr := flag.String("addr", ":8766", "listen address")
+	adapter := flag.String("adapter", "hci0", "Bluetooth HCI adapter for the SPP phone link")
 	socketPath := flag.String("socket", "/run/phone-fprint-auth/daemon.sock", "unix socket path for the root-only local surface")
 	keysDir := flag.String("keys-dir", "/var/lib/phone-fprint-auth/keys", "directory of <name>.pub Ed25519 public keys (base64)")
-	tlsCert := flag.String("tls-cert", "", "TLS certificate file (PEM) for the phone (TCP) listener")
-	tlsKey := flag.String("tls-key", "", "TLS private key file (PEM) for the phone (TCP) listener")
+	simSocketPath := flag.String("phone-sim-socket", "", "unix socket path for a test phone link (empty = disabled)")
 	flag.Parse()
 
-	// HTTPS-only phone surface: the TCP listener MUST NOT start without a
-	// valid certificate + key. No plain-HTTP fallback.
-	if *tlsCert == "" || *tlsKey == "" {
-		log.Fatal("both -tls-cert and -tls-key are required (HTTPS-only)")
-	}
-	tlsCfg, err := loadTLSConfig(*tlsCert, *tlsKey)
-	if err != nil {
-		log.Fatal(err)
-	}
+	log.Printf("phone-fprint-auth daemon: adapter=%s", *adapter)
 
 	keys := loadPubKeys(*keysDir)
 	store := NewStore()
@@ -64,35 +45,47 @@ func main() {
 			log.Fatal(err)
 		}
 	}()
+	log.Printf("phone-fprint-auth daemon: local=%s (%d paired key(s))", *socketPath, len(keys))
 
-	// Phone surface: LAN long-poll, signed decision, healthz. HTTPS-only
-	// (TLS >= 1.2) via tls.NewListener; plain HTTP is refused at startup.
-	phoneLn, err := net.Listen("tcp", *addr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("phone-fprint-auth daemon: local=%s phone=%s (%d paired key(s))", *socketPath, *addr, len(keys))
-	go func() {
-		if err := http.Serve(tls.NewListener(phoneLn, tlsCfg), newPhoneMux(store, keys)); err != nil {
+	// Phone surface: the real link is the BlueZ SPP server (see bt.go). The
+	// -phone-sim-socket listener is test-only: it accepts plain framed streams
+	// over a unix socket exactly like the SPP RFCOMM socket will.
+	if *simSocketPath != "" {
+		ln, err := servePhoneSimSocket(*simSocketPath, store, keys)
+		if err != nil {
 			log.Fatal(err)
 		}
-	}()
+		defer ln.Close()
+		log.Printf("phone-fprint-auth daemon: phone sim socket listening on %s", *simSocketPath)
+	}
 
 	select {}
 }
 
-// loadTLSConfig loads the PEM certificate + key pair and returns a server
-// tls.Config enforcing TLS >= 1.2. CipherSuites is left unset so Go's default
-// (safe, policy-tracked) cipher list applies.
-func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+// servePhoneSimSocket listens on the given unix socket path and hands every
+// accepted connection to startPhoneLink. Any stale socket file from a
+// previous run is removed first; the socket file is chmodded 0700. The
+// returned listener must be closed by the caller to stop accepting.
+func servePhoneSimSocket(path string, store *Store, keys map[string]ed25519.PublicKey) (net.Listener, error) {
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
 	}
-	return &tls.Config{
-		MinVersion:   tls.VersionTLS12,
-		Certificates: []tls.Certificate{cert},
-	}, nil
+	if err := os.Chmod(path, 0700); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			startPhoneLink(conn, store, keys)
+		}
+	}()
+	return ln, nil
 }
 
 // newLocalMux wires the root-only local surface (unix socket): session
@@ -130,52 +123,8 @@ func newLocalMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 	return mux
 }
 
-// newPhoneMux wires the LAN phone surface (TCP): pending long-poll
-// (GET /v1/pending), signed decision (POST /v1/session/{id}/decision), and
-// healthz only.
-func newPhoneMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.NotFound(w, r)
-			return
-		}
-		io.WriteString(w, "ok")
-	})
-
-	mux.HandleFunc("/v1/pending", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.NotFound(w, r)
-			return
-		}
-		handlePending(w, r, store)
-	})
-
-	// Session creation is root-only and lives on the local unix-socket mux.
-	// Register the exact path here so POST /v1/session on the phone surface
-	// gets a real 404 instead of a 301 redirect to the subtree below.
-	mux.HandleFunc("/v1/session", func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
-	})
-
-	// Subtree dispatch: two segments = {id}/decision.
-	mux.HandleFunc("/v1/session/", func(w http.ResponseWriter, r *http.Request) {
-		suffix := strings.TrimPrefix(r.URL.Path, "/v1/session/")
-		parts := strings.Split(strings.Trim(suffix, "/"), "/")
-		if len(parts) == 2 && parts[1] == "decision" && r.Method == http.MethodPost {
-			handleDecisionSession(w, r, store, keys, parts[0])
-			return
-		}
-		http.NotFound(w, r)
-	})
-
-	return mux
-}
-
 // phoneLinks tracks the number of active phone links (SPP-connected phones).
-// Link registration/unregistration is wired by later todos; today only
-// phoneConnected reads the count.
+// Link registration/unregistration happens in phone_link.go.
 var phoneLinks = struct {
 	sync.Mutex
 	active int
@@ -274,69 +223,6 @@ func decide(store *Store, keys map[string]ed25519.PublicKey, id, decision, sigB6
 	}
 	audit("decision-failed", "id", id, "reason", "unpaired-key")
 	return http.StatusUnauthorized, "", ""
-}
-
-// handleDecisionSession decodes the signed decision request and delegates
-// verification and transition to decide. Responses: 200 decided, 400 bad
-// decision value, 401 bad/absent sig or no matching key, 404 unknown id,
-// 409 not pending (already decided or expired).
-func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store, keys map[string]ed25519.PublicKey, id string) {
-	var req struct {
-		Decision string `json:"decision"`
-		Sig      string `json:"sig"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	code, status, key := decide(store, keys, id, req.Decision, req.Sig)
-	switch code {
-	case http.StatusOK:
-		writeJSON(w, code, map[string]string{"status": status, "key": key})
-	case http.StatusBadRequest:
-		writeJSON(w, code, map[string]string{"error": "decision must be approve or deny"})
-	case http.StatusUnauthorized:
-		writeJSON(w, code, map[string]string{"error": "invalid signature"})
-	case http.StatusNotFound:
-		writeJSON(w, code, map[string]string{"error": "unknown session"})
-	case http.StatusConflict:
-		writeJSON(w, code, map[string]string{"error": "session is not pending"})
-	default:
-		writeJSON(w, code, map[string]string{"error": "decision failed"})
-	}
-}
-
-// handlePending is the long-poll endpoint: it holds up to wait seconds and
-// returns 200 with the new session as soon as one is created, or 204 when the
-// wait elapses. wait is given in seconds (?wait=<sec>), default 60, clamped to
-// maxPendingWaitSecs.
-func handlePending(w http.ResponseWriter, r *http.Request, store *Store) {
-	s := store.WaitPending(pendingWait(r))
-	if s == nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"id":      s.ID,
-		"nonce":   base64.StdEncoding.EncodeToString(s.Nonce),
-		"user":    s.User,
-		"service": s.Service,
-		"tty":     s.TTY,
-	})
-}
-
-// pendingWait parses ?wait=<sec> (default 60) and clamps it to
-// maxPendingWaitSecs. Malformed, negative, or out-of-range values fall back
-// to the default; huge values are clamped instead of pinning a goroutine
-// for an arbitrary duration.
-func pendingWait(r *http.Request) time.Duration {
-	wait := 60 * time.Second
-	if v := r.URL.Query().Get("wait"); v != "" {
-		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
-			if secs > maxPendingWaitSecs {
-				secs = maxPendingWaitSecs
-			}
-			wait = time.Duration(secs) * time.Second
-		}
-	}
-	return wait
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
