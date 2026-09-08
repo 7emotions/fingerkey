@@ -67,6 +67,18 @@ class DecisionResult {
   bool get isError => error != null;
 }
 
+/// A connection-state change on the Bluetooth link. [connected] is true on
+/// `connected` events and false on `disconnected`/`error` events; [address]
+/// is the remote MAC on connected/disconnected, [message] the transport
+/// error text on error events.
+class ConnectionStatus {
+  const ConnectionStatus({required this.connected, this.address, this.message});
+
+  final bool connected;
+  final String? address;
+  final String? message;
+}
+
 /// Framed SPP client: consumes the daemon's push stream and posts signed
 /// decisions over the shared [BtLink].
 class BtClient {
@@ -98,6 +110,27 @@ class BtClient {
       }
     });
   }
+
+  /// The stream of connection-state changes on the link: yields a
+  /// [ConnectionStatus] for every `connected`, `disconnected` and `error`
+  /// event (discovery results and `data` frames are not part of it).
+  Stream<ConnectionStatus> connection() async* {
+    await for (final BtEvent event in _link.events) {
+      switch (event.status) {
+        case 'connected':
+          yield ConnectionStatus(connected: true, address: event.address);
+        case 'disconnected':
+          yield ConnectionStatus(connected: false, address: event.address);
+        case 'error':
+          yield ConnectionStatus(connected: false, message: event.message);
+      }
+    }
+  }
+
+  /// Dials the daemon's SPP server at [address]. Reconnects a dropped link;
+  /// throws a [PlatformException] with code `already_connected` when a
+  /// socket is already active.
+  Future<void> connect(String address) => _link.connect(address);
 
   /// Sends a signed `decision` frame and awaits the matching
   /// `decision-result` frame (matched by session id).

@@ -1,12 +1,14 @@
 /// Approval flow: receive pushed pending sudo/pkexec requests from the
 /// daemon over the Bluetooth SPP link, pop the native biometric prompt, sign
 /// the decision with the device key and send it back as a framed
-/// `decision` message.
+/// `decision` message. A connection banner shows the link state and
+/// reconnects automatically when it drops.
 library;
 
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:local_auth/local_auth.dart';
 
 import 'daemon_client.dart';
@@ -17,44 +19,51 @@ class ApprovalScreen extends StatefulWidget {
   const ApprovalScreen({
     super.key,
     required this.identity,
-    required this.daemonUrl,
-    required this.certPin,
+    required this.btAddress,
     required this.onReset,
+    this.client,
   });
 
   final DeviceIdentity identity;
 
-  /// Legacy daemon URL from the pre-Bluetooth pairing flow, shown for
-  /// context only — the BT transport does not use it.
-  final String daemonUrl;
-
-  /// Legacy TLS certificate fingerprint from the pre-Bluetooth pairing
-  /// flow; unused on the BT transport.
-  final String certPin;
+  /// MAC address of the paired daemon computer; the transport dials its SPP
+  /// server here and reconnects to it when the link drops.
+  final String btAddress;
 
   /// Invoked when the user chooses to drop the current pairing and re-pair:
-  /// the caller clears the stored identity/URL/pin and falls back to the
+  /// the caller clears the stored identity/address and falls back to the
   /// pairing screen.
   final VoidCallback onReset;
+
+  /// The framed SPP client; injectable for tests, defaults to the real
+  /// platform channel.
+  final BtClient? client;
 
   @override
   State<ApprovalScreen> createState() => _ApprovalScreenState();
 }
 
 class _ApprovalScreenState extends State<ApprovalScreen> {
+  static const Duration _reconnectDelay = Duration(seconds: 3);
+
   late final BtClient _client;
   final LocalAuthentication _auth = LocalAuthentication();
   StreamSubscription<PendingSession>? _sub;
+  StreamSubscription<ConnectionStatus>? _connSub;
+  Timer? _reconnectTimer;
 
   bool _disposed = false;
   bool _busy = false;
+  bool _connecting = false;
+  bool _connected = false;
+  String? _connectedAddress;
   PendingSession? _session;
   String _status = 'Listening for requests…';
 
   @override
   void initState() {
     super.initState();
-    _client = BtClient();
+    _client = widget.client ?? BtClient();
     _sub = _client.pending().listen(
           _onSession,
           onError: (Object e, StackTrace st) {
@@ -62,14 +71,78 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
             setState(() => _status = 'BT link unavailable ($e).');
           },
         );
+    _connSub = _client.connection().listen(_onConnection);
+    unawaited(_reconnect());
   }
 
   @override
   void dispose() {
     _disposed = true;
+    _reconnectTimer?.cancel();
     unawaited(_sub?.cancel());
+    unawaited(_connSub?.cancel());
     _client.dispose();
     super.dispose();
+  }
+
+  void _onConnection(ConnectionStatus status) {
+    if (_disposed) return;
+    if (status.connected) {
+      _reconnectTimer?.cancel();
+      setState(() {
+        _connected = true;
+        _connectedAddress = status.address ?? _connectedAddress;
+      });
+    } else {
+      _scheduleReconnect();
+    }
+  }
+
+  /// Marks the link down and arms a reconnect attempt after
+  /// [_reconnectDelay]. Re-arming collapses repeated events into a single
+  /// pending attempt.
+  void _scheduleReconnect() {
+    if (_disposed) return;
+    if (_connected) {
+      setState(() {
+        _connected = false;
+        _connectedAddress = null;
+      });
+    }
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(_reconnectDelay, () {
+      _reconnectTimer = null;
+      unawaited(_reconnect());
+    });
+  }
+
+  /// Dials the daemon at [btAddress]. An `already_connected` error means a
+  /// socket is still active (e.g. just paired) — treat it as connected.
+  Future<void> _reconnect() async {
+    if (_disposed || _connecting) return;
+    _connecting = true;
+    try {
+      await _client.connect(widget.btAddress);
+      if (!_disposed) {
+        setState(() {
+          _connected = true;
+          _connectedAddress = widget.btAddress;
+        });
+      }
+    } on PlatformException catch (e) {
+      if (!_disposed && e.code == 'already_connected') {
+        setState(() {
+          _connected = true;
+          _connectedAddress = widget.btAddress;
+        });
+      } else {
+        _scheduleReconnect();
+      }
+    } catch (_) {
+      _scheduleReconnect();
+    } finally {
+      _connecting = false;
+    }
   }
 
   /// A pending session pushed by the daemon: show it and pop the biometric
@@ -156,6 +229,47 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     unawaited(_sendDecision(session, kActionDeny));
   }
 
+  Widget _connectionBanner() {
+    final Color background;
+    final Color foreground;
+    final IconData icon;
+    final String text;
+    if (_connected) {
+      background = const Color(0xFF123524);
+      foreground = const Color(0xFF8CE0A8);
+      icon = Icons.bluetooth_connected;
+      text = 'connected to ${_connectedAddress ?? widget.btAddress}';
+    } else {
+      background = const Color(0xFF3B1D1D);
+      foreground = const Color(0xFFF0B4B4);
+      icon = Icons.bluetooth_disabled;
+      text = 'disconnected — reconnecting…';
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 18, color: foreground),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: TextStyle(
+                color: foreground,
+                fontFamily: 'monospace',
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -177,24 +291,10 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.surfaceContainerHighest,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(widget.daemonUrl,
-                        style: const TextStyle(
-                            fontFamily: 'monospace', fontSize: 12)),
-                    const SizedBox(height: 4),
-                    Text(_status, style: theme.textTheme.bodyMedium),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 24),
+              _connectionBanner(),
+              const SizedBox(height: 12),
+              Text(_status, style: theme.textTheme.bodyMedium),
+              const SizedBox(height: 16),
               Expanded(
                 child: session == null
                     ? Center(
