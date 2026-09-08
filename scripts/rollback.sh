@@ -15,6 +15,7 @@ fi
 
 UNIT="/etc/systemd/system/phone-approve-daemon.service"
 DAEMON_BIN="/usr/local/libexec/phone-approve-daemon"
+PAIR_BIN="/usr/local/bin/phone-approve"
 HELPER_BIN="/usr/local/libexec/phone-approve-t0"
 PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_phone_approve.so"
 PAM_FILE="/etc/pam.d/sudo"
@@ -27,8 +28,8 @@ systemctl daemon-reload
 echo "disabled + removed phone-approve-daemon unit"
 
 echo "== binaries =="
-rm -f "${DAEMON_BIN}" "${HELPER_BIN}" "${PAM_MODULE}"
-echo "removed ${DAEMON_BIN}, ${HELPER_BIN}, ${PAM_MODULE}"
+rm -f "${DAEMON_BIN}" "${PAIR_BIN}" "${HELPER_BIN}" "${PAM_MODULE}"
+echo "removed ${DAEMON_BIN}, ${PAIR_BIN}, ${HELPER_BIN}, ${PAM_MODULE}"
 
 echo "== PAM restore (${PAM_FILE}) =="
 newest_backup=""
@@ -54,5 +55,5 @@ fi
 echo
 echo "== rollback complete =="
 echo "  unit:     disabled + removed"
-echo "  binaries: ${DAEMON_BIN}, ${HELPER_BIN}, ${PAM_MODULE} removed"
+echo "  binaries: ${DAEMON_BIN}, ${PAIR_BIN}, ${HELPER_BIN}, ${PAM_MODULE} removed"
 echo "  pam:      ${PAM_FILE} restored from backup (or module line stripped)"

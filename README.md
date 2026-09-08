@@ -72,10 +72,10 @@ Before touching a PAM file, the script copies it to `<file>.orig-<timestamp>`. T
 3. On the machine, add the key under a name you choose:
 
 ```sh
-sudo scripts/phone-approve pair my-phone <pubkey_b64>
+sudo phone-approve pair my-phone <pubkey_b64>
 ```
 
-For example, `sudo scripts/phone-approve pair pixel-8 AAAA...base64...`.
+For example, `sudo phone-approve pair pixel-8 AAAA...base64...`.
 
 The daemon loads paired keys only at startup, so restart it after pairing:
 
@@ -83,7 +83,7 @@ The daemon loads paired keys only at startup, so restart it after pairing:
 sudo systemctl restart phone-approve-daemon
 ```
 
-`sudo scripts/phone-approve list` shows paired keys; `sudo scripts/phone-approve remove <name>` removes one. The `pair` and `remove` commands require root because the key store is owned by `phonefprint`.
+`sudo phone-approve list` shows paired keys; `sudo phone-approve remove <name>` removes one. The `pair` and `remove` commands require root because the key store is owned by `phonefprint`.
 
 ## Usage
 
@@ -95,7 +95,7 @@ sudo systemctl restart phone-approve-daemon
 To test without a phone, use the simulator:
 
 ```sh
-scripts/phone-sim --help
+go run ./scripts/phone-sim --help
 ```
 
 ## Rollback
