@@ -35,8 +35,7 @@ Frames are length-prefixed JSON (4-byte big-endian length + payload):
 | --- | --- |
 | `daemon/` | Go single binary `phone-approve-daemon`, run as the `phonefprint` user. Holds pending sessions, issues nonces, verifies signed decisions. Two surfaces: the root-only unix socket `/run/phone-fprint-auth/daemon.sock` (`POST /v1/session`, `GET /v1/session/{id}`, used by the PAM module) and the phone link (BlueZ SPP server). Flags: `-adapter` (HCI adapter), `-socket`, `-keys-dir`, `-phone-sim-socket` — the last listens on a unix socket that accepts plain framed streams exactly like an SPP connection, a test transport for `phone-sim` and the local E2E. |
 | `pam/pam_phone_approve.c` | Native C PAM module. `pam_sm_authenticate` creates a session and polls up to 60s, returns `PAM_SUCCESS` on approve, `PAM_AUTH_ERR` otherwise. A non-2xx session creation (daemon down, no paired keys, no phone connected) fails fast instead of hanging the 60s. The `socket=<path>` argument overrides the daemon socket (used by tests and throwaway PAM services). |
-| `pam/phone-approve-t0.sh` | Legacy T0 pam_exec helper. De-risk only; not wired into the final system. |
-| `scripts/install.sh` | Root install: builds and installs daemon, helper, module, pair CLI and systemd unit; creates the `phonefprint` user and key store; installs the D-Bus policy letting the daemon own `com.phonefprint.auth` (the SPP profile name); wires the module into `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`. |
+| `scripts/install.sh` | Root install: builds and installs daemon, module, pair CLI and systemd unit; creates the `phonefprint` user and key store; installs the D-Bus policy letting the daemon own `com.phonefprint.auth` (the SPP profile name); wires the module into `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`. |
 | `scripts/rollback.sh` | Reverses the install and restores the original PAM files. |
 | `scripts/phone-approve` | Pair CLI (root): `bt-pair`, `pair <name> <pubkey_b64>`, `list`, `remove <name>`. |
 | `scripts/phone-sim` | Simulator for testing. Dials the daemon's `-phone-sim-socket` and speaks the same framed protocol as a real phone: `-socket <path> -key <priv_b64> [-decision approve|deny] [-once]`. |
@@ -167,5 +166,5 @@ Residual risks:
 | `app/` | Flutter Android app. Release APK at `app/build/app/outputs/flutter-apk/app-release.apk`. |
 | `daemon/` | Go approval daemon: unix-socket surface, BlueZ SPP server, session store, key loading, Ed25519 verification, unit tests. |
 | `etc/` | Systemd unit and D-Bus policy. |
-| `pam/` | PAM module C source, legacy T0 helper, build Makefile. |
+| `pam/` | PAM module C source and build Makefile. |
 | `scripts/` | `install.sh`, `rollback.sh`, `phone-approve` pair CLI, `phone-sim` simulator. |
