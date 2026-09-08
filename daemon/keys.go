@@ -10,11 +10,13 @@ import (
 )
 
 // loadPubKeys reads every <name>.pub file in dir and decodes each file as a
-// standard, padded base64 encoding of a 32-byte Ed25519 public key. Files
-// that fail to decode are skipped with a warning so one bad key cannot take
-// the daemon down. A missing directory yields an empty set — with no keys
-// paired, every /decision is 401.
-func loadPubKeys(dir string) []ed25519.PublicKey {
+// standard, padded base64 encoding of a 32-byte Ed25519 public key. The
+// returned map is keyed by the <name>.pub filename with the .pub suffix
+// stripped, so a verified decision can be attributed to the key's name in
+// audit logging. Files that fail to decode are skipped with a warning so one
+// bad key cannot take the daemon down. A missing directory yields an empty
+// map — with no keys paired, every /decision is 401.
+func loadPubKeys(dir string) map[string]ed25519.PublicKey {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -22,9 +24,9 @@ func loadPubKeys(dir string) []ed25519.PublicKey {
 		} else {
 			log.Printf("keys: cannot read %s: %v", dir, err)
 		}
-		return nil
+		return map[string]ed25519.PublicKey{}
 	}
-	var keys []ed25519.PublicKey
+	keys := make(map[string]ed25519.PublicKey)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".pub") {
 			continue
@@ -40,7 +42,7 @@ func loadPubKeys(dir string) []ed25519.PublicKey {
 			log.Printf("keys: skipping %s: not a padded base64 Ed25519 public key", path)
 			continue
 		}
-		keys = append(keys, ed25519.PublicKey(raw))
+		keys[strings.TrimSuffix(e.Name(), ".pub")] = ed25519.PublicKey(raw)
 	}
 	return keys
 }

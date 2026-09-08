@@ -140,7 +140,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Store, ed25519.PrivateKey) 
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	st := NewStore()
-	ts := httptest.NewServer(newHandler(st, []ed25519.PublicKey{pub}))
+	ts := httptest.NewServer(newHandler(st, map[string]ed25519.PublicKey{"alice": pub}))
 	t.Cleanup(ts.Close)
 	return ts, st, priv
 }
@@ -150,7 +150,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Store, ed25519.PrivateKey) 
 func newTestServerNoKeys(t *testing.T) (*httptest.Server, *Store) {
 	t.Helper()
 	st := NewStore()
-	ts := httptest.NewServer(newHandler(st, nil))
+	ts := httptest.NewServer(newHandler(st, map[string]ed25519.PublicKey{}))
 	t.Cleanup(ts.Close)
 	return ts, st
 }

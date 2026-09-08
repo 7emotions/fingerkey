@@ -28,7 +28,7 @@ func main() {
 }
 
 // newHandler wires the HTTP surface around the given store and paired keys.
-func newHandler(store *Store, keys []ed25519.PublicKey) http.Handler {
+func newHandler(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 	mux := http.NewServeMux()
 	limiter := newRateLimiter(10, time.Minute)
 
@@ -120,9 +120,11 @@ func handleGetSession(w http.ResponseWriter, r *http.Request, store *Store, id s
 
 // handleDecisionSession verifies an Ed25519 signature over the pinned decision
 // message against any paired pubkey and, on success, transitions the session.
-// Responses: 200 decided, 400 bad decision value, 401 bad/absent sig or no
-// matching key, 404 unknown id, 409 not pending (already decided or expired).
-func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store, keys []ed25519.PublicKey, id string) {
+// The matching key's name is recoverable from the keys map for audit
+// attribution. Responses: 200 decided, 400 bad decision value, 401 bad/absent
+// sig or no matching key, 404 unknown id, 409 not pending (already decided or
+// expired).
+func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store, keys map[string]ed25519.PublicKey, id string) {
 	s, ok := store.Get(id)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown session"})
@@ -149,7 +151,7 @@ func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store,
 		return
 	}
 	msg := signedMessage(req.Decision, s.User, s.Service, s.TTY, s.Nonce)
-	for _, key := range keys {
+	for name, key := range keys {
 		if ed25519.Verify(key, msg, sig) {
 			status := StatusDenied
 			if req.Decision == "approve" {
@@ -159,7 +161,9 @@ func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store,
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not pending"})
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": s.CurrentStatus()})
+			// name is the paired-key identity that verified this decision;
+			// the audit log (todo 2) will attribute the decision to it.
+			writeJSON(w, http.StatusOK, map[string]string{"status": s.CurrentStatus(), "key": name})
 			return
 		}
 	}
