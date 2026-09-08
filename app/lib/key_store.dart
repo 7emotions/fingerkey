@@ -20,7 +20,7 @@ class DeviceIdentity {
 class KeyStore {
   static const String _kPrivateKey = 'ed25519_private_key';
   static const String _kDaemonUrl = 'daemon_url';
-  static const String defaultDaemonUrl = 'http://192.168.1.100:8766';
+  static const String defaultDaemonUrl = 'http://192.168.112.239:8766';
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 

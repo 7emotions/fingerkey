@@ -1,14 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  The daemon is plain HTTP on the LAN. Cleartext is allowed ONLY for the
-  configured daemon host (default 192.168.1.100); everything else stays TLS-only.
-
-  If you run the daemon on a different LAN host, update the <domain> below
-  before building the APK.
+  Cleartext HTTP is permitted app-wide because this is a LAN-only tool: the
+  daemon URL is user-configurable (no single IP can be pinned) and request
+  authenticity comes from the Ed25519 decision signatures, not TLS. See the
+  README threat model.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">192.168.1.100</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>
