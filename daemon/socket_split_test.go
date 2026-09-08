@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSocketSplit asserts the split between the root-only local surface
@@ -56,6 +57,41 @@ func TestSocketSplit(t *testing.T) {
 			t.Errorf("phone mux %s %s = %d, want 404", tc.method, tc.path, resp.StatusCode)
 		}
 	}
+
+	// POST /v1/session on the phone mux must be a real 404 — no 301 redirect
+	// to the subtree pattern and no session creation.
+	t.Run("phone POST /v1/session is a real 404", func(t *testing.T) {
+		client := &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		req, _ := http.NewRequest(http.MethodPost, phone.URL+"/v1/session", strings.NewReader(`{}`))
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("POST /v1/session: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("status = %d, want 404", resp.StatusCode)
+		}
+		if loc := resp.Header.Get("Location"); loc != "" {
+			t.Errorf("unexpected Location header %q, want a real 404 with no redirect", loc)
+		}
+
+		// The 404 handler must not have created a session: a short
+		// WaitPending would return it if it had.
+		created := make(chan *Session, 1)
+		go func() { created <- store.WaitPending(200 * time.Millisecond) }()
+		select {
+		case s := <-created:
+			if s != nil {
+				t.Errorf("POST /v1/session created session %q, want none", s.ID)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("WaitPending did not return")
+		}
+	})
 
 	// Each mux serves its own endpoints: a valid create on local, healthz on phone.
 	resp := postJSON(t, local.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)

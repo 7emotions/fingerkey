@@ -17,6 +17,12 @@ import (
 	"time"
 )
 
+// maxPendingWaitSecs caps the ?wait= long-poll duration: an unauthenticated
+// LAN peer must not be able to pin a goroutine + timer for arbitrary time,
+// and huge inputs must not overflow the time.Duration conversion. It is a
+// package var (like sessionTTL) so tests can shorten it.
+var maxPendingWaitSecs = 120
+
 func main() {
 	addr := flag.String("addr", ":8766", "listen address")
 	socketPath := flag.String("socket", "/run/phone-fprint-auth/daemon.sock", "unix socket path for the root-only local surface")
@@ -138,6 +144,13 @@ func newPhoneMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 		handlePending(w, r, store)
 	})
 
+	// Session creation is root-only and lives on the local unix-socket mux.
+	// Register the exact path here so POST /v1/session on the phone surface
+	// gets a real 404 instead of a 301 redirect to the subtree below.
+	mux.HandleFunc("/v1/session", func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+
 	// Subtree dispatch: two segments = {id}/decision.
 	mux.HandleFunc("/v1/session/", func(w http.ResponseWriter, r *http.Request) {
 		suffix := strings.TrimPrefix(r.URL.Path, "/v1/session/")
@@ -248,15 +261,10 @@ func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store,
 
 // handlePending is the long-poll endpoint: it holds up to wait seconds and
 // returns 200 with the new session as soon as one is created, or 204 when the
-// wait elapses. wait is given in seconds (?wait=<sec>), default 60.
+// wait elapses. wait is given in seconds (?wait=<sec>), default 60, clamped to
+// maxPendingWaitSecs.
 func handlePending(w http.ResponseWriter, r *http.Request, store *Store) {
-	wait := 60 * time.Second
-	if v := r.URL.Query().Get("wait"); v != "" {
-		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
-			wait = time.Duration(secs) * time.Second
-		}
-	}
-	s := store.WaitPending(wait)
+	s := store.WaitPending(pendingWait(r))
 	if s == nil {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -268,6 +276,23 @@ func handlePending(w http.ResponseWriter, r *http.Request, store *Store) {
 		"service": s.Service,
 		"tty":     s.TTY,
 	})
+}
+
+// pendingWait parses ?wait=<sec> (default 60) and clamps it to
+// maxPendingWaitSecs. Malformed, negative, or out-of-range values fall back
+// to the default; huge values are clamped instead of pinning a goroutine
+// for an arbitrary duration.
+func pendingWait(r *http.Request) time.Duration {
+	wait := 60 * time.Second
+	if v := r.URL.Query().Get("wait"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			if secs > maxPendingWaitSecs {
+				secs = maxPendingWaitSecs
+			}
+			wait = time.Duration(secs) * time.Second
+		}
+	}
+	return wait
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
