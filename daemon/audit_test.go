@@ -44,8 +44,8 @@ func assertCleanAuditLine(t *testing.T, got string) {
 
 func TestAuditSessionCreated(t *testing.T) {
 	buf := swapAudit(t)
-	ts, _, _ := newTestServer(t)
-	resp := postJSON(t, ts.URL+"/v1/session", `{"user":"alice","service":"sudo","tty":"/dev/pts/0"}`)
+	env := newTestServer(t)
+	resp := postJSON(t, env.local.URL+"/v1/session", `{"user":"alice","service":"sudo","tty":"/dev/pts/0"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
@@ -63,13 +63,13 @@ func TestAuditSessionCreated(t *testing.T) {
 
 func TestAuditDecisionApprove(t *testing.T) {
 	buf := swapAudit(t)
-	ts, st, priv := newTestServer(t)
-	s, err := st.Create("alice", "sudo", "")
+	env := newTestServer(t)
+	s, err := env.store.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	sig := signDecision(priv, "approve", s)
-	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision",
+	sig := signDecision(env.priv, "approve", s)
+	resp := postJSON(t, env.phone.URL+"/v1/session/"+s.ID+"/decision",
 		`{"decision":"approve","sig":"`+sig+`"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -91,12 +91,12 @@ func TestAuditDecisionApprove(t *testing.T) {
 
 func TestAuditDecisionFailed(t *testing.T) {
 	buf := swapAudit(t)
-	ts, st, _ := newTestServer(t)
-	s, err := st.Create("alice", "sudo", "")
+	env := newTestServer(t)
+	s, err := env.store.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	resp := postJSON(t, ts.URL+"/v1/session/"+s.ID+"/decision",
+	resp := postJSON(t, env.phone.URL+"/v1/session/"+s.ID+"/decision",
 		`{"decision":"approve","sig":"!!!not-base64!!!"}`)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)

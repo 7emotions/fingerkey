@@ -9,41 +9,98 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 func main() {
 	addr := flag.String("addr", ":8766", "listen address")
+	socketPath := flag.String("socket", "/run/phone-fprint-auth/daemon.sock", "unix socket path for the root-only local surface")
 	keysDir := flag.String("keys-dir", "/var/lib/phone-fprint-auth/keys", "directory of <name>.pub Ed25519 public keys (base64)")
 	flag.Parse()
 
 	keys := loadPubKeys(*keysDir)
-	log.Printf("phone-fprint-auth daemon listening on %s (%d paired key(s))", *addr, len(keys))
-	if err := http.ListenAndServe(*addr, newHandler(NewStore(), keys)); err != nil {
+	store := NewStore()
+
+	// Local surface: root-only session creation and status polling over a 0700
+	// unix socket. systemd's RuntimeDirectory normally owns the parent dir;
+	// MkdirAll is best-effort for running outside the unit. Remove any stale
+	// socket left by a previous run, then chmod the socket file itself to 0700
+	// so only root (DAC override) can connect.
+	_ = os.MkdirAll(filepath.Dir(*socketPath), 0700)
+	_ = os.Remove(*socketPath)
+	localLn, err := net.Listen("unix", *socketPath)
+	if err != nil {
 		log.Fatal(err)
 	}
+	if err := os.Chmod(*socketPath, 0700); err != nil {
+		log.Fatal(err)
+	}
+	go func() {
+		if err := http.Serve(localLn, newLocalMux(store)); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// Phone surface: LAN long-poll, signed decision, healthz. Plain HTTP for
+	// now; TLS arrives in a later todo.
+	phoneLn, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("phone-fprint-auth daemon: local=%s phone=%s (%d paired key(s))", *socketPath, *addr, len(keys))
+	go func() {
+		if err := http.Serve(phoneLn, newPhoneMux(store, keys)); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	select {}
 }
 
-// newHandler wires the HTTP surface around the given store and paired keys.
-func newHandler(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
+// newLocalMux wires the root-only local surface (unix socket): session
+// creation (POST /v1/session) and status polling (GET /v1/session/{id}) only.
+func newLocalMux(store *Store) http.Handler {
 	mux := http.NewServeMux()
-	limiter := newRateLimiter(10, time.Minute)
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "ok")
-	})
-
-	// Go 1.18 ServeMux: "/v1/session" matches only the exact path, so subpaths
-	// need their own subtree pattern — two registrations, not one.
+	// Go 1.18 ServeMux: "/v1/session" matches only the exact path.
 	mux.HandleFunc("/v1/session", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
 			return
 		}
-		handleCreateSession(w, r, store, limiter)
+		handleCreateSession(w, r, store)
+	})
+
+	// Subtree dispatch: one segment = session id (status).
+	mux.HandleFunc("/v1/session/", func(w http.ResponseWriter, r *http.Request) {
+		suffix := strings.TrimPrefix(r.URL.Path, "/v1/session/")
+		parts := strings.Split(strings.Trim(suffix, "/"), "/")
+		if len(parts) == 1 && r.Method == http.MethodGet {
+			handleGetSession(w, r, store, parts[0])
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	return mux
+}
+
+// newPhoneMux wires the LAN phone surface (TCP): pending long-poll
+// (GET /v1/pending), signed decision (POST /v1/session/{id}/decision), and
+// healthz only.
+func newPhoneMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.NotFound(w, r)
+			return
+		}
+		io.WriteString(w, "ok")
 	})
 
 	mux.HandleFunc("/v1/pending", func(w http.ResponseWriter, r *http.Request) {
@@ -54,23 +111,11 @@ func newHandler(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 		handlePending(w, r, store)
 	})
 
-	// Subtree dispatch: one segment = session id, two = {id}/decision.
+	// Subtree dispatch: two segments = {id}/decision.
 	mux.HandleFunc("/v1/session/", func(w http.ResponseWriter, r *http.Request) {
 		suffix := strings.TrimPrefix(r.URL.Path, "/v1/session/")
 		parts := strings.Split(strings.Trim(suffix, "/"), "/")
-		if len(parts) == 1 {
-			if r.Method != http.MethodGet {
-				http.NotFound(w, r)
-				return
-			}
-			handleGetSession(w, r, store, parts[0])
-			return
-		}
-		if len(parts) == 2 && parts[1] == "decision" {
-			if r.Method != http.MethodPost {
-				http.NotFound(w, r)
-				return
-			}
+		if len(parts) == 2 && parts[1] == "decision" && r.Method == http.MethodPost {
 			handleDecisionSession(w, r, store, keys, parts[0])
 			return
 		}
@@ -80,11 +125,7 @@ func newHandler(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 	return mux
 }
 
-func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store, limiter *rateLimiter) {
-	if !limiter.allow(clientIP(r)) {
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
-		return
-	}
+func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store) {
 	var req struct {
 		User    string `json:"user"`
 		Service string `json:"service"`
@@ -206,48 +247,4 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-// clientIP returns the remote IP of the request (RemoteAddr without port).
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// rateLimiter is a fixed-window in-memory per-key counter.
-type rateLimiter struct {
-	mu      sync.Mutex
-	limit   int
-	window  time.Duration
-	entries map[string]*rateEntry
-}
-
-type rateEntry struct {
-	start time.Time
-	count int
-}
-
-func newRateLimiter(limit int, window time.Duration) *rateLimiter {
-	return &rateLimiter{
-		limit:   limit,
-		window:  window,
-		entries: make(map[string]*rateEntry),
-	}
-}
-
-// allow reports whether key is under the limit for the current window.
-func (rl *rateLimiter) allow(key string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	now := time.Now()
-	e, ok := rl.entries[key]
-	if !ok || now.Sub(e.start) >= rl.window {
-		rl.entries[key] = &rateEntry{start: now, count: 1}
-		return true
-	}
-	e.count++
-	return e.count <= rl.limit
 }
