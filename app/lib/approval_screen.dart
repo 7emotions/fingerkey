@@ -18,6 +18,7 @@ class ApprovalScreen extends StatefulWidget {
     required this.identity,
     required this.daemonUrl,
     required this.certPin,
+    required this.onReset,
   });
 
   final DeviceIdentity identity;
@@ -26,6 +27,11 @@ class ApprovalScreen extends StatefulWidget {
   /// 64-lowercase-hex SHA-256 fingerprint of the daemon's TLS certificate;
   /// the connection is pinned to it.
   final String certPin;
+
+  /// Invoked when the user chooses to drop the current pairing and re-pair:
+  /// the caller clears the stored identity/URL/pin and falls back to the
+  /// pairing screen.
+  final VoidCallback onReset;
 
   @override
   State<ApprovalScreen> createState() => _ApprovalScreenState();
@@ -163,7 +169,16 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     final theme = Theme.of(context);
     final session = _session;
     return Scaffold(
-      appBar: AppBar(title: const Text('PHONE FPRINT AUTH')),
+      appBar: AppBar(
+        title: const Text('PHONE FPRINT AUTH'),
+        actions: [
+          IconButton(
+            tooltip: 'Re-pair device',
+            icon: const Icon(Icons.settings),
+            onPressed: widget.onReset,
+          ),
+        ],
+      ),
       body: SafeArea(
         child: Padding(
           padding: const EdgeInsets.all(24),

@@ -39,6 +39,14 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
   String? _storedUrl;
   String? _certPin;
 
+  /// True after a re-pair reset: the bootstrap values must be ignored and
+  /// the pairing screen shown with a freshly generated identity.
+  bool _reset = false;
+
+  /// Fresh-identity generation for the reset path; memoized so rebuilds do
+  /// not regenerate (and re-store) a new keypair every frame.
+  Future<DeviceIdentity>? _generation;
+
   static Future<_Bootstrap> _load() async {
     final keyStore = KeyStore();
     final identity = await keyStore.load();
@@ -55,10 +63,29 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
 
   void _onPaired(DeviceIdentity identity, String daemonUrl, String certPin) {
     setState(() {
+      _reset = false;
+      _generation = null;
       _identity = identity;
       _daemonUrl = daemonUrl;
       _storedUrl = daemonUrl;
       _certPin = certPin;
+    });
+  }
+
+  /// Re-pair: wipe the stored daemon URL, certificate pin and Ed25519
+  /// private key, then fall back to the pairing screen, which generates a
+  /// fresh identity.
+  Future<void> _onReset() async {
+    final data = await _bootstrap;
+    await data.keyStore.clear();
+    if (!mounted) return;
+    setState(() {
+      _reset = true;
+      _identity = null;
+      _daemonUrl = null;
+      _storedUrl = null;
+      _certPin = null;
+      _generation = data.keyStore.generate();
     });
   }
 
@@ -91,13 +118,15 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
               body: Center(child: CircularProgressIndicator()),
             );
           }
-          final identity = _identity ?? data.identity;
-          final daemonUrl = _daemonUrl ?? data.daemonUrl;
-          final storedUrl = _storedUrl ?? data.storedUrl;
-          final certPin = _certPin ?? data.certPin;
+          final identity = _reset ? null : (_identity ?? data.identity);
+          final daemonUrl = _reset
+              ? KeyStore.defaultDaemonUrl
+              : (_daemonUrl ?? data.daemonUrl);
+          final storedUrl = _reset ? null : (_storedUrl ?? data.storedUrl);
+          final certPin = _reset ? null : (_certPin ?? data.certPin);
           if (identity == null) {
             return FutureBuilder<DeviceIdentity>(
-              future: data.keyStore.generate(),
+              future: _generation ?? data.keyStore.generate(),
               builder: (context, genSnapshot) {
                 final generated = genSnapshot.data;
                 if (generated == null) {
@@ -129,6 +158,7 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
             identity: identity,
             daemonUrl: daemonUrl,
             certPin: certPin!,
+            onReset: _onReset,
           );
         },
       ),

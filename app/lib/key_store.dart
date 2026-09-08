@@ -70,6 +70,15 @@ class KeyStore {
   Future<void> setCertPin(String pin) =>
       _storage.write(key: _kCertPin, value: pin);
 
+  /// Wipes the pairing state: daemon URL, certificate pin, and the Ed25519
+  /// private key. Used by the re-pair flow so that a fresh identity is
+  /// generated on the next pairing instead of reusing a stale one.
+  Future<void> clear() async {
+    await _storage.delete(key: _kDaemonUrl);
+    await _storage.delete(key: _kCertPin);
+    await _storage.delete(key: _kPrivateKey);
+  }
+
   /// True when [url] parses as an `https://` URL.
   static bool isHttpsUrl(String url) {
     final uri = Uri.tryParse(url.trim());
