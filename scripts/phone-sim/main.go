@@ -1,109 +1,155 @@
-// Command phone-sim is the phone simulator for phone-fprint-auth. It
-// long-polls the daemon's /v1/pending endpoint and, for every pending
-// session, builds the pinned signed message with the session's nonce, signs
-// it with the given Ed25519 private key, and POSTs the decision back to the
-// daemon. It keeps polling after every response.
+// Command phone-sim is the phone simulator for phone-fprint-auth. It dials
+// the daemon's test phone-link unix socket (-phone-sim-socket) and speaks the
+// same framed protocol as the production phone (SPP): the daemon pushes
+// pending frames, the sim builds the pinned signed message with the session's
+// nonce, signs it with the given Ed25519 private key, and answers with a
+// decision frame. It keeps listening after every answer unless -once.
 //
 // Usage:
 //
-//	phone-sim -key <priv_b64> (-pin <64-hex> | -insecure) [-action approve|deny] [-url https://127.0.0.1:8766]
+//	phone-sim -socket <path> -key <priv_b64> [-decision approve|deny] [-once]
 //
 // <priv_b64> is the standard, padded base64 encoding of a 64-byte Ed25519
-// private key; -action defaults to "approve". The daemon is HTTPS-only, so
-// exactly one of -pin (leaf cert SHA-256, 64 lowercase hex) or -insecure
-// (skip verification, testing only) is required.
+// private key; -decision defaults to "approve".
 package main
 
 import (
-	"bytes"
 	"crypto/ed25519"
-	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
+	"net"
 	"strings"
 	"time"
 
 	"phonefprint/scripts/format"
 )
 
-// pollTimeout exceeds the daemon's maximum long-poll hold (60s) so a pending
-// poll is never cut short by the client.
-const pollTimeout = 75 * time.Second
+// maxFrameSize caps a single frame at 1 MiB, mirroring daemon/frame.go.
+const maxFrameSize = 1 << 20
+
+// errFrameTooLarge is returned by readFrame when the declared frame length
+// exceeds maxFrameSize; no payload is allocated in that case.
+var errFrameTooLarge = errors.New("frame too large")
 
 func main() {
+	socket := flag.String("socket", "", "unix socket path the daemon's -phone-sim-socket listens on")
 	keyB64 := flag.String("key", "", "base64 (standard, padded) Ed25519 private key")
-	action := flag.String("action", "approve", "decision to send: approve or deny")
-	baseURL := flag.String("url", "https://127.0.0.1:8766", "daemon base URL")
-	pin := flag.String("pin", "", "leaf cert SHA-256 (64 lowercase hex) to pin")
-	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (testing only)")
+	decision := flag.String("decision", "approve", "decision to send: approve or deny")
+	once := flag.Bool("once", false, "handle one pending request, then exit")
 	flag.Parse()
 
+	if *socket == "" {
+		log.Fatal("phone-sim: -socket is required")
+	}
 	if *keyB64 == "" {
 		log.Fatal("phone-sim: -key is required")
-	}
-	if *pin == "" && !*insecure {
-		log.Fatal("phone-sim: one of -pin or -insecure is required (daemon is HTTPS-only)")
-	}
-	if *pin != "" && *insecure {
-		log.Fatal("phone-sim: -pin and -insecure are mutually exclusive")
 	}
 	priv, err := decodePriv(*keyB64)
 	if err != nil {
 		log.Fatalf("phone-sim: %v", err)
 	}
-	if *action != "approve" && *action != "deny" {
-		log.Fatalf("phone-sim: -action must be approve or deny, got %q", *action)
+	if *decision != "approve" && *decision != "deny" {
+		log.Fatalf("phone-sim: -decision must be approve or deny, got %q", *decision)
 	}
-	tlsCfg, err := tlsConfig(*pin, *insecure)
-	if err != nil {
-		log.Fatalf("phone-sim: %v", err)
-	}
-	base := strings.TrimRight(*baseURL, "/")
 
-	client := &http.Client{
-		Timeout:   pollTimeout,
-		Transport: &http.Transport{TLSClientConfig: tlsCfg},
-	}
 	for {
-		if err := pollOnce(client, base, *action, priv); err != nil {
-			log.Printf("phone-sim: %v (retrying in 2s)", err)
+		conn, err := net.Dial("unix", *socket)
+		if err != nil {
+			log.Printf("phone-sim: dial %s failed: %v (retrying in 2s)", *socket, err)
 			time.Sleep(2 * time.Second)
+			continue
+		}
+		log.Printf("phone-sim: connected to %s (decision=%s)", *socket, *decision)
+		handled, linkErr := handleLink(conn, *decision, priv)
+		_ = conn.Close()
+		if *once && handled {
+			log.Printf("phone-sim: handled one pending request, exiting")
+			return
+		}
+		if linkErr != nil {
+			log.Printf("phone-sim: %v", linkErr)
+		}
+		log.Printf("phone-sim: link closed, reconnecting in 2s")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// handleLink reads frames from the daemon until the link closes or a write
+// fails. Every pending frame is signed and answered with a decision frame;
+// decision-result frames are logged; anything else is ignored. It reports
+// whether at least one pending request was handled.
+func handleLink(conn net.Conn, decision string, priv ed25519.PrivateKey) (bool, error) {
+	handled := false
+	for {
+		payload, err := readFrame(conn)
+		if err != nil {
+			return handled, err
+		}
+		var typ struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(payload, &typ); err != nil {
+			log.Printf("phone-sim: ignoring malformed frame: %v", err)
+			continue
+		}
+		switch typ.Type {
+		case "pending":
+			handled = true
+			if err := answerPending(conn, payload, decision, priv); err != nil {
+				return handled, err
+			}
+		case "decision-result":
+			var res decisionResultFrame
+			if err := json.Unmarshal(payload, &res); err != nil {
+				log.Printf("phone-sim: ignoring malformed decision-result: %v", err)
+				continue
+			}
+			if res.Error != "" {
+				log.Printf("phone-sim: decision %q rejected: %s", res.ID, res.Error)
+			} else {
+				log.Printf("phone-sim: decision %q accepted: status=%s key=%q", res.ID, res.Status, res.Key)
+			}
+		default:
+			log.Printf("phone-sim: ignoring frame type %q", typ.Type)
 		}
 	}
 }
 
-// tlsConfig builds the client TLS config: with -insecure it skips all
-// verification; with -pin it skips chain verification (the daemon cert is
-// self-signed) but requires the leaf cert's SHA-256 to equal the pin.
-func tlsConfig(pin string, insecure bool) (*tls.Config, error) {
-	if insecure {
-		return &tls.Config{InsecureSkipVerify: true}, nil
+// answerPending parses one pending frame, signs the pinned message with the
+// pending nonce, and writes the decision frame back.
+func answerPending(conn net.Conn, payload []byte, decision string, priv ed25519.PrivateKey) error {
+	var p pendingFrame
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("cannot decode pending frame: %v", err)
 	}
-	pinBytes, err := hex.DecodeString(strings.TrimSpace(pin))
-	if err != nil || len(pinBytes) != sha256.Size {
-		return nil, fmt.Errorf("-pin must be a 64-character lowercase hex SHA-256, got %q", pin)
+	nonce, err := base64.StdEncoding.DecodeString(p.Nonce)
+	if err != nil || len(nonce) != 32 {
+		return fmt.Errorf("session %s: bad nonce in pending frame", p.ID)
 	}
-	return &tls.Config{
-		InsecureSkipVerify: true, // replaced by leaf pinning below
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return fmt.Errorf("daemon sent no certificate")
-			}
-			sum := sha256.Sum256(rawCerts[0])
-			if !bytes.Equal(sum[:], pinBytes) {
-				return fmt.Errorf("leaf certificate SHA-256 mismatch: got %x, want %x", sum, pinBytes)
-			}
-			return nil
-		},
-	}, nil
+
+	msg := format.SignedMessage(decision, p.User, p.Service, p.TTY, nonce)
+	sig := ed25519.Sign(priv, msg)
+	out, err := json.Marshal(decisionFrame{
+		Type:     "decision",
+		ID:       p.ID,
+		Decision: decision,
+		Sig:      base64.StdEncoding.EncodeToString(sig),
+	})
+	if err != nil {
+		return err
+	}
+	if err := writeFrame(conn, out); err != nil {
+		return fmt.Errorf("session %s: decision write failed: %v", p.ID, err)
+	}
+	log.Printf("session %s user=%q service=%q tty=%q: sent %s",
+		p.ID, p.User, p.Service, p.TTY, decision)
+	return nil
 }
 
 // decodePriv decodes the standard padded base64 private key and checks its
@@ -119,8 +165,11 @@ func decodePriv(b64 string) (ed25519.PrivateKey, error) {
 	return ed25519.PrivateKey(raw), nil
 }
 
-// pending is the body of a 200 /v1/pending response.
-type pending struct {
+// pendingFrame is the daemon→phone notification for a new pending session.
+// The nonce is standard-base64 of the 32 raw bytes. The shape mirrors
+// daemon/phone_link.go.
+type pendingFrame struct {
+	Type    string `json:"type"`
 	ID      string `json:"id"`
 	Nonce   string `json:"nonce"`
 	User    string `json:"user"`
@@ -128,53 +177,51 @@ type pending struct {
 	TTY     string `json:"tty"`
 }
 
-// pollOnce performs one long-poll cycle: it waits up to 60s for a pending
-// session and, if one arrives, signs and posts the decision. Any error is
-// returned to the caller, which retries after a short pause.
-func pollOnce(client *http.Client, base, action string, priv ed25519.PrivateKey) error {
-	resp, err := client.Get(base + "/v1/pending?wait=60")
-	if err != nil {
-		return fmt.Errorf("poll failed: %v", err)
-	}
-	defer resp.Body.Close()
+// decisionFrame is the phone→daemon frame: a signed approve/deny.
+type decisionFrame struct {
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	Decision string `json:"decision"`
+	Sig      string `json:"sig"`
+}
 
-	switch resp.StatusCode {
-	case http.StatusNoContent:
-		fmt.Println("poll: no pending session")
-		return nil
-	case http.StatusOK:
-		// a session arrived — fall through to handle it
-	default:
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("poll returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
+// decisionResultFrame is the daemon→phone answer to a decision.
+type decisionResultFrame struct {
+	Type   string `json:"type"`
+	ID     string `json:"id"`
+	Status string `json:"status,omitempty"`
+	Key    string `json:"key,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
 
-	var p pending
-	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
-		return fmt.Errorf("cannot decode pending session: %v", err)
+// readFrame reads one length-prefixed frame from r: a 4-byte big-endian
+// uint32 length followed by exactly that many payload bytes. If the declared
+// length exceeds maxFrameSize it returns errFrameTooLarge without allocating
+// the payload. It mirrors daemon/frame.go.
+func readFrame(r io.Reader) ([]byte, error) {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
 	}
-	nonce, err := base64.StdEncoding.DecodeString(p.Nonce)
-	if err != nil || len(nonce) != 32 {
-		return fmt.Errorf("session %s: bad nonce in pending response", p.ID)
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n > maxFrameSize {
+		return nil, errFrameTooLarge
 	}
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
 
-	msg := format.SignedMessage(action, p.User, p.Service, p.TTY, nonce)
-	sig := ed25519.Sign(priv, msg)
-	body, err := json.Marshal(struct {
-		Decision string `json:"decision"`
-		Sig      string `json:"sig"`
-	}{action, base64.StdEncoding.EncodeToString(sig)})
-	if err != nil {
+// writeFrame writes payload to w as one length-prefixed frame: the 4-byte
+// big-endian uint32 length followed by the payload bytes.
+func writeFrame(w io.Writer, payload []byte) error {
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
-
-	post, err := client.Post(base+"/v1/session/"+p.ID+"/decision", "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("session %s: decision POST failed: %v", p.ID, err)
-	}
-	defer post.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(post.Body, 4096))
-	fmt.Printf("session %s user=%q service=%q tty=%q: sent %s -> HTTP %d %s\n",
-		p.ID, p.User, p.Service, p.TTY, action, post.StatusCode, strings.TrimSpace(string(respBody)))
-	return nil
+	_, err := w.Write(payload)
+	return err
 }
