@@ -5,10 +5,12 @@ library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import 'daemon_client.dart';
 import 'key_store.dart';
+import 'pairing_qr.dart';
 
 class PairingScreen extends StatefulWidget {
   const PairingScreen({
@@ -55,6 +57,19 @@ class _PairingScreenState extends State<PairingScreen> {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Public key copied to clipboard')),
+    );
+  }
+
+  Future<void> _scanQr() async {
+    final info = await Navigator.of(context).push<PairingInfo>(
+      MaterialPageRoute(builder: (_) => const _QrScanScreen()),
+    );
+    if (info == null || !mounted) return;
+    _urlController.text = info.url;
+    _pinController.text = info.pin;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+          content: Text('QR scanned — daemon URL and fingerprint filled')),
     );
   }
 
@@ -138,6 +153,28 @@ class _PairingScreenState extends State<PairingScreen> {
               ),
             ),
             const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _scanQr,
+              icon: const Icon(Icons.qr_code_scanner),
+              label: const Text('SCAN QR'),
+            ),
+            Center(
+              child: Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  'Run `phone-approve pair-qr` on the computer and point the '
+                  'camera at the code it prints.',
+                  style: theme.textTheme.bodySmall,
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
+            const Divider(height: 32),
+            Text(
+              '…or enter the details manually',
+              style: theme.textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
             TextField(
               controller: _urlController,
               keyboardType: TextInputType.url,
@@ -169,6 +206,119 @@ class _PairingScreenState extends State<PairingScreen> {
               label: const Text('START LISTENING'),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Full-screen camera view that scans the pairing QR shown by the computer's
+/// `phone-approve pair-qr`. Pops with the validated [PairingInfo] on success;
+/// on a malformed QR it tells the operator and keeps scanning.
+class _QrScanScreen extends StatefulWidget {
+  const _QrScanScreen();
+
+  @override
+  State<_QrScanScreen> createState() => _QrScanScreenState();
+}
+
+class _QrScanScreenState extends State<_QrScanScreen> {
+  /// Set once a valid pairing QR has been parsed; guards against onDetect
+  /// firing again while the route is being popped.
+  bool _handled = false;
+
+  /// The last payload that was shown to the operator as invalid, so the
+  /// error SnackBar is not re-shown for the same QR on every frame.
+  String? _lastRejectedRaw;
+
+  void _onDetect(BarcodeCapture capture) {
+    if (_handled) return;
+    final rawValue =
+        capture.barcodes.isEmpty ? null : capture.barcodes.first.rawValue;
+    if (rawValue == null || rawValue.isEmpty) return;
+
+    final info = parsePairingQr(rawValue);
+    if (info == null) {
+      if (rawValue == _lastRejectedRaw) return;
+      _lastRejectedRaw = rawValue;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('not a phone-fprint-auth pairing QR')),
+      );
+      return;
+    }
+
+    _handled = true;
+    Navigator.of(context).pop(info);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(title: const Text('SCAN PAIRING QR')),
+      body: Column(
+        children: [
+          Expanded(
+            child: MobileScanner(
+              onDetect: _onDetect,
+              errorBuilder: (context, error) =>
+                  _ScannerErrorView(error: error),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Text(
+              'Point the camera at the QR printed by\n'
+              '`phone-approve pair-qr`',
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: Colors.white70),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ScannerErrorView extends StatelessWidget {
+  const _ScannerErrorView({required this.error});
+
+  final MobileScannerException error;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ColoredBox(
+      color: Colors.black,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.no_photography,
+                  color: Colors.white, size: 48),
+              const SizedBox(height: 16),
+              Text(
+                error.errorCode.message,
+                textAlign: TextAlign.center,
+                style: theme.textTheme.titleMedium
+                    ?.copyWith(color: Colors.white),
+              ),
+              if (error.errorDetails?.message case final String message) ...[
+                const SizedBox(height: 8),
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: Colors.white70),
+                ),
+              ],
+            ],
+          ),
         ),
       ),
     );
