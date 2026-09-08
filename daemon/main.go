@@ -97,6 +97,7 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store, l
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session creation failed"})
 		return
 	}
+	audit("session-created", "id", s.ID, "user", s.User, "service", s.Service, "tty", s.TTY)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"id":    s.ID,
 		"nonce": base64.StdEncoding.EncodeToString(s.Nonce),
@@ -128,6 +129,7 @@ func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store,
 	s, ok := store.Get(id)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown session"})
+		audit("decision-failed", "id", id, "reason", "unknown-session")
 		return
 	}
 	var req struct {
@@ -139,15 +141,18 @@ func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store,
 	case "approve", "deny":
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "decision must be approve or deny"})
+		audit("decision-failed", "id", id, "reason", "bad-decision")
 		return
 	}
 	if s.CurrentStatus() != StatusPending {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not pending"})
+		audit("decision-failed", "id", id, "reason", "not-pending")
 		return
 	}
 	sig, err := base64.StdEncoding.Strict().DecodeString(req.Sig)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid signature"})
+		audit("decision-failed", "id", id, "reason", "invalid-signature")
 		return
 	}
 	msg := signedMessage(req.Decision, s.User, s.Service, s.TTY, s.Nonce)
@@ -159,15 +164,18 @@ func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store,
 			}
 			if ok, _ := store.Decide(id, status); !ok {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not pending"})
+				audit("decision-failed", "id", id, "reason", "not-pending")
 				return
 			}
-			// name is the paired-key identity that verified this decision;
-			// the audit log (todo 2) will attribute the decision to it.
+			// name is the paired-key identity that verified this decision and is
+			// logged as key= for audit attribution.
+			audit("decision", "id", id, "decision", req.Decision, "key", name)
 			writeJSON(w, http.StatusOK, map[string]string{"status": s.CurrentStatus(), "key": name})
 			return
 		}
 	}
 	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "signature verification failed"})
+	audit("decision-failed", "id", id, "reason", "unpaired-key")
 }
 
 // handlePending is the long-poll endpoint: it holds up to wait seconds and
