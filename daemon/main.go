@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -172,7 +173,29 @@ func newPhoneMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 	return mux
 }
 
+// phoneLinks tracks the number of active phone links (SPP-connected phones).
+// Link registration/unregistration is wired by later todos; today only
+// phoneConnected reads the count.
+var phoneLinks = struct {
+	sync.Mutex
+	active int
+}{}
+
+// phoneConnected reports whether at least one phone link is active.
+func phoneConnected() bool {
+	phoneLinks.Lock()
+	defer phoneLinks.Unlock()
+	return phoneLinks.active > 0
+}
+
 func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store) {
+	// Fail fast when no phone is connected: the PAM module falls back to the
+	// password prompt instead of polling a request no phone can approve.
+	// (The no-paired-keys 503 is checked earlier, in newLocalMux.)
+	if !phoneConnected() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no phone connected"})
+		return
+	}
 	var req struct {
 		User    string `json:"user"`
 		Service string `json:"service"`
@@ -207,63 +230,77 @@ func handleGetSession(w http.ResponseWriter, r *http.Request, store *Store, id s
 	})
 }
 
-// handleDecisionSession verifies an Ed25519 signature over the pinned decision
-// message against any paired pubkey and, on success, transitions the session.
-// The matching key's name is recoverable from the keys map for audit
-// attribution. Responses: 200 decided, 400 bad decision value, 401 bad/absent
-// sig or no matching key, 404 unknown id, 409 not pending (already decided or
-// expired).
-func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store, keys map[string]ed25519.PublicKey, id string) {
+// decide verifies an Ed25519 signature over the pinned decision message
+// against any paired pubkey and, on success, transitions the session. It
+// returns the HTTP-ish status code (reused by the SPP frame handler), the
+// session's new status, and the matching key's name: 200 decided + key name,
+// 400 bad decision value, 401 bad/absent sig or no matching key, 404 unknown
+// id, 409 not pending (already decided or expired).
+func decide(store *Store, keys map[string]ed25519.PublicKey, id, decision, sigB64 string) (code int, status string, key string) {
 	s, ok := store.Get(id)
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown session"})
 		audit("decision-failed", "id", id, "reason", "unknown-session")
-		return
+		return http.StatusNotFound, "", ""
 	}
+	switch decision {
+	case "approve", "deny":
+	default:
+		audit("decision-failed", "id", id, "reason", "bad-decision")
+		return http.StatusBadRequest, "", ""
+	}
+	if s.CurrentStatus() != StatusPending {
+		audit("decision-failed", "id", id, "reason", "not-pending")
+		return http.StatusConflict, "", ""
+	}
+	sig, err := base64.StdEncoding.Strict().DecodeString(sigB64)
+	if err != nil {
+		audit("decision-failed", "id", id, "reason", "invalid-signature")
+		return http.StatusUnauthorized, "", ""
+	}
+	msg := signedMessage(decision, s.User, s.Service, s.TTY, s.Nonce)
+	for name, k := range keys {
+		if ed25519.Verify(k, msg, sig) {
+			newStatus := StatusDenied
+			if decision == "approve" {
+				newStatus = StatusApproved
+			}
+			if ok, _ := store.Decide(id, newStatus); !ok {
+				audit("decision-failed", "id", id, "reason", "not-pending")
+				return http.StatusConflict, "", ""
+			}
+			audit("decision", "id", id, "decision", decision, "key", name)
+			return http.StatusOK, s.CurrentStatus(), name
+		}
+	}
+	audit("decision-failed", "id", id, "reason", "unpaired-key")
+	return http.StatusUnauthorized, "", ""
+}
+
+// handleDecisionSession decodes the signed decision request and delegates
+// verification and transition to decide. Responses: 200 decided, 400 bad
+// decision value, 401 bad/absent sig or no matching key, 404 unknown id,
+// 409 not pending (already decided or expired).
+func handleDecisionSession(w http.ResponseWriter, r *http.Request, store *Store, keys map[string]ed25519.PublicKey, id string) {
 	var req struct {
 		Decision string `json:"decision"`
 		Sig      string `json:"sig"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	switch req.Decision {
-	case "approve", "deny":
+	code, status, key := decide(store, keys, id, req.Decision, req.Sig)
+	switch code {
+	case http.StatusOK:
+		writeJSON(w, code, map[string]string{"status": status, "key": key})
+	case http.StatusBadRequest:
+		writeJSON(w, code, map[string]string{"error": "decision must be approve or deny"})
+	case http.StatusUnauthorized:
+		writeJSON(w, code, map[string]string{"error": "invalid signature"})
+	case http.StatusNotFound:
+		writeJSON(w, code, map[string]string{"error": "unknown session"})
+	case http.StatusConflict:
+		writeJSON(w, code, map[string]string{"error": "session is not pending"})
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "decision must be approve or deny"})
-		audit("decision-failed", "id", id, "reason", "bad-decision")
-		return
+		writeJSON(w, code, map[string]string{"error": "decision failed"})
 	}
-	if s.CurrentStatus() != StatusPending {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not pending"})
-		audit("decision-failed", "id", id, "reason", "not-pending")
-		return
-	}
-	sig, err := base64.StdEncoding.Strict().DecodeString(req.Sig)
-	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid signature"})
-		audit("decision-failed", "id", id, "reason", "invalid-signature")
-		return
-	}
-	msg := signedMessage(req.Decision, s.User, s.Service, s.TTY, s.Nonce)
-	for name, key := range keys {
-		if ed25519.Verify(key, msg, sig) {
-			status := StatusDenied
-			if req.Decision == "approve" {
-				status = StatusApproved
-			}
-			if ok, _ := store.Decide(id, status); !ok {
-				writeJSON(w, http.StatusConflict, map[string]string{"error": "session is not pending"})
-				audit("decision-failed", "id", id, "reason", "not-pending")
-				return
-			}
-			// name is the paired-key identity that verified this decision and is
-			// logged as key= for audit attribution.
-			audit("decision", "id", id, "decision", req.Decision, "key", name)
-			writeJSON(w, http.StatusOK, map[string]string{"status": s.CurrentStatus(), "key": name})
-			return
-		}
-	}
-	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "signature verification failed"})
-	audit("decision-failed", "id", id, "reason", "unpaired-key")
 }
 
 // handlePending is the long-poll endpoint: it holds up to wait seconds and

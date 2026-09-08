@@ -41,18 +41,23 @@ func (s *Session) CurrentStatus() string {
 }
 
 // Store is an in-memory session store guarded by a mutex. It broadcasts a
-// signal on every Create so long-pollers of /v1/pending can wait on it.
+// signal on every Create so long-pollers of /v1/pending can wait on it, and
+// pushes the new session to every subscriber registered via Subscribe.
 type Store struct {
 	mu          sync.Mutex
 	sessions    map[string]*Session
 	cond        *sync.Cond
 	seq         uint64   // bumped on every Create
 	lastSession *Session // most recently created session
+	subs        map[chan *Session]struct{}
 }
 
 // NewStore returns an empty session store.
 func NewStore() *Store {
-	st := &Store{sessions: make(map[string]*Session)}
+	st := &Store{
+		sessions: make(map[string]*Session),
+		subs:     make(map[chan *Session]struct{}),
+	}
 	st.cond = sync.NewCond(&st.mu)
 	return st
 }
@@ -83,9 +88,36 @@ func (st *Store) Create(user, service, tty string) (*Session, error) {
 	st.sessions[id] = s
 	st.seq++
 	st.lastSession = s
+	for sub := range st.subs {
+		select {
+		case sub <- s:
+		default: // subscriber buffer full: skip this delivery
+		}
+	}
 	st.mu.Unlock()
 	st.cond.Broadcast()
 	return s, nil
+}
+
+// Subscribe registers a broadcast subscriber: every Create delivers the new
+// session to the returned channel. The channel is buffered (one slot) and is
+// never closed; if a Create arrives while the buffer is full, that delivery
+// is skipped. The returned closure unsubscribes and is safe to call more than
+// once.
+func (st *Store) Subscribe() (<-chan *Session, func()) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	ch := make(chan *Session, 1)
+	st.subs[ch] = struct{}{}
+	var once sync.Once
+	unsub := func() {
+		once.Do(func() {
+			st.mu.Lock()
+			delete(st.subs, ch)
+			st.mu.Unlock()
+		})
+	}
+	return ch, unsub
 }
 
 // Get returns the session with the given id, if known.

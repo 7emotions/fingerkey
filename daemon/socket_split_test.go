@@ -18,6 +18,7 @@ func TestSocketSplit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
+	linkPhone(t)
 	store := NewStore()
 	keys := map[string]ed25519.PublicKey{"alice": pub}
 
@@ -141,11 +142,13 @@ func TestLocalSessionCreateNoKeys(t *testing.T) {
 		t.Fatal("WaitPending did not return")
 	}
 
-	// Control: with a paired key, the normal path still creates a session.
+	// Control: with a paired key and a connected phone link, the normal path
+	// still creates a session.
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
+	linkPhone(t)
 	withKey := httptest.NewServer(newLocalMux(store, map[string]ed25519.PublicKey{"alice": pub}))
 	defer withKey.Close()
 	resp = postJSON(t, withKey.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)

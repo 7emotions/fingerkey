@@ -172,6 +172,21 @@ func newTestServerNoKeys(t *testing.T) *testEnv {
 	return newTestEnv(t, map[string]ed25519.PublicKey{}, nil)
 }
 
+// linkPhone marks one phone link as connected for the duration of the test.
+// Session creation over the local mux fails fast with 503 when no link is
+// active, so tests exercising the normal create path need this.
+func linkPhone(t *testing.T) {
+	t.Helper()
+	phoneLinks.Lock()
+	phoneLinks.active++
+	phoneLinks.Unlock()
+	t.Cleanup(func() {
+		phoneLinks.Lock()
+		phoneLinks.active--
+		phoneLinks.Unlock()
+	})
+}
+
 func postJSON(t *testing.T, url, body string) *http.Response {
 	t.Helper()
 	resp, err := http.Post(url, "application/json", strings.NewReader(body))
@@ -209,6 +224,7 @@ func TestHealthz(t *testing.T) {
 
 func TestHandlerCreateSession(t *testing.T) {
 	env := newTestServer(t)
+	linkPhone(t)
 	resp := postJSON(t, env.local.URL+"/v1/session", `{"user":"alice","service":"sudo","tty":"/dev/pts/0"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -233,6 +249,7 @@ func TestHandlerCreateSession(t *testing.T) {
 
 func TestHandlerCreateSessionDefaults(t *testing.T) {
 	env := newTestServer(t)
+	linkPhone(t)
 	resp := postJSON(t, env.local.URL+"/v1/session", "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)

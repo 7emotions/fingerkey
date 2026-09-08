@@ -45,6 +45,7 @@ func assertCleanAuditLine(t *testing.T, got string) {
 func TestAuditSessionCreated(t *testing.T) {
 	buf := swapAudit(t)
 	env := newTestServer(t)
+	linkPhone(t)
 	resp := postJSON(t, env.local.URL+"/v1/session", `{"user":"alice","service":"sudo","tty":"/dev/pts/0"}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
