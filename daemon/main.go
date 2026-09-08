@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -20,7 +21,19 @@ func main() {
 	addr := flag.String("addr", ":8766", "listen address")
 	socketPath := flag.String("socket", "/run/phone-fprint-auth/daemon.sock", "unix socket path for the root-only local surface")
 	keysDir := flag.String("keys-dir", "/var/lib/phone-fprint-auth/keys", "directory of <name>.pub Ed25519 public keys (base64)")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file (PEM) for the phone (TCP) listener")
+	tlsKey := flag.String("tls-key", "", "TLS private key file (PEM) for the phone (TCP) listener")
 	flag.Parse()
+
+	// HTTPS-only phone surface: the TCP listener MUST NOT start without a
+	// valid certificate + key. No plain-HTTP fallback.
+	if *tlsCert == "" || *tlsKey == "" {
+		log.Fatal("both -tls-cert and -tls-key are required (HTTPS-only)")
+	}
+	tlsCfg, err := loadTLSConfig(*tlsCert, *tlsKey)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	keys := loadPubKeys(*keysDir)
 	store := NewStore()
@@ -45,20 +58,34 @@ func main() {
 		}
 	}()
 
-	// Phone surface: LAN long-poll, signed decision, healthz. Plain HTTP for
-	// now; TLS arrives in a later todo.
+	// Phone surface: LAN long-poll, signed decision, healthz. HTTPS-only
+	// (TLS >= 1.2) via tls.NewListener; plain HTTP is refused at startup.
 	phoneLn, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("phone-fprint-auth daemon: local=%s phone=%s (%d paired key(s))", *socketPath, *addr, len(keys))
 	go func() {
-		if err := http.Serve(phoneLn, newPhoneMux(store, keys)); err != nil {
+		if err := http.Serve(tls.NewListener(phoneLn, tlsCfg), newPhoneMux(store, keys)); err != nil {
 			log.Fatal(err)
 		}
 	}()
 
 	select {}
+}
+
+// loadTLSConfig loads the PEM certificate + key pair and returns a server
+// tls.Config enforcing TLS >= 1.2. CipherSuites is left unset so Go's default
+// (safe, policy-tracked) cipher list applies.
+func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+	}, nil
 }
 
 // newLocalMux wires the root-only local surface (unix socket): session
