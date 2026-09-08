@@ -3,6 +3,7 @@
 #   - build + install the approval daemon, helper and PAM module
 #   - create the dedicated phonefprint system user and key store dir
 #   - install + enable the systemd unit
+#   - install the D-Bus policy for the BlueZ SPP profile (com.phonefprint.auth)
 #   - wire pam_phone_approve.so into /etc/pam.d/sudo (above @include common-auth)
 #
 # Idempotent — safe to re-run. Must run as root.
@@ -24,9 +25,8 @@ UNIT_SRC="etc/systemd/phone-approve-daemon.service"
 UNIT_DST="/etc/systemd/system/phone-approve-daemon.service"
 KEYS_PARENT="/var/lib/phone-fprint-auth"
 KEYS_DIR="/var/lib/phone-fprint-auth/keys"
-TLS_DIR="/var/lib/phone-fprint-auth/tls"
-TLS_CERT="${TLS_DIR}/cert.pem"
-TLS_KEY="${TLS_DIR}/key.pem"
+DBUS_POLICY_SRC="etc/dbus-1/system.d/phone-fprint-auth.conf"
+DBUS_POLICY_DST="/etc/dbus-1/system.d/phone-fprint-auth.conf"
 DAEMON_USER="phonefprint"
 PAM_LINE="auth sufficient pam_phone_approve.so"
 
@@ -84,38 +84,25 @@ echo "ensured ${KEYS_PARENT} (0755, traversable by ${DAEMON_USER})"
 install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${KEYS_DIR}"
 echo "ensured ${KEYS_DIR} (${DAEMON_USER} 0700)"
 
-echo "== tls cert =="
-install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${TLS_DIR}"
-# Generate ONLY if absent: re-generating would change the cert fingerprint
-# and break already-pinned phones. The daemon refuses to start without both.
-if [[ ! -f "${TLS_CERT}" || ! -f "${TLS_KEY}" ]]; then
-    openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout "${TLS_KEY}" -out "${TLS_CERT}" \
-        -days 3650 -subj "/CN=phone-fprint-auth" \
-        -addext "subjectAltName=IP:$(hostname -I | awk '{print $1}')"
-    chown "${DAEMON_USER}:${DAEMON_USER}" "${TLS_CERT}" "${TLS_KEY}"
-    chmod 0644 "${TLS_CERT}"
-    chmod 0600 "${TLS_KEY}"
-    echo "generated ${TLS_CERT} + ${TLS_KEY}"
-else
-    echo "tls cert already present — keeping (regenerating breaks pinned phones)"
-fi
-chown "${DAEMON_USER}:${DAEMON_USER}" "${TLS_CERT}" "${TLS_KEY}"
-chmod 0644 "${TLS_CERT}"
-chmod 0600 "${TLS_KEY}"
-echo "ensured ${TLS_CERT} (0644) + ${TLS_KEY} (0600, ${DAEMON_USER})"
-
 echo "== install files =="
 install -o root -g root -m 0755 pam/phone-approve-t0.sh "${HELPER_BIN}"
 install -o root -g root -m 0644 pam/pam_phone_approve.so "${PAM_MODULE}"
 install -o root -g root -m 0644 "${UNIT_SRC}" "${UNIT_DST}"
-echo "installed ${HELPER_BIN}, ${PAM_MODULE}, ${UNIT_DST}"
+install -o root -g root -m 0644 "${DBUS_POLICY_SRC}" "${DBUS_POLICY_DST}"
+echo "installed ${HELPER_BIN}, ${PAM_MODULE}, ${UNIT_DST}, ${DBUS_POLICY_DST}"
 
 echo "== systemd =="
 systemctl daemon-reload
 systemctl enable --now phone-approve-daemon
 systemctl restart phone-approve-daemon
 echo "enabled + restarted phone-approve-daemon"
+
+echo "== dbus policy =="
+if ! dbus-send --system --type=method_call --print-reply \
+    --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1; then
+    echo "warning: dbus ReloadConfig failed — check system bus" >&2
+fi
+echo "reloaded dbus system bus config"
 
 if [[ ! -S /run/phone-fprint-auth/daemon.sock ]]; then
     for _ in $(seq 1 25); do
@@ -142,6 +129,5 @@ echo "  helper:   ${HELPER_BIN}"
 echo "  module:   ${PAM_MODULE}"
 echo "  unit:     ${UNIT_DST} (enabled + started)"
 echo "  key dir:  ${KEYS_DIR} (${DAEMON_USER} 0700; parent ${KEYS_PARENT} 0755)"
-echo "  tls:      ${TLS_CERT} + ${TLS_KEY} (${DAEMON_USER})"
-echo "  cert sha256: $(openssl x509 -in "${TLS_CERT}" -outform DER | sha256sum | awk '{print $1}')"
+echo "  dbus:     ${DBUS_POLICY_DST} (phonefprint owns com.phonefprint.auth)"
 echo "  pam:      /etc/pam.d/sudo + /etc/pam.d/polkit-1 -> ${PAM_LINE} above @include common-auth"

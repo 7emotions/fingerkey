@@ -7,6 +7,7 @@
 #     BEFORE the binaries are removed so a restored PAM file never
 #     references a deleted module.
 #   - remove the daemon, helper and PAM module binaries
+#   - remove the D-Bus policy file(s) and reload the system bus
 #   - remove the paired-key store and the TLS cert/key dirs
 #     (/run/phone-fprint-auth is a systemd RuntimeDirectory, so it
 #     disappears automatically when the unit stops)
@@ -27,6 +28,8 @@ PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_phone_approve.so"
 STATE_PARENT="/var/lib/phone-fprint-auth"
 KEYS_DIR="${STATE_PARENT}/keys"
 TLS_DIR="${STATE_PARENT}/tls"
+DBUS_POLICY="/etc/dbus-1/system.d/phone-fprint-auth.conf"
+DBUS_POLICY_LEFTOVER="/etc/dbus-1/system.d/com.phonefprint.auth.conf"
 PAM_FILES=(
     "/etc/pam.d/sudo"
     "/etc/pam.d/polkit-1"
@@ -38,6 +41,16 @@ systemctl disable --now phone-approve-daemon 2>/dev/null || true
 rm -f "${UNIT}"
 systemctl daemon-reload
 echo "disabled + removed phone-approve-daemon unit"
+
+echo "== dbus policy =="
+# The repo-installed policy plus a leftover smoke-test policy from an earlier
+# session; both grant com.phonefprint.auth and are removed here.
+rm -f "${DBUS_POLICY}" "${DBUS_POLICY_LEFTOVER}"
+if ! dbus-send --system --type=method_call --print-reply \
+    --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1; then
+    echo "warning: dbus ReloadConfig failed — check system bus" >&2
+fi
+echo "removed ${DBUS_POLICY} + ${DBUS_POLICY_LEFTOVER}, reloaded dbus"
 
 # restore_pam_file puts back the newest .orig-* backup of a PAM service
 # file, or strips the pam_phone_approve.so line if no backup exists.
@@ -107,5 +120,6 @@ echo
 echo "== rollback complete =="
 echo "  unit:     disabled + removed"
 echo "  binaries: ${DAEMON_BIN}, ${PAIR_BIN}, ${HELPER_BIN}, ${PAM_MODULE} removed"
+echo "  dbus:     ${DBUS_POLICY} + ${DBUS_POLICY_LEFTOVER} removed, dbus reloaded"
 echo "  pam:      ${PAM_FILES[*]} restored from backup (or module line stripped)"
 echo "  state:    ${TLS_DIR} + ${KEYS_DIR} removed (${STATE_PARENT} left in place)"
