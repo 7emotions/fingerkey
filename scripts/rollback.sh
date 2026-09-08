@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Revert the phone fingerprint approval installation:
 #   - disable + remove the systemd unit
-#   - remove the daemon, helper and PAM module binaries
 #   - restore /etc/pam.d/sudo and /etc/pam.d/polkit-1 from their newest
 #     .orig-* backups (or strip the pam_phone_approve.so line if no
-#     backup exists; the .orig-* backups themselves are kept)
+#     backup exists; the .orig-* backups themselves are kept). This runs
+#     BEFORE the binaries are removed so a restored PAM file never
+#     references a deleted module.
+#   - remove the daemon, helper and PAM module binaries
 #   - remove the paired-key store and the TLS cert/key dirs
 #     (/run/phone-fprint-auth is a systemd RuntimeDirectory, so it
 #     disappears automatically when the unit stops)
@@ -37,17 +39,15 @@ rm -f "${UNIT}"
 systemctl daemon-reload
 echo "disabled + removed phone-approve-daemon unit"
 
-echo "== binaries =="
-rm -f "${DAEMON_BIN}" "${PAIR_BIN}" "${HELPER_BIN}" "${PAM_MODULE}"
-echo "removed ${DAEMON_BIN}, ${PAIR_BIN}, ${HELPER_BIN}, ${PAM_MODULE}"
-
 # restore_pam_file puts back the newest .orig-* backup of a PAM service
 # file, or strips the pam_phone_approve.so line if no backup exists.
 # The .orig-* backups are never deleted (pre-install state is kept).
+# It returns non-zero on failure so the caller can accumulate errors.
 restore_pam_file() {
     local pam_file="$1"
     local newest_backup=""
     local f
+    local rc=0
 
     echo "== PAM restore (${pam_file}) =="
     for f in "${pam_file}".orig-*; do
@@ -57,21 +57,39 @@ restore_pam_file() {
         fi
     done
     if [[ -n "${newest_backup}" ]]; then
-        cp -p "${newest_backup}" "${pam_file}"
-        echo "restored ${pam_file} from ${newest_backup} (backup kept)"
-    else
-        if grep -q 'pam_phone_approve.so' "${pam_file}"; then
-            sed -i '/pam_phone_approve.so/d' "${pam_file}"
+        if cp -p "${newest_backup}" "${pam_file}"; then
+            echo "restored ${pam_file} from ${newest_backup} (backup kept)"
+        else
+            echo "error: restoring ${pam_file} from ${newest_backup} failed" >&2
+            rc=1
+        fi
+    elif grep -q 'pam_phone_approve.so' "${pam_file}"; then
+        if sed -i '/pam_phone_approve.so/d' "${pam_file}"; then
             echo "removed pam_phone_approve.so line from ${pam_file} (no backup found)"
         else
-            echo "no backup found and no module line present — ${pam_file} untouched"
+            echo "error: stripping pam_phone_approve.so from ${pam_file} failed" >&2
+            rc=1
         fi
+    else
+        echo "no backup found and no module line present — ${pam_file} untouched"
     fi
+    return "${rc}"
 }
 
+# PAM files are restored BEFORE the module binary is removed, and failures
+# accumulate: one failing file must not stop the other from being restored.
+echo "== PAM =="
+restore_pam_error=0
 for pam_file in "${PAM_FILES[@]}"; do
-    restore_pam_file "${pam_file}"
+    if ! restore_pam_file "${pam_file}"; then
+        echo "error: PAM restore failed for ${pam_file}" >&2
+        restore_pam_error=1
+    fi
 done
+
+echo "== binaries =="
+rm -f "${DAEMON_BIN}" "${PAIR_BIN}" "${HELPER_BIN}" "${PAM_MODULE}"
+echo "removed ${DAEMON_BIN}, ${PAIR_BIN}, ${HELPER_BIN}, ${PAM_MODULE}"
 
 echo "== state dirs =="
 rm -rf "${TLS_DIR}" "${KEYS_DIR}"
@@ -79,6 +97,11 @@ echo "removed ${TLS_DIR} (cert+key) and ${KEYS_DIR} (paired keys)"
 # /run/phone-fprint-auth is a systemd RuntimeDirectory and is cleaned up
 # automatically when the unit stops — nothing to do here.
 echo "/run/phone-fprint-auth is a systemd RuntimeDirectory — auto-removed on unit stop"
+
+if [[ ${restore_pam_error} -ne 0 ]]; then
+    echo "warning: one or more PAM files were not restored cleanly — see errors above" >&2
+    exit 1
+fi
 
 echo
 echo "== rollback complete =="
