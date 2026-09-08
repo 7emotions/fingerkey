@@ -7,8 +7,6 @@ import 'dart:convert';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
-import 'daemon_client.dart';
-
 class DeviceIdentity {
   const DeviceIdentity({required this.keyPair, required this.publicKeyBase64});
 
@@ -99,9 +97,22 @@ class KeyStore {
   /// stored (a corrupt non-empty pin must not silently disable pinning), or
   /// the stored URL is not `https://`.
   static bool needsPairing(String? storedUrl, String? pin) {
-    if (storedUrl == null || pin == null || !DaemonClient.isHexPin(pin)) {
+    if (storedUrl == null || pin == null || !isHexPin(pin)) {
       return true;
     }
     return !isHttpsUrl(storedUrl);
+  }
+
+  /// True when [pin] is a valid 64-lowercase-hex certificate fingerprint.
+  ///
+  /// Legacy TLS-pairing validation (the BT transport does not pin a cert);
+  /// retained until the pairing flow drops the URL/pin entirely.
+  static bool isHexPin(String pin) {
+    if (pin.length != 64) return false;
+    for (final c in pin.codeUnits) {
+      final ok = (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66); // 0-9a-f
+      if (!ok) return false;
+    }
+    return true;
   }
 }

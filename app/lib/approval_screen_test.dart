@@ -13,6 +13,8 @@ library;
 // ignore: depend_on_referenced_packages
 import 'package:flutter/material.dart';
 // ignore: depend_on_referenced_packages
+import 'package:flutter/services.dart';
+// ignore: depend_on_referenced_packages
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cryptography/cryptography.dart';
 
@@ -28,7 +30,35 @@ Future<DeviceIdentity> _identity() async {
   return DeviceIdentity(keyPair: keyPair, publicKeyBase64: 'AQID');
 }
 
+/// Mocks the two BT platform channels so the [ApprovalScreen]'s [BtClient]
+/// can subscribe to the event stream without a platform (the widget test
+/// exercises the re-pair affordance, not the transport).
+void _mockBtChannels() {
+  final messenger =
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+  messenger.setMockMethodCallHandler(
+    const MethodChannel('com.phonefprint.auth/bt'),
+    (MethodCall call) async => null,
+  );
+  messenger.setMockMethodCallHandler(
+    const MethodChannel('com.phonefprint.auth/bt_events'),
+    (MethodCall call) async => null,
+  );
+}
+
+void _unmockBtChannels() {
+  final messenger =
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+  messenger.setMockMethodCallHandler(
+      const MethodChannel('com.phonefprint.auth/bt'), null);
+  messenger.setMockMethodCallHandler(
+      const MethodChannel('com.phonefprint.auth/bt_events'), null);
+}
+
 void main() {
+  setUp(_mockBtChannels);
+  tearDown(_unmockBtChannels);
+
   testWidgets('settings tap invokes the onReset callback', (tester) async {
     final identity = await _identity();
     var resetCalls = 0;
@@ -42,7 +72,7 @@ void main() {
         ),
       ),
     );
-    await tester.pump(); // let the first long-poll attempt fail
+    await tester.pump(); // let the BT subscription settle
 
     expect(find.byIcon(Icons.settings), findsOneWidget);
     expect(resetCalls, 0);
@@ -51,8 +81,8 @@ void main() {
 
     expect(resetCalls, 1);
 
-    // Dispose the screen (stops the poll loop) and flush the 3 s retry
-    // timer so no timers are left pending at the end of the test.
+    // Dispose the screen (cancels the BT subscription) so no pending
+    // streams are left at the end of the test.
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(seconds: 4));
   });

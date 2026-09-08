@@ -1,6 +1,7 @@
-/// Approval flow: long-poll the daemon for pending sudo/pkexec requests,
-/// pop the native biometric prompt, sign the decision with the device key
-/// and POST it back.
+/// Approval flow: receive pushed pending sudo/pkexec requests from the
+/// daemon over the Bluetooth SPP link, pop the native biometric prompt, sign
+/// the decision with the device key and send it back as a framed
+/// `decision` message.
 library;
 
 import 'dart:async';
@@ -22,10 +23,13 @@ class ApprovalScreen extends StatefulWidget {
   });
 
   final DeviceIdentity identity;
+
+  /// Legacy daemon URL from the pre-Bluetooth pairing flow, shown for
+  /// context only — the BT transport does not use it.
   final String daemonUrl;
 
-  /// 64-lowercase-hex SHA-256 fingerprint of the daemon's TLS certificate;
-  /// the connection is pinned to it.
+  /// Legacy TLS certificate fingerprint from the pre-Bluetooth pairing
+  /// flow; unused on the BT transport.
   final String certPin;
 
   /// Invoked when the user chooses to drop the current pairing and re-pair:
@@ -38,53 +42,46 @@ class ApprovalScreen extends StatefulWidget {
 }
 
 class _ApprovalScreenState extends State<ApprovalScreen> {
-  late final DaemonClient _client;
+  late final BtClient _client;
   final LocalAuthentication _auth = LocalAuthentication();
+  StreamSubscription<PendingSession>? _sub;
 
   bool _disposed = false;
   bool _busy = false;
   PendingSession? _session;
-  Completer<void>? _resolution;
   String _status = 'Listening for requests…';
 
   @override
   void initState() {
     super.initState();
-    _client = DaemonClient(baseUrl: widget.daemonUrl, pin: widget.certPin);
-    unawaited(_pollLoop());
+    _client = BtClient();
+    _sub = _client.pending().listen(
+          _onSession,
+          onError: (Object e, StackTrace st) {
+            if (_disposed) return;
+            setState(() => _status = 'BT link unavailable ($e).');
+          },
+        );
   }
 
   @override
   void dispose() {
     _disposed = true;
-    _client.close();
+    unawaited(_sub?.cancel());
+    _client.dispose();
     super.dispose();
   }
 
-  Future<void> _pollLoop() async {
-    while (!_disposed) {
-      PendingSession? session;
-      try {
-        session = await _client.pollPending();
-      } catch (e) {
-        if (_disposed) return;
-        setState(() => _status = 'Daemon unreachable ($e). Retrying in 3 s…');
-        await Future<void>.delayed(const Duration(seconds: 3));
-        continue;
-      }
-      if (_disposed) return;
-      if (session == null) continue; // 204 long-poll timeout — keep polling
-
-      _resolution = Completer<void>();
-      setState(() {
-        _session = session;
-        _status = 'Request pending — waiting for your decision.';
-      });
-      // Pop the native biometric prompt as soon as a session surfaces.
-      unawaited(_approveWithBiometrics());
-      // Wait until the session is approved or denied before polling again.
-      await _resolution!.future;
-    }
+  /// A pending session pushed by the daemon: show it and pop the biometric
+  /// prompt. Sessions arriving while one is already on screen are ignored
+  /// (the daemon pushes at most one live session per request).
+  void _onSession(PendingSession session) {
+    if (_disposed || _session != null) return;
+    setState(() {
+      _session = session;
+      _status = 'Request pending — waiting for your decision.';
+    });
+    unawaited(_approveWithBiometrics());
   }
 
   Future<void> _approveWithBiometrics() async {
@@ -131,30 +128,25 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
         tty: session.tty,
         nonce: session.nonce,
       );
-      final code = await _client.postDecision(
+      final result = await _client.postDecision(
         sessionId: session.id,
         decision: decision,
         signatureBase64: sig,
       );
       if (_disposed) return;
-      if (code == 200) {
+      if (!result.isError) {
         setState(() {
           _session = null;
-          _status =
-              'Decision "$decision" accepted. Listening for requests…';
+          _status = 'Decision "$decision" accepted '
+              '(${result.status ?? 'recorded'}). Listening for requests…';
         });
-        _resolution?.complete();
       } else {
-        setState(
-            () => _status = 'Daemon rejected decision (HTTP $code). Retrying…');
-        await Future<void>.delayed(const Duration(seconds: 3));
-        if (!_disposed) _resolution?.complete(); // give the session back
+        setState(() => _status =
+            'Daemon rejected decision (${result.error}). Tap to retry.');
       }
     } catch (e) {
       if (_disposed) return;
-      setState(() => _status = 'Failed to send decision ($e). Retrying…');
-      await Future<void>.delayed(const Duration(seconds: 3));
-      if (!_disposed) _resolution?.complete();
+      setState(() => _status = 'Failed to send decision ($e). Tap to retry.');
     }
   }
 

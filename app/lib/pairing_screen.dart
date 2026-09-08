@@ -8,7 +8,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
-import 'daemon_client.dart';
 import 'key_store.dart';
 import 'pairing_qr.dart';
 
@@ -89,7 +88,7 @@ class _PairingScreenState extends State<PairingScreen> {
     // The normative pin form is 64 lowercase hex; accept mixed case input
     // and normalize.
     final pin = _pinController.text.trim().toLowerCase();
-    if (!DaemonClient.isHexPin(pin)) {
+    if (!KeyStore.isHexPin(pin)) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
             content: Text('Enter the 64-character certificate fingerprint '

@@ -12,7 +12,6 @@ library;
 
 import 'dart:convert';
 
-import 'daemon_client.dart';
 import 'key_store.dart';
 
 /// A validated daemon URL + certificate fingerprint taken from a pairing QR.
@@ -43,7 +42,7 @@ PairingInfo? parsePairingQr(String raw) {
 
   final trimmedUrl = url.trim();
   if (!KeyStore.isHttpsUrl(trimmedUrl)) return null;
-  if (!DaemonClient.isHexPin(pin)) return null;
+  if (!KeyStore.isHexPin(pin)) return null;
 
   return PairingInfo(url: trimmedUrl, pin: pin);
 }
