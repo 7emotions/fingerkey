@@ -6,16 +6,22 @@
 //
 // Usage:
 //
-//	phone-sim -key <priv_b64> [-action approve|deny] [-url http://127.0.0.1:8766]
+//	phone-sim -key <priv_b64> (-pin <64-hex> | -insecure) [-action approve|deny] [-url https://127.0.0.1:8766]
 //
 // <priv_b64> is the standard, padded base64 encoding of a 64-byte Ed25519
-// private key; -action defaults to "approve".
+// private key; -action defaults to "approve". The daemon is HTTPS-only, so
+// exactly one of -pin (leaf cert SHA-256, 64 lowercase hex) or -insecure
+// (skip verification, testing only) is required.
 package main
 
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -35,11 +41,19 @@ const pollTimeout = 75 * time.Second
 func main() {
 	keyB64 := flag.String("key", "", "base64 (standard, padded) Ed25519 private key")
 	action := flag.String("action", "approve", "decision to send: approve or deny")
-	baseURL := flag.String("url", "http://127.0.0.1:8766", "daemon base URL")
+	baseURL := flag.String("url", "https://127.0.0.1:8766", "daemon base URL")
+	pin := flag.String("pin", "", "leaf cert SHA-256 (64 lowercase hex) to pin")
+	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (testing only)")
 	flag.Parse()
 
 	if *keyB64 == "" {
 		log.Fatal("phone-sim: -key is required")
+	}
+	if *pin == "" && !*insecure {
+		log.Fatal("phone-sim: one of -pin or -insecure is required (daemon is HTTPS-only)")
+	}
+	if *pin != "" && *insecure {
+		log.Fatal("phone-sim: -pin and -insecure are mutually exclusive")
 	}
 	priv, err := decodePriv(*keyB64)
 	if err != nil {
@@ -48,15 +62,48 @@ func main() {
 	if *action != "approve" && *action != "deny" {
 		log.Fatalf("phone-sim: -action must be approve or deny, got %q", *action)
 	}
+	tlsCfg, err := tlsConfig(*pin, *insecure)
+	if err != nil {
+		log.Fatalf("phone-sim: %v", err)
+	}
 	base := strings.TrimRight(*baseURL, "/")
 
-	client := &http.Client{Timeout: pollTimeout}
+	client := &http.Client{
+		Timeout:   pollTimeout,
+		Transport: &http.Transport{TLSClientConfig: tlsCfg},
+	}
 	for {
 		if err := pollOnce(client, base, *action, priv); err != nil {
 			log.Printf("phone-sim: %v (retrying in 2s)", err)
 			time.Sleep(2 * time.Second)
 		}
 	}
+}
+
+// tlsConfig builds the client TLS config: with -insecure it skips all
+// verification; with -pin it skips chain verification (the daemon cert is
+// self-signed) but requires the leaf cert's SHA-256 to equal the pin.
+func tlsConfig(pin string, insecure bool) (*tls.Config, error) {
+	if insecure {
+		return &tls.Config{InsecureSkipVerify: true}, nil
+	}
+	pinBytes, err := hex.DecodeString(strings.TrimSpace(pin))
+	if err != nil || len(pinBytes) != sha256.Size {
+		return nil, fmt.Errorf("-pin must be a 64-character lowercase hex SHA-256, got %q", pin)
+	}
+	return &tls.Config{
+		InsecureSkipVerify: true, // replaced by leaf pinning below
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("daemon sent no certificate")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			if !bytes.Equal(sum[:], pinBytes) {
+				return fmt.Errorf("leaf certificate SHA-256 mismatch: got %x, want %x", sum, pinBytes)
+			}
+			return nil
+		},
+	}, nil
 }
 
 // decodePriv decodes the standard padded base64 private key and checks its
