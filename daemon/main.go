@@ -59,6 +59,13 @@ func main() {
 		log.Printf("phone-fprint-auth daemon: phone sim socket listening on %s", *simSocketPath)
 	}
 
+	// Phone surface: the real link is the BlueZ SPP server (bt.go).
+	// Deliberately non-fatal: without Bluetooth the daemon still serves the
+	// unix-socket surface and PAM falls back to the password prompt.
+	if err := startSppServer(*adapter, store, keys); err != nil {
+		log.Printf("bluetooth unavailable: %v", err)
+	}
+
 	select {}
 }
 
