@@ -1,12 +1,12 @@
 /// First-launch pairing: generate (or show) the Ed25519 device key, present
-/// the public key as a QR code + copy button for registration on the daemon,
-/// and configure the HTTPS daemon URL plus the TLS certificate fingerprint.
+/// the public key as copyable text for registration on the daemon (the
+/// computer has no camera, so a pubkey QR there is useless), and configure
+/// the HTTPS daemon URL plus the TLS certificate fingerprint.
 library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
-import 'package:qr_flutter/qr_flutter.dart';
 
 import 'daemon_client.dart';
 import 'key_store.dart';
@@ -42,6 +42,11 @@ class _PairingScreenState extends State<PairingScreen> {
     super.initState();
     _urlController = TextEditingController(text: widget.initialUrl);
     _pinController = TextEditingController(text: widget.initialPin);
+    // Emit the pubkey to logcat so an agent on the machine can retrieve it
+    // with `adb logcat -d | grep 'phone-fprint-auth pubkey'` and run
+    // `phone-approve pair <name> <pubkey>` without the user copying it.
+    debugPrint('phone-fprint-auth pubkey: '
+        '${widget.identity.publicKeyBase64}');
   }
 
   @override
@@ -112,26 +117,11 @@ class _PairingScreenState extends State<PairingScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Scan the QR or paste this base64 public key into the '
-              'daemon\'s registered devices.',
+              'Copy this base64 public key and add it on the computer with '
+              '`phone-approve pair <name> <pubkey>`.',
               style: theme.textTheme.bodyMedium,
             ),
             const SizedBox(height: 24),
-            Center(
-              child: Container(
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: QrImageView(
-                  data: widget.identity.publicKeyBase64,
-                  version: QrVersions.auto,
-                  size: 220,
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
             Container(
               padding: const EdgeInsets.all(12),
               decoration: BoxDecoration(
