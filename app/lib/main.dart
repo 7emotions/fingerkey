@@ -9,20 +9,13 @@ void main() {
 }
 
 class _Bootstrap {
-  const _Bootstrap(
-      this.keyStore, this.identity, this.daemonUrl, this.storedUrl, this.certPin);
+  const _Bootstrap(this.keyStore, this.identity, this.btAddress);
 
   final KeyStore keyStore;
   final DeviceIdentity? identity;
 
-  /// Effective (sanitized, https) daemon URL.
-  final String daemonUrl;
-
-  /// Raw stored daemon URL (may be null or a leftover non-https value).
-  final String? storedUrl;
-
-  /// 64-hex TLS certificate pin, or null when not yet paired.
-  final String? certPin;
+  /// MAC address of the paired daemon computer, or null when not yet paired.
+  final String? btAddress;
 }
 
 class PhoneFprintApp extends StatefulWidget {
@@ -35,9 +28,7 @@ class PhoneFprintApp extends StatefulWidget {
 class _PhoneFprintAppState extends State<PhoneFprintApp> {
   final Future<_Bootstrap> _bootstrap = _load();
   DeviceIdentity? _identity;
-  String? _daemonUrl;
-  String? _storedUrl;
-  String? _certPin;
+  String? _btAddress;
 
   /// True after a re-pair reset: the bootstrap values must be ignored and
   /// the pairing screen shown with a freshly generated identity.
@@ -50,31 +41,21 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
   static Future<_Bootstrap> _load() async {
     final keyStore = KeyStore();
     final identity = await keyStore.load();
-    final storedUrl = await keyStore.daemonUrlStored();
-    final certPin = await keyStore.certPin();
-    return _Bootstrap(
-      keyStore,
-      identity,
-      KeyStore.effectiveDaemonUrl(storedUrl),
-      storedUrl,
-      certPin,
-    );
+    final btAddress = await keyStore.btAddress();
+    return _Bootstrap(keyStore, identity, btAddress);
   }
 
-  void _onPaired(DeviceIdentity identity, String daemonUrl, String certPin) {
+  void _onPaired(DeviceIdentity identity, String btAddress) {
     setState(() {
       _reset = false;
       _generation = null;
       _identity = identity;
-      _daemonUrl = daemonUrl;
-      _storedUrl = daemonUrl;
-      _certPin = certPin;
+      _btAddress = btAddress;
     });
   }
 
-  /// Re-pair: wipe the stored daemon URL, certificate pin and Ed25519
-  /// private key, then fall back to the pairing screen, which generates a
-  /// fresh identity.
+  /// Re-pair: wipe the stored Bluetooth address and Ed25519 private key,
+  /// then fall back to the pairing screen, which generates a fresh identity.
   Future<void> _onReset() async {
     final data = await _bootstrap;
     await data.keyStore.clear();
@@ -82,9 +63,7 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
     setState(() {
       _reset = true;
       _identity = null;
-      _daemonUrl = null;
-      _storedUrl = null;
-      _certPin = null;
+      _btAddress = null;
       _generation = data.keyStore.generate();
     });
   }
@@ -119,11 +98,7 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
             );
           }
           final identity = _reset ? null : (_identity ?? data.identity);
-          final daemonUrl = _reset
-              ? KeyStore.defaultDaemonUrl
-              : (_daemonUrl ?? data.daemonUrl);
-          final storedUrl = _reset ? null : (_storedUrl ?? data.storedUrl);
-          final certPin = _reset ? null : (_certPin ?? data.certPin);
+          final btAddress = _reset ? null : (_btAddress ?? data.btAddress);
           if (identity == null) {
             return FutureBuilder<DeviceIdentity>(
               future: _generation ?? data.keyStore.generate(),
@@ -137,27 +112,22 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
                 return PairingScreen(
                   keyStore: data.keyStore,
                   identity: generated,
-                  initialUrl: daemonUrl,
-                  initialPin: certPin ?? '',
                   onPaired: _onPaired,
                 );
               },
             );
           }
-          if (KeyStore.needsPairing(storedUrl, certPin)) {
-            // No pin yet, or a leftover non-https URL: re-enter both.
+          if (btAddress == null) {
+            // Key exists but no paired computer yet: connect + authorize.
             return PairingScreen(
               keyStore: data.keyStore,
               identity: identity,
-              initialUrl: daemonUrl,
-              initialPin: certPin ?? '',
               onPaired: _onPaired,
             );
           }
           return ApprovalScreen(
             identity: identity,
-            daemonUrl: daemonUrl,
-            certPin: certPin!,
+            btAddress: btAddress,
             onReset: _onReset,
           );
         },

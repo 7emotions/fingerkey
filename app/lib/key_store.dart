@@ -1,5 +1,5 @@
 /// Device identity: Ed25519 keypair persisted in Android Keystore-backed
-/// secure storage, plus the daemon base URL and TLS certificate pin.
+/// secure storage, plus the paired daemon's Bluetooth address.
 library;
 
 import 'dart:convert';
@@ -19,9 +19,7 @@ class DeviceIdentity {
 
 class KeyStore {
   static const String _kPrivateKey = 'ed25519_private_key';
-  static const String _kDaemonUrl = 'daemon_url';
-  static const String _kCertPin = 'daemon_cert_pin';
-  static const String defaultDaemonUrl = 'https://192.168.112.239:8766';
+  static const String _kBtAddress = 'bt_address';
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
@@ -50,69 +48,18 @@ class KeyStore {
     );
   }
 
-  /// The raw stored daemon URL (null when never configured). Callers that
-  /// must distinguish "unset" from "leftover non-https" (e.g. pairing
-  /// re-entry) use this instead of [daemonUrl].
-  Future<String?> daemonUrlStored() async => await _storage.read(key: _kDaemonUrl);
+  /// The MAC address of the paired daemon computer (null when never paired).
+  /// The phone dials the daemon's SPP server at this address.
+  Future<String?> btAddress() async => await _storage.read(key: _kBtAddress);
 
-  Future<String> daemonUrl() async =>
-      effectiveDaemonUrl(await _storage.read(key: _kDaemonUrl));
+  Future<void> setBtAddress(String address) =>
+      _storage.write(key: _kBtAddress, value: address.trim());
 
-  Future<void> setDaemonUrl(String url) =>
-      _storage.write(key: _kDaemonUrl, value: url.trim());
-
-  /// 64-lowercase-hex SHA-256 fingerprint of the daemon's TLS leaf
-  /// certificate (SHA-256 of the DER encoding). Entered at pairing.
-  Future<String?> certPin() async => await _storage.read(key: _kCertPin);
-
-  Future<void> setCertPin(String pin) =>
-      _storage.write(key: _kCertPin, value: pin);
-
-  /// Wipes the pairing state: daemon URL, certificate pin, and the Ed25519
+  /// Wipes the pairing state: the paired Bluetooth address and the Ed25519
   /// private key. Used by the re-pair flow so that a fresh identity is
   /// generated on the next pairing instead of reusing a stale one.
   Future<void> clear() async {
-    await _storage.delete(key: _kDaemonUrl);
-    await _storage.delete(key: _kCertPin);
+    await _storage.delete(key: _kBtAddress);
     await _storage.delete(key: _kPrivateKey);
-  }
-
-  /// True when [url] parses as an `https://` URL.
-  static bool isHttpsUrl(String url) {
-    final uri = Uri.tryParse(url.trim());
-    return uri != null && uri.scheme == 'https';
-  }
-
-  /// The daemon URL to use given a stored value.
-  ///
-  /// A stored non-`https` URL (e.g. a leftover `http://` from before the
-  /// TLS hardening) is NOT silently kept — it is treated as unset so the
-  /// user must re-enter it at pairing.
-  static String effectiveDaemonUrl(String? stored) {
-    if (stored == null || !isHttpsUrl(stored)) return defaultDaemonUrl;
-    return stored.trim();
-  }
-
-  /// True when pairing (re-entry) is required: no URL stored, no VALID pin
-  /// stored (a corrupt non-empty pin must not silently disable pinning), or
-  /// the stored URL is not `https://`.
-  static bool needsPairing(String? storedUrl, String? pin) {
-    if (storedUrl == null || pin == null || !isHexPin(pin)) {
-      return true;
-    }
-    return !isHttpsUrl(storedUrl);
-  }
-
-  /// True when [pin] is a valid 64-lowercase-hex certificate fingerprint.
-  ///
-  /// Legacy TLS-pairing validation (the BT transport does not pin a cert);
-  /// retained until the pairing flow drops the URL/pin entirely.
-  static bool isHexPin(String pin) {
-    if (pin.length != 64) return false;
-    for (final c in pin.codeUnits) {
-      final ok = (c >= 0x30 && c <= 0x39) || (c >= 0x61 && c <= 0x66); // 0-9a-f
-      if (!ok) return false;
-    }
-    return true;
   }
 }

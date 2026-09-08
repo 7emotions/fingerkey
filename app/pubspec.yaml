@@ -31,11 +31,9 @@ dependencies:
 
   cupertino_icons: ^1.0.8
   crypto: ^3.0.0
-  http: ^1.2.0
   local_auth: ^3.0.0
   cryptography: ^2.7.0
   flutter_secure_storage: ^10.0.0
-  mobile_scanner: ^7.4.0
 
 dev_dependencies:
   flutter_test:
