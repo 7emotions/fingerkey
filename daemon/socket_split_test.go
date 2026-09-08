@@ -21,7 +21,7 @@ func TestSocketSplit(t *testing.T) {
 	store := NewStore()
 	keys := map[string]ed25519.PublicKey{"alice": pub}
 
-	local := httptest.NewServer(newLocalMux(store))
+	local := httptest.NewServer(newLocalMux(store, keys))
 	defer local.Close()
 	phone := httptest.NewServer(newPhoneMux(store, keys))
 	defer phone.Close()
@@ -106,5 +106,50 @@ func TestSocketSplit(t *testing.T) {
 	defer hresp.Body.Close()
 	if hresp.StatusCode != http.StatusOK {
 		t.Fatalf("phone GET /healthz = %d, want 200", hresp.StatusCode)
+	}
+}
+
+// TestLocalSessionCreateNoKeys asserts the fail-fast path on the local
+// surface: with ZERO paired keys, POST /v1/session must return 503 and must
+// NOT create a session, so the PAM module falls back to the password prompt
+// immediately instead of polling 60s for a phone that can never approve.
+// With at least one paired key, the normal path must still create a session.
+func TestLocalSessionCreateNoKeys(t *testing.T) {
+	store := NewStore()
+
+	local := httptest.NewServer(newLocalMux(store, map[string]ed25519.PublicKey{}))
+	defer local.Close()
+
+	resp := postJSON(t, local.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("empty keys: status = %d, want 503", resp.StatusCode)
+	}
+	if m := decodeJSON(t, resp); m["error"] != "no paired keys" {
+		t.Errorf("empty keys: body = %v, want error %q", m, "no paired keys")
+	}
+
+	// The 503 must not have created a session: a short WaitPending would
+	// return it if it had.
+	created := make(chan *Session, 1)
+	go func() { created <- store.WaitPending(200 * time.Millisecond) }()
+	select {
+	case s := <-created:
+		if s != nil {
+			t.Errorf("empty keys: POST /v1/session created session %q, want none", s.ID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitPending did not return")
+	}
+
+	// Control: with a paired key, the normal path still creates a session.
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	withKey := httptest.NewServer(newLocalMux(store, map[string]ed25519.PublicKey{"alice": pub}))
+	defer withKey.Close()
+	resp = postJSON(t, withKey.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("with keys: status = %d, want 200", resp.StatusCode)
 	}
 }

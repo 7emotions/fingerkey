@@ -59,7 +59,7 @@ func main() {
 		log.Fatal(err)
 	}
 	go func() {
-		if err := http.Serve(localLn, newLocalMux(store)); err != nil {
+		if err := http.Serve(localLn, newLocalMux(store, keys)); err != nil {
 			log.Fatal(err)
 		}
 	}()
@@ -96,13 +96,20 @@ func loadTLSConfig(certFile, keyFile string) (*tls.Config, error) {
 
 // newLocalMux wires the root-only local surface (unix socket): session
 // creation (POST /v1/session) and status polling (GET /v1/session/{id}) only.
-func newLocalMux(store *Store) http.Handler {
+// keys are the paired Ed25519 pubkeys: with none paired, session creation
+// fails fast with 503 so the PAM module falls back to the password prompt
+// instead of polling a request no phone can approve.
+func newLocalMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 	mux := http.NewServeMux()
 
 	// Go 1.18 ServeMux: "/v1/session" matches only the exact path.
 	mux.HandleFunc("/v1/session", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
+			return
+		}
+		if len(keys) == 0 {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no paired keys"})
 			return
 		}
 		handleCreateSession(w, r, store)

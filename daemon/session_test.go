@@ -147,7 +147,7 @@ type testEnv struct {
 func newTestEnv(t *testing.T, keys map[string]ed25519.PublicKey, priv ed25519.PrivateKey) *testEnv {
 	t.Helper()
 	store := NewStore()
-	local := httptest.NewServer(newLocalMux(store))
+	local := httptest.NewServer(newLocalMux(store, keys))
 	phone := httptest.NewServer(newPhoneMux(store, keys))
 	t.Cleanup(local.Close)
 	t.Cleanup(phone.Close)
@@ -165,7 +165,8 @@ func newTestServer(t *testing.T) *testEnv {
 }
 
 // newTestServerNoKeys builds a split harness with NO paired keys (empty keys
-// dir case): every /decision must be 401.
+// dir case): POST /v1/session on the local mux is 503, and every /decision is
+// 401.
 func newTestServerNoKeys(t *testing.T) *testEnv {
 	t.Helper()
 	return newTestEnv(t, map[string]ed25519.PublicKey{}, nil)
