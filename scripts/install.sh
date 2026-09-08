@@ -89,7 +89,7 @@ install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${TLS_DIR}"
 # Generate ONLY if absent: re-generating would change the cert fingerprint
 # and break already-pinned phones. The daemon refuses to start without both.
 if [[ ! -f "${TLS_CERT}" || ! -f "${TLS_KEY}" ]]; then
-    openssl req -x509 -newkey ed25519 -nodes \
+    openssl req -x509 -newkey rsa:2048 -nodes \
         -keyout "${TLS_KEY}" -out "${TLS_CERT}" \
         -days 3650 -subj "/CN=phone-fprint-auth" \
         -addext "subjectAltName=IP:$(hostname -I | awk '{print $1}')"
