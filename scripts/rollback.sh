@@ -23,7 +23,6 @@ fi
 UNIT="/etc/systemd/system/phone-approve-daemon.service"
 DAEMON_BIN="/usr/local/libexec/phone-approve-daemon"
 PAIR_BIN="/usr/local/bin/phone-approve"
-HELPER_BIN="/usr/local/libexec/phone-approve-t0"
 PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_phone_approve.so"
 STATE_PARENT="/var/lib/phone-fprint-auth"
 KEYS_DIR="${STATE_PARENT}/keys"
@@ -101,8 +100,8 @@ for pam_file in "${PAM_FILES[@]}"; do
 done
 
 echo "== binaries =="
-rm -f "${DAEMON_BIN}" "${PAIR_BIN}" "${HELPER_BIN}" "${PAM_MODULE}"
-echo "removed ${DAEMON_BIN}, ${PAIR_BIN}, ${HELPER_BIN}, ${PAM_MODULE}"
+rm -f "${DAEMON_BIN}" "${PAIR_BIN}" "${PAM_MODULE}"
+echo "removed ${DAEMON_BIN}, ${PAIR_BIN}, ${PAM_MODULE}"
 
 echo "== state dirs =="
 rm -rf "${TLS_DIR}" "${KEYS_DIR}"
@@ -119,7 +118,7 @@ fi
 echo
 echo "== rollback complete =="
 echo "  unit:     disabled + removed"
-echo "  binaries: ${DAEMON_BIN}, ${PAIR_BIN}, ${HELPER_BIN}, ${PAM_MODULE} removed"
+echo "  binaries: ${DAEMON_BIN}, ${PAIR_BIN}, ${PAM_MODULE} removed"
 echo "  dbus:     ${DBUS_POLICY} + ${DBUS_POLICY_LEFTOVER} removed, dbus reloaded"
 echo "  pam:      ${PAM_FILES[*]} restored from backup (or module line stripped)"
 echo "  state:    ${TLS_DIR} + ${KEYS_DIR} removed (${STATE_PARENT} left in place)"

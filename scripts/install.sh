@@ -19,7 +19,6 @@ cd "${REPO_ROOT}"
 
 DAEMON_BIN="/usr/local/libexec/phone-approve-daemon"
 PAIR_BIN="/usr/local/bin/phone-approve"
-HELPER_BIN="/usr/local/libexec/phone-approve-t0"
 PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_phone_approve.so"
 UNIT_SRC="etc/systemd/phone-approve-daemon.service"
 UNIT_DST="/etc/systemd/system/phone-approve-daemon.service"
@@ -85,11 +84,10 @@ install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${KEYS_DIR}"
 echo "ensured ${KEYS_DIR} (${DAEMON_USER} 0700)"
 
 echo "== install files =="
-install -o root -g root -m 0755 pam/phone-approve-t0.sh "${HELPER_BIN}"
 install -o root -g root -m 0644 pam/pam_phone_approve.so "${PAM_MODULE}"
 install -o root -g root -m 0644 "${UNIT_SRC}" "${UNIT_DST}"
 install -o root -g root -m 0644 "${DBUS_POLICY_SRC}" "${DBUS_POLICY_DST}"
-echo "installed ${HELPER_BIN}, ${PAM_MODULE}, ${UNIT_DST}, ${DBUS_POLICY_DST}"
+echo "installed ${PAM_MODULE}, ${UNIT_DST}, ${DBUS_POLICY_DST}"
 
 echo "== systemd =="
 systemctl daemon-reload
@@ -125,7 +123,6 @@ echo
 echo "== install complete =="
 echo "  daemon:   ${DAEMON_BIN} (running as ${DAEMON_USER})"
 echo "  pair cli: ${PAIR_BIN}"
-echo "  helper:   ${HELPER_BIN}"
 echo "  module:   ${PAM_MODULE}"
 echo "  unit:     ${UNIT_DST} (enabled + started)"
 echo "  key dir:  ${KEYS_DIR} (${DAEMON_USER} 0700; parent ${KEYS_PARENT} 0755)"

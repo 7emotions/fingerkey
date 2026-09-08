@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
-  HTTPS-only: the daemon is reached exclusively over TLS (self-signed
-  certificate pinned by SHA-256 fingerprint). Cleartext HTTP is disallowed
-  app-wide.
--->
-<network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-</network-security-config>
