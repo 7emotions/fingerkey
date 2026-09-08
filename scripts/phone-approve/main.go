@@ -17,7 +17,9 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"os/user"
@@ -30,6 +32,9 @@ import (
 // keysDir is where the daemon loads <name>.pub files from (daemon default
 // -keys-dir). It must match the daemon's configuration.
 const keysDir = "/var/lib/phone-fprint-auth/keys"
+
+// tlsCertPath is the self-signed daemon certificate installed by install.sh.
+const tlsCertPath = "/var/lib/phone-fprint-auth/tls/cert.pem"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -52,6 +57,8 @@ func main() {
 			os.Exit(1)
 		}
 		err = remove(os.Args[2])
+	case "tls-fingerprint":
+		err = tlsFingerprint()
 	default:
 		usage()
 		os.Exit(1)
@@ -66,7 +73,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage: phone-approve <command>
   pair <name> <pubkey_b64>   pair a phone: store its Ed25519 public key
   list                       list paired key names
-  remove <name>              unpair a phone`)
+  remove <name>              unpair a phone
+  tls-fingerprint            print the daemon TLS cert sha256 (64 hex)`)
 }
 
 // pair validates the public key and stores it under keysDir as <name>.pub,
@@ -154,6 +162,24 @@ func remove(name string) error {
 		return err
 	}
 	fmt.Printf("unpaired %q\n", name)
+	return nil
+}
+
+// tlsFingerprint prints the SHA-256 of the DER-encoded daemon TLS certificate
+// as 64 lowercase hex characters with no separators. This matches the digest
+// the app pins against (Dart's X509Certificate.sha256) and the
+// `openssl x509 -outform DER | sha256sum` value.
+func tlsFingerprint() error {
+	raw, err := os.ReadFile(tlsCertPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %v", tlsCertPath, err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return fmt.Errorf("no PEM certificate found in %s", tlsCertPath)
+	}
+	sum := sha256.Sum256(block.Bytes)
+	fmt.Printf("%x\n", sum)
 	return nil
 }
 

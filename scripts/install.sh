@@ -24,6 +24,9 @@ UNIT_SRC="etc/systemd/phone-approve-daemon.service"
 UNIT_DST="/etc/systemd/system/phone-approve-daemon.service"
 KEYS_PARENT="/var/lib/phone-fprint-auth"
 KEYS_DIR="/var/lib/phone-fprint-auth/keys"
+TLS_DIR="/var/lib/phone-fprint-auth/tls"
+TLS_CERT="${TLS_DIR}/cert.pem"
+TLS_KEY="${TLS_DIR}/key.pem"
 DAEMON_USER="phonefprint"
 PAM_LINE="auth sufficient pam_phone_approve.so"
 
@@ -81,6 +84,27 @@ echo "ensured ${KEYS_PARENT} (0755, traversable by ${DAEMON_USER})"
 install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${KEYS_DIR}"
 echo "ensured ${KEYS_DIR} (${DAEMON_USER} 0700)"
 
+echo "== tls cert =="
+install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${TLS_DIR}"
+# Generate ONLY if absent: re-generating would change the cert fingerprint
+# and break already-pinned phones. The daemon refuses to start without both.
+if [[ ! -f "${TLS_CERT}" || ! -f "${TLS_KEY}" ]]; then
+    openssl req -x509 -newkey ed25519 -nodes \
+        -keyout "${TLS_KEY}" -out "${TLS_CERT}" \
+        -days 3650 -subj "/CN=phone-fprint-auth" \
+        -addext "subjectAltName=IP:$(hostname -I | awk '{print $1}')"
+    chown "${DAEMON_USER}:${DAEMON_USER}" "${TLS_CERT}" "${TLS_KEY}"
+    chmod 0644 "${TLS_CERT}"
+    chmod 0600 "${TLS_KEY}"
+    echo "generated ${TLS_CERT} + ${TLS_KEY}"
+else
+    echo "tls cert already present — keeping (regenerating breaks pinned phones)"
+fi
+chown "${DAEMON_USER}:${DAEMON_USER}" "${TLS_CERT}" "${TLS_KEY}"
+chmod 0644 "${TLS_CERT}"
+chmod 0600 "${TLS_KEY}"
+echo "ensured ${TLS_CERT} (0644) + ${TLS_KEY} (0600, ${DAEMON_USER})"
+
 echo "== install files =="
 install -o root -g root -m 0755 pam/phone-approve-t0.sh "${HELPER_BIN}"
 install -o root -g root -m 0644 pam/pam_phone_approve.so "${PAM_MODULE}"
@@ -118,4 +142,6 @@ echo "  helper:   ${HELPER_BIN}"
 echo "  module:   ${PAM_MODULE}"
 echo "  unit:     ${UNIT_DST} (enabled + started)"
 echo "  key dir:  ${KEYS_DIR} (${DAEMON_USER} 0700; parent ${KEYS_PARENT} 0755)"
+echo "  tls:      ${TLS_CERT} + ${TLS_KEY} (${DAEMON_USER})"
+echo "  cert sha256: $(openssl x509 -in "${TLS_CERT}" -outform DER | sha256sum | awk '{print $1}')"
 echo "  pam:      /etc/pam.d/sudo + /etc/pam.d/polkit-1 -> ${PAM_LINE} above @include common-auth"
