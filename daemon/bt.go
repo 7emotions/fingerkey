@@ -22,6 +22,8 @@ const (
 	sppUUID = "00001101-0000-1000-8000-00805F9B34FB"
 	// sppChannel is the RFCOMM channel advertised in the SDP record.
 	sppChannel = uint16(22)
+	// sppAgentPath is the D-Bus object path the pairing agent is exported on.
+	sppAgentPath = dbus.ObjectPath("/com/phonefprint/agent")
 )
 
 // sppConn and sppProfile hold the live D-Bus state past startSppServer's
@@ -89,6 +91,33 @@ func startSppServer(adapter string, store *Store, keys map[string]ed25519.Public
 		return fmt.Errorf("register profile: %w", call.Err)
 	}
 
+	// Export and register the NoInputNoOutput pairing agent: without it
+	// bluetoothd rejects pairing with "Authentication attempt without agent".
+	// Every agent callback auto-accepts, so the phone can bond inside the
+	// 60s bt-pair window; approval authority still comes from pubkey
+	// registration, never from bonding.
+	agent := &sppAgent{}
+	if err := conn.Export(agent, sppAgentPath, "org.bluez.Agent1"); err != nil {
+		conn.Export(nil, sppProfilePath, "org.bluez.Profile1")
+		conn.Close()
+		return fmt.Errorf("export pairing agent: %w", err)
+	}
+	agentManager := conn.Object("org.bluez", "/org/bluez")
+	if call := agentManager.Call(
+		"org.bluez.AgentManager1.RegisterAgent", 0, sppAgentPath, "NoInputNoOutput"); call.Err != nil {
+		conn.Export(nil, sppAgentPath, "org.bluez.Agent1")
+		conn.Export(nil, sppProfilePath, "org.bluez.Profile1")
+		conn.Close()
+		return fmt.Errorf("register pairing agent: %w", call.Err)
+	}
+	if call := agentManager.Call(
+		"org.bluez.AgentManager1.RequestDefaultAgent", 0, sppAgentPath); call.Err != nil {
+		conn.Export(nil, sppAgentPath, "org.bluez.Agent1")
+		conn.Export(nil, sppProfilePath, "org.bluez.Profile1")
+		conn.Close()
+		return fmt.Errorf("request default pairing agent: %w", call.Err)
+	}
+
 	// Keep the live D-Bus state referenced and unregister best-effort on
 	// shutdown, then exit so SIGINT/SIGTERM still terminate the process.
 	sppConn = conn
@@ -101,11 +130,16 @@ func startSppServer(adapter string, store *Store, keys map[string]ed25519.Public
 			"org.bluez.ProfileManager1.UnregisterProfile", 0, sppProfilePath).Err; err != nil {
 			log.Printf("bluetooth: unregister profile: %v", err)
 		}
+		if err := conn.Object("org.bluez", "/org/bluez").Call(
+			"org.bluez.AgentManager1.UnregisterAgent", 0, sppAgentPath).Err; err != nil {
+			log.Printf("bluetooth: unregister pairing agent: %v", err)
+		}
 		conn.Close()
 		os.Exit(0)
 	}()
 
 	log.Printf("spp profile registered (uuid=%s, channel=%d, adapter=%s)", sppUUID, sppChannel, path)
+	log.Printf("pairing agent registered (path=%s, capability=NoInputNoOutput)", sppAgentPath)
 	return nil
 }
 
@@ -205,6 +239,43 @@ func (p *sppProfileState) closeActive() {
 		p.active = nil
 	}
 }
+
+// sppAgent implements org.bluez.Agent1 with the NoInputNoOutput capability.
+// Returning nil from RequestConfirmation/RequestAuthorization/AuthorizeService
+// means accept, so pairing always succeeds while this agent is the default.
+type sppAgent struct{}
+
+func (a *sppAgent) Release() *dbus.Error { return nil }
+
+func (a *sppAgent) RequestPinCode(device dbus.ObjectPath) (string, *dbus.Error) {
+	return "", nil
+}
+
+func (a *sppAgent) DisplayPinCode(device dbus.ObjectPath, pincode string) *dbus.Error {
+	return nil
+}
+
+func (a *sppAgent) RequestPasskey(device dbus.ObjectPath) (uint32, *dbus.Error) {
+	return 0, nil
+}
+
+func (a *sppAgent) DisplayPasskey(device dbus.ObjectPath, passkey uint32, entered uint16) *dbus.Error {
+	return nil
+}
+
+func (a *sppAgent) RequestConfirmation(device dbus.ObjectPath, passkey uint32) *dbus.Error {
+	return nil
+}
+
+func (a *sppAgent) RequestAuthorization(device dbus.ObjectPath) *dbus.Error {
+	return nil
+}
+
+func (a *sppAgent) AuthorizeService(device dbus.ObjectPath, uuid string) *dbus.Error {
+	return nil
+}
+
+func (a *sppAgent) Cancel() *dbus.Error { return nil }
 
 // wrapUnixFD turns a dbus.UnixFD received on the wire (the actual process fd
 // number, extracted from the SCM_RIGHTS payload by godbus) into an *os.File,

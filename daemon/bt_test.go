@@ -65,6 +65,37 @@ func TestSelectAdapterPathNotFound(t *testing.T) {
 	}
 }
 
+func TestSppAgentAutoAccepts(t *testing.T) {
+	a := &sppAgent{}
+	device := dbus.ObjectPath("/org/bluez/hci0/dev_68_85_A4_4A_56_10")
+
+	if pin, err := a.RequestPinCode(device); err != nil || pin != "" {
+		t.Errorf("RequestPinCode() = %q, %v; want \"\", nil", pin, err)
+	}
+	if passkey, err := a.RequestPasskey(device); err != nil || passkey != 0 {
+		t.Errorf("RequestPasskey() = %d, %v; want 0, nil", passkey, err)
+	}
+
+	// All NoInputNoOutput auto-accept callbacks must return nil so pairing
+	// succeeds: nil means accept/authorize for this agent.
+	callbacks := map[string]*dbus.Error{
+		"DisplayPinCode":      a.DisplayPinCode(device, "1234"),
+		"DisplayPasskey":      a.DisplayPasskey(device, 1234, 0),
+		"RequestConfirmation": a.RequestConfirmation(device, 1234),
+		"RequestAuthorization": a.RequestAuthorization(device),
+		"AuthorizeService":    a.AuthorizeService(device, sppUUID),
+		"Cancel":              a.Cancel(),
+	}
+	for name, err := range callbacks {
+		if err != nil {
+			t.Errorf("%s() = %v; want nil (auto-accept)", name, err)
+		}
+	}
+	if err := a.Release(); err != nil {
+		t.Errorf("Release() = %v; want nil", err)
+	}
+}
+
 func TestWrapUnixFDRoundTrip(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {
