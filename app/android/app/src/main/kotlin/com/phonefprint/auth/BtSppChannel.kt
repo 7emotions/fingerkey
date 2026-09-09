@@ -244,7 +244,7 @@ class BtSppChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandle
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(discoveryReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            context.registerReceiver(discoveryReceiver, filter, Context.RECEIVER_EXPORTED)
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             context.registerReceiver(discoveryReceiver, filter)
