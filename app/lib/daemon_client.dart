@@ -95,8 +95,12 @@ class BtClient {
   /// Each `data` event's bytes are fed to a [FrameDecoder]; every complete
   /// frame whose JSON `type` is `pending` is yielded as a [PendingSession].
   Stream<PendingSession> pending() {
-    final decoder = FrameDecoder();
+    var decoder = FrameDecoder();
     return _link.events.asyncExpand((BtEvent event) async* {
+      if (event.status == 'connected') {
+        decoder = FrameDecoder();
+        return;
+      }
       if (event.status != 'data' || event.data == null) return;
       final List<Uint8List> frames;
       try {
