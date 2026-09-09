@@ -58,6 +58,9 @@ class BtSppChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandle
         /** Serial Port Profile UUID — must match the daemon's SPP server. */
         val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
+        /** How long bond() waits for BOND_BONDED before giving up. */
+        private const val BOND_TIMEOUT_MS = 30_000L
+
         private const val PERMISSION_REQUEST_CODE = 0x2FA
     }
 
@@ -273,11 +276,67 @@ class BtSppChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandle
             result.error("bad_address", "Invalid Bluetooth address: $address", null)
             return
         }
-        try {
-            result.success(device.createBond())
+        val context = activity?.applicationContext ?: run {
+            result.error("no_activity", "Activity is not attached", null)
+            return
+        }
+        val started = try {
+            device.createBond()
         } catch (e: SecurityException) {
             result.error("permission_denied", e.message, null)
+            return
         }
+        if (!started) {
+            result.success(false)
+            return
+        }
+
+        // createBond() only initiates pairing and returns immediately. Hold
+        // the result until the bond reaches BOND_BONDED (an already-bonded
+        // device broadcasts BOND_BONDED right away) or the timeout fires, so
+        // the Dart side connects after the link is already encrypted.
+        val settled = AtomicBoolean(false)
+        var timeout: Runnable? = null
+        var receiver: BroadcastReceiver? = null
+
+        fun settle(success: Boolean) {
+            if (!settled.compareAndSet(false, true)) return
+            timeout?.let { mainHandler.removeCallbacks(it) }
+            receiver?.let {
+                try {
+                    context.unregisterReceiver(it)
+                } catch (e: IllegalArgumentException) {
+                    // Already unregistered.
+                }
+            }
+            mainHandler.post { result.success(success) }
+        }
+
+        receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+                val changed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                } ?: return
+                if (changed.address != device.address) return
+                when (intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE)) {
+                    BluetoothDevice.BOND_BONDED -> settle(true)
+                    BluetoothDevice.BOND_NONE -> settle(false)
+                }
+            }
+        }
+        val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        timeout = Runnable { settle(false) }
+        mainHandler.postDelayed(timeout, BOND_TIMEOUT_MS)
     }
 
     private fun connect(call: MethodCall, result: MethodChannel.Result) {
