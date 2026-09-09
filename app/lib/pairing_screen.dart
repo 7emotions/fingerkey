@@ -143,7 +143,13 @@ class _PairingScreenState extends State<PairingScreen> {
     setState(() => _connectingAddress = device.address);
     try {
       await _link.bond(device.address);
-      await _link.connect(device.address);
+      try {
+        await _link.connect(device.address);
+      } on PlatformException catch (e) {
+        // An already-active socket means the link is up (e.g. re-pairing
+        // while the old socket is still live) — treat it as connected.
+        if (e.code != 'already_connected') rethrow;
+      }
       await widget.keyStore.setBtAddress(device.address);
       if (!mounted) return;
       setState(() => _connectedAddress = device.address);
