@@ -185,10 +185,15 @@ class BtClient {
     }
   }
 
-  /// Releases the client. Dart-side subscriptions are owned by callers and
-  /// the platform channel holds no per-client resources, so this is
-  /// currently a no-op lifecycle hook.
-  void dispose() {}
+  /// Releases the client, closing the underlying SPP socket so a later
+  /// [connect] starts from a clean state (a stale open socket makes the
+  /// platform channel reject the next connect with `already_connected`).
+  /// Dart-side subscriptions are owned by callers.
+  void dispose() {
+    // Fire-and-forget: disconnect() returns a Future; there is nobody to
+    // await here, and an in-flight failure is not actionable at disposal.
+    _link.disconnect();
+  }
 
   static PendingSession? _parsePending(Uint8List frame) {
     final json = _decodeFrameJson(frame);
