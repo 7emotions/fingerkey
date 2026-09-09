@@ -41,6 +41,10 @@ class _PairingScreenState extends State<PairingScreen> {
   /// this and let the operator re-scan.
   static const Duration _discoveryTimeout = Duration(seconds: 15);
 
+  /// Sliding-window cap on the device list: a busy RF environment yields
+  /// far more peripherals than are useful, so keep only the most recent.
+  static const int _maxDevices = 50;
+
   late final BtLink _link;
   StreamSubscription<BtDevice>? _discoverySub;
   Timer? _discoveryTimer;
@@ -51,6 +55,8 @@ class _PairingScreenState extends State<PairingScreen> {
   String? _connectedAddress;
   String? _discoveryError;
   final List<BtDevice> _devices = [];
+  final TextEditingController _filterController = TextEditingController();
+  String _filter = '';
 
   @override
   void initState() {
@@ -66,6 +72,7 @@ class _PairingScreenState extends State<PairingScreen> {
   void dispose() {
     _discoveryTimer?.cancel();
     unawaited(_discoverySub?.cancel());
+    _filterController.dispose();
     super.dispose();
   }
 
@@ -112,11 +119,16 @@ class _PairingScreenState extends State<PairingScreen> {
 
   void _onDevice(BtDevice device) {
     if (!mounted) return;
+    // Many nearby BT peripherals report no name — pure noise here.
+    if (device.name.isEmpty) return;
     setState(() {
       final index = _devices.indexWhere((d) => d.address == device.address);
       if (index >= 0) {
         _devices[index] = device; // refresh the name
       } else {
+        if (_devices.length >= _maxDevices) {
+          _devices.removeAt(0); // drop the oldest beyond the cap
+        }
         _devices.add(device);
       }
     });
@@ -168,6 +180,9 @@ class _PairingScreenState extends State<PairingScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final visibleDevices = _devices
+        .where((d) => d.name.toLowerCase().contains(_filter))
+        .toList();
     return Scaffold(
       appBar: AppBar(title: const Text('PAIR DEVICE')),
       body: SafeArea(
@@ -198,6 +213,29 @@ class _PairingScreenState extends State<PairingScreen> {
               ),
             ],
             const SizedBox(height: 12),
+            if (_devices.isNotEmpty) ...[
+              TextField(
+                controller: _filterController,
+                decoration: InputDecoration(
+                  hintText: 'Filter by name',
+                  prefixIcon: const Icon(Icons.search),
+                  suffixIcon: _filter.isEmpty
+                      ? null
+                      : IconButton(
+                          icon: const Icon(Icons.clear),
+                          onPressed: () {
+                            _filterController.clear();
+                            setState(() => _filter = '');
+                          },
+                        ),
+                  isDense: true,
+                  border: const OutlineInputBorder(),
+                ),
+                onChanged: (value) =>
+                    setState(() => _filter = value.toLowerCase()),
+              ),
+              const SizedBox(height: 12),
+            ],
             if (_devices.isEmpty &&
                 !_discovering &&
                 _hasScanned &&
@@ -207,7 +245,12 @@ class _PairingScreenState extends State<PairingScreen> {
                 'and scan again.',
                 style: theme.textTheme.bodySmall,
               ),
-            for (final device in _devices) _deviceTile(theme, device),
+            if (_devices.isNotEmpty && visibleDevices.isEmpty)
+              Text(
+                'No devices match your filter.',
+                style: theme.textTheme.bodySmall,
+              ),
+            for (final device in visibleDevices) _deviceTile(theme, device),
             const Divider(height: 32),
             Text('AUTHORIZE THIS DEVICE', style: theme.textTheme.titleLarge),
             const SizedBox(height: 8),
