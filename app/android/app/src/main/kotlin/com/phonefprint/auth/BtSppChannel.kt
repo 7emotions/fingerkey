@@ -475,7 +475,6 @@ class BtSppChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandle
 
     private fun postEvent(event: Map<String, Any?>) {
         val sink = eventSink ?: return
-        // EventSink is thread-safe: it posts to the platform main thread itself.
-        sink.success(event)
+        mainHandler.post { sink.success(event) }
     }
 }
