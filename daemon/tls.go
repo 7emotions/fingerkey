@@ -203,16 +203,19 @@ func serveTLS(addr string, cert tls.Certificate, maxConns, maxConnsPerIP int, st
 }
 
 // handleTLSConn bounds the handshake and hands the established TLS stream to
-// the phone-link lifecycle. Closing the conn — here or later inside the link
-// — releases the tracker slot via trackedConn.Close.
+// the phone-link lifecycle. Closing the conn — here on handshake failure, or
+// later inside the link (its finish() closes on every exit path) — releases
+// the tracker slot via trackedConn.Close.
 func handleTLSConn(conn *trackedConn, hsTimeout time.Duration, store *Store, keys *keyProvider, pairs *pairManager) {
-	defer conn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), hsTimeout)
 	err := conn.HandshakeContext(ctx)
 	cancel()
 	if err != nil {
+		conn.Close()
 		return
 	}
+	// The link owns the conn from here: startPhoneLink runs the link in its
+	// own goroutine, so closing on return would race the hello read.
 	startPhoneLink(conn, store, keys, pairs)
 }
 
