@@ -59,4 +59,12 @@ class FrameDecoder {
     }
     return frames;
   }
+
+  /// Discards the buffered (partial) bytes so the decoder can resume parsing
+  /// a fresh frame after an [add] call threw [FrameTooLargeException]. Without
+  /// this, the over-long header stays buffered and every subsequent [add]
+  /// rethrows on the same garbage.
+  void reset() {
+    _pending = Uint8List(0);
+  }
 }

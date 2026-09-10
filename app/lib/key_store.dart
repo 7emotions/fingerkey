@@ -1,5 +1,9 @@
-/// Device identity: Ed25519 keypair persisted in Android Keystore-backed
-/// secure storage, plus the paired daemon's Bluetooth address.
+/// Device identity (Ed25519 keypair in Keystore-backed secure storage) plus
+/// the roster of paired daemon computers. The roster replaces the old single
+/// `bt_address`: each entry is `{name, fingerprint, lastAddr}` where `name`
+/// is the computer's display name (from the QR `n=` or the mDNS instance),
+/// `fingerprint` is the pinned lowercase-hex SHA-256 of its TLS leaf cert,
+/// and `lastAddr` is the last known `host:port`.
 library;
 
 import 'dart:convert';
@@ -13,13 +17,38 @@ class DeviceIdentity {
   final SimpleKeyPair keyPair;
 
   /// Standard (padded) base64 of the raw 32-byte Ed25519 public key.
-  /// This is the string the daemon operator registers during pairing.
+  /// This is the string the daemon registers during pairing.
   final String publicKeyBase64;
+}
+
+/// One paired computer in the roster.
+class RosterComputer {
+  const RosterComputer({
+    required this.name,
+    required this.fingerprint,
+    required this.lastAddr,
+  });
+
+  factory RosterComputer.fromJson(Map<String, dynamic> json) => RosterComputer(
+        name: json['name'] as String? ?? '',
+        fingerprint: json['fingerprint'] as String? ?? '',
+        lastAddr: json['lastAddr'] as String? ?? '',
+      );
+
+  final String name;
+  final String fingerprint;
+  final String lastAddr;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'name': name,
+        'fingerprint': fingerprint,
+        'lastAddr': lastAddr,
+      };
 }
 
 class KeyStore {
   static const String _kPrivateKey = 'ed25519_private_key';
-  static const String _kBtAddress = 'bt_address';
+  static const String _kRoster = 'roster';
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
@@ -48,18 +77,65 @@ class KeyStore {
     );
   }
 
-  /// The MAC address of the paired daemon computer (null when never paired).
-  /// The phone dials the daemon's SPP server at this address.
-  Future<String?> btAddress() async => await _storage.read(key: _kBtAddress);
+  /// The roster of paired computers, in insertion order.
+  Future<List<RosterComputer>> roster() async {
+    final raw = await _storage.read(key: _kRoster);
+    if (raw == null || raw.isEmpty) return <RosterComputer>[];
+    final List<dynamic> decoded;
+    try {
+      decoded = json.decode(raw) as List<dynamic>;
+    } on FormatException {
+      return <RosterComputer>[];
+    }
+    return decoded
+        .map((dynamic e) =>
+            RosterComputer.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
 
-  Future<void> setBtAddress(String address) =>
-      _storage.write(key: _kBtAddress, value: address.trim());
+  /// Adds (or updates) a computer, keyed by [fingerprint]. Updating keeps the
+  /// existing name if the new one is empty (mDNS may not carry a name).
+  Future<void> addComputer({
+    required String name,
+    required String fingerprint,
+    required String lastAddr,
+  }) async {
+    final current = await roster();
+    final existing = current.indexWhere((c) => c.fingerprint == fingerprint);
+    final entry = RosterComputer(
+      name: name.isEmpty && existing >= 0 ? current[existing].name : name,
+      fingerprint: fingerprint,
+      lastAddr: lastAddr,
+    );
+    if (existing >= 0) {
+      current[existing] = entry;
+    } else {
+      current.add(entry);
+    }
+    await _writeRoster(current);
+  }
 
-  /// Wipes the pairing state: the paired Bluetooth address and the Ed25519
-  /// private key. Used by the re-pair flow so that a fresh identity is
-  /// generated on the next pairing instead of reusing a stale one.
-  Future<void> clear() async {
-    await _storage.delete(key: _kBtAddress);
+  /// Removes one computer from the roster, keeping the device key. A no-op
+  /// when [fingerprint] is not present.
+  Future<void> removeComputer(String fingerprint) async {
+    final current = await roster();
+    current.removeWhere((c) => c.fingerprint == fingerprint);
+    await _writeRoster(current);
+  }
+
+  /// Deletes the Ed25519 private key AND clears the roster: a full identity
+  /// reset back to the pairing screen with a freshly generated key.
+  Future<void> resetIdentity() async {
+    await _storage.delete(key: _kRoster);
     await _storage.delete(key: _kPrivateKey);
+  }
+
+  Future<void> _writeRoster(List<RosterComputer> roster) async {
+    await _storage.write(
+      key: _kRoster,
+      value: json.encode(
+        roster.map((c) => c.toJson()).toList(),
+      ),
+    );
   }
 }

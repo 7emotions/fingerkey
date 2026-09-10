@@ -1,6 +1,6 @@
-/// Tests for KeyStore pairing-state persistence: the paired Bluetooth
-/// address is stored and read back, and clear() must wipe it together with
-/// the Ed25519 private key so re-pairing starts from a fresh identity.
+/// Tests for KeyStore roster persistence: the roster of paired computers
+/// (`[{name, fingerprint, lastAddr}]`) replaces the old single bt_address.
+/// `removeComputer` keeps the Ed25519 key; `resetIdentity` wipes both.
 ///
 /// Canonical location per the build plan is lib/key_store_test.dart; the
 /// test/key_store_test.dart delegator makes `flutter test` discover these.
@@ -17,58 +17,105 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:auth/key_store.dart';
 
 void main() {
-  group('KeyStore btAddress', () {
-    test('stores and reads back the paired Bluetooth address', () async {
+  group('KeyStore roster', () {
+    test('addComputer stores and reads back name/fingerprint/lastAddr',
+        () async {
       // ignore: invalid_use_of_visible_for_testing_member
       FlutterSecureStorage.setMockInitialValues({});
       final store = KeyStore();
 
-      await store.setBtAddress('D0:57:7E:C8:12:B5');
+      await store.addComputer(
+        name: 'desk',
+        fingerprint: 'abc123',
+        lastAddr: '192.168.1.5:4443',
+      );
 
-      expect(await store.btAddress(), 'D0:57:7E:C8:12:B5');
+      final roster = await store.roster();
+      expect(roster, hasLength(1));
+      expect(roster.first.name, 'desk');
+      expect(roster.first.fingerprint, 'abc123');
+      expect(roster.first.lastAddr, '192.168.1.5:4443');
     });
 
-    test('setBtAddress trims surrounding whitespace', () async {
+    test('addComputer upserts by fingerprint (keeps name, moves lastAddr)',
+        () async {
       // ignore: invalid_use_of_visible_for_testing_member
       FlutterSecureStorage.setMockInitialValues({});
       final store = KeyStore();
 
-      await store.setBtAddress('  D0:57:7E:C8:12:B5  ');
+      await store.addComputer(
+        name: 'desk',
+        fingerprint: 'abc123',
+        lastAddr: '192.168.1.5:4443',
+      );
+      await store.addComputer(
+        name: '',
+        fingerprint: 'abc123',
+        lastAddr: '192.168.1.9:4443',
+      );
 
-      expect(await store.btAddress(), 'D0:57:7E:C8:12:B5');
+      final roster = await store.roster();
+      expect(roster, hasLength(1));
+      expect(roster.first.fingerprint, 'abc123');
+      expect(roster.first.name, 'desk'); // empty name keeps the old one
+      expect(roster.first.lastAddr, '192.168.1.9:4443');
+    });
+
+    test('roster on an empty store is empty', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({});
+      expect(await KeyStore().roster(), isEmpty);
     });
   });
 
-  group('KeyStore.clear', () {
-    test('removes the Bluetooth address and Ed25519 private key', () async {
+  group('removeComputer / resetIdentity', () {
+    test('removeComputer removes the computer but keeps the key', () async {
       final seed = base64.encode(List<int>.filled(32, 7));
-      // Pinned under lib/ per the build plan; the test-only helper needs a
-      // suppression for the same reason.
       // ignore: invalid_use_of_visible_for_testing_member
       FlutterSecureStorage.setMockInitialValues({
-        'bt_address': 'D0:57:7E:C8:12:B5',
         'ed25519_private_key': seed,
       });
       final store = KeyStore();
+      await store.addComputer(
+        name: 'desk',
+        fingerprint: 'abc123',
+        lastAddr: '192.168.1.5:4443',
+      );
 
-      expect(await store.load(), isNotNull);
-      expect(await store.btAddress(), 'D0:57:7E:C8:12:B5');
+      await store.removeComputer('abc123');
 
-      await store.clear();
-
-      expect(await store.load(), isNull);
-      expect(await store.btAddress(), isNull);
+      expect(await store.roster(), isEmpty);
+      expect(await store.load(), isNotNull); // key retained
     });
 
-    test('clear on an empty store is a no-op', () async {
+    test('resetIdentity clears the roster and the Ed25519 key', () async {
+      final seed = base64.encode(List<int>.filled(32, 7));
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({
+        'ed25519_private_key': seed,
+      });
+      final store = KeyStore();
+      await store.addComputer(
+        name: 'desk',
+        fingerprint: 'abc123',
+        lastAddr: '192.168.1.5:4443',
+      );
+
+      await store.resetIdentity();
+
+      expect(await store.roster(), isEmpty);
+      expect(await store.load(), isNull);
+    });
+
+    test('resetIdentity on an empty store is a no-op', () async {
       // ignore: invalid_use_of_visible_for_testing_member
       FlutterSecureStorage.setMockInitialValues({});
       final store = KeyStore();
 
-      await store.clear();
+      await store.resetIdentity();
 
+      expect(await store.roster(), isEmpty);
       expect(await store.load(), isNull);
-      expect(await store.btAddress(), isNull);
     });
   });
 }

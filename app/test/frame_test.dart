@@ -112,5 +112,23 @@ void main() {
         throwsA(isA<FrameTooLargeException>()),
       );
     });
+
+    test('reset() clears the buffered header so a fresh frame still parses',
+        () {
+      final decoder = FrameDecoder();
+      final header = Uint8List(4);
+      ByteData.sublistView(header).setUint32(0, kMaxFrameSize + 1, Endian.big);
+      expect(
+        () => decoder.add(header),
+        throwsA(isA<FrameTooLargeException>()),
+      );
+
+      // Without reset() the bad header stays buffered and rethrows forever.
+      decoder.reset();
+      final payload = _payload(10);
+      final decoded = decoder.add(encodeFrame(payload));
+      expect(decoded, hasLength(1));
+      expect(decoded.single, payload);
+    });
   });
 }

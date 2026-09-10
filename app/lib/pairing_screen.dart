@@ -1,15 +1,137 @@
-/// First-launch pairing over Bluetooth SPP: connect to the daemon computer
-/// by selecting it from a discovery list, then register this phone's
-/// Ed25519 public key on the computer.
+/// QR pairing over LAN: scan the computer's `phonefprint://ip:port?
+/// fp=hex&t=token&n=name` code, connect (pinning the leaf cert to `fp`)
+/// with a short timeout, fall back to NSD browse when the direct dial fails,
+/// and register this phone's key by answering with `hello{token}`. On
+/// `registered` the computer is added to the roster and [onPaired] fires.
 library;
 
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
-import 'bt_link.dart';
+import 'daemon_client.dart';
 import 'key_store.dart';
+import 'tcp_tls_link.dart';
+
+/// Builds the in-screen QR scanner. Injectable so tests can substitute a
+/// button without spinning up a camera.
+typedef ScannerBuilder =
+    Widget Function(BuildContext context, ValueChanged<String> onScanned);
+
+/// One parsed `phonefprint://` pairing code.
+class PairRequest {
+  const PairRequest({
+    required this.ip,
+    required this.port,
+    required this.fp,
+    required this.token,
+    required this.name,
+  });
+
+  factory PairRequest.parse(String raw) {
+    final uri = Uri.tryParse(raw.trim());
+    if (uri == null || uri.scheme != 'phonefprint') {
+      throw const FormatException('not a phonefprint:// URI');
+    }
+    final host = uri.host;
+    final fp = uri.queryParameters['fp'];
+    if (host.isEmpty || fp == null || fp.isEmpty) {
+      throw const FormatException('missing host or fp');
+    }
+    return PairRequest(
+      ip: host,
+      port: uri.hasPort ? uri.port : 4443,
+      fp: fp,
+      token: uri.queryParameters['t'] ?? '',
+      name: uri.queryParameters['n'] ?? '',
+    );
+  }
+
+  final String ip;
+  final int port;
+  final String fp;
+  final String token;
+  final String name;
+}
+
+/// Runs the pairing exchange for a parsed [qr]: direct-connect (with a short
+/// timeout, so a dead IP cannot burn the 60s token TTL) then, on failure,
+/// fall back to NSD browse matched by fingerprint. On `registered` the
+/// computer is added to the roster. Returns the [RosterComputer] added.
+Future<RosterComputer> pairFromQr({
+  required String qr,
+  required DeviceIdentity identity,
+  required KeyStore keyStore,
+  required DaemonClient Function() clientFactory,
+  required Future<List<TcpComputer>> Function() browse,
+}) async {
+  final request = PairRequest.parse(qr);
+  final lastAddr = '${request.ip}:${request.port}';
+
+  Future<void> connect(String host, int port) async {
+    final client = clientFactory();
+    try {
+      final welcome = await client
+          .connect(
+            host: host,
+            port: port,
+            fp: request.fp,
+            token: request.token,
+          )
+          .timeout(const Duration(seconds: 5));
+      if (!welcome.registered) {
+        throw const PairRejected('connection refused (key not accepted)');
+      }
+    } finally {
+      await client.dispose();
+    }
+  }
+
+  try {
+    await connect(request.ip, request.port);
+  } catch (_) {
+    // Direct dial failed (or was refused): browse for the same fingerprint
+    // and try its advertised address.
+    TcpComputer? match;
+    for (final c in await browse()) {
+      if (c.fp.toLowerCase() == request.fp.toLowerCase()) {
+        match = c;
+        break;
+      }
+    }
+    if (match == null) {
+      throw const PairNotFound('computer not found on the network');
+    }
+    await connect(match.host, match.port);
+  }
+
+  final computer = RosterComputer(
+    name: request.name,
+    fingerprint: request.fp,
+    lastAddr: lastAddr,
+  );
+  await keyStore.addComputer(
+    name: request.name,
+    fingerprint: request.fp,
+    lastAddr: lastAddr,
+  );
+  return computer;
+}
+
+class PairRejected implements Exception {
+  const PairRejected(this.message);
+  final String message;
+  @override
+  String toString() => message;
+}
+
+class PairNotFound implements Exception {
+  const PairNotFound(this.message);
+  final String message;
+  @override
+  String toString() => message;
+}
 
 class PairingScreen extends StatefulWidget {
   const PairingScreen({
@@ -17,323 +139,138 @@ class PairingScreen extends StatefulWidget {
     required this.keyStore,
     required this.identity,
     required this.onPaired,
-    this.link,
+    this.clientFactory,
+    this.browse,
+    this.scannerBuilder,
   });
 
   final KeyStore keyStore;
   final DeviceIdentity identity;
 
-  /// Invoked once the phone is connected to the daemon computer and the
-  /// operator has registered the public key there; the caller switches to
-  /// the approval screen with [btAddress] persisted.
-  final void Function(DeviceIdentity identity, String btAddress) onPaired;
+  /// Invoked once the QR pairing added a computer to the roster; the caller
+  /// switches to the approval screen.
+  final void Function(DeviceIdentity identity) onPaired;
 
-  /// The Bluetooth link; injectable for tests, defaults to the real
-  /// platform channel.
-  final BtLink? link;
+  /// Test seam: creates the per-attempt [DaemonClient].
+  final DaemonClient Function()? clientFactory;
+
+  /// Test seam: mDNS browse.
+  final Future<List<TcpComputer>> Function()? browse;
+
+  /// Test seam: builds the scanner UI (defaults to a [MobileScanner]).
+  final ScannerBuilder? scannerBuilder;
 
   @override
-  State<PairingScreen> createState() => _PairingScreenState();
+  State<PairingScreen> createState() => PairingScreenState();
 }
 
-class _PairingScreenState extends State<PairingScreen> {
-  /// Discovery yields devices for a bounded time; stop listening after
-  /// this and let the operator re-scan.
-  static const Duration _discoveryTimeout = Duration(seconds: 15);
-
-  /// Sliding-window cap on the device list: a busy RF environment yields
-  /// far more peripherals than are useful, so keep only the most recent.
-  static const int _maxDevices = 50;
-
-  late final BtLink _link;
-  StreamSubscription<BtDevice>? _discoverySub;
-  Timer? _discoveryTimer;
-
-  bool _discovering = false;
-  bool _hasScanned = false;
-  String? _connectingAddress;
-  String? _connectedAddress;
-  String? _discoveryError;
-  final List<BtDevice> _devices = [];
-  final TextEditingController _filterController = TextEditingController();
-  String _filter = '';
+class PairingScreenState extends State<PairingScreen> {
+  bool _pairing = false;
+  bool _paired = false;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
-    _link = widget.link ?? BtLink();
     // Emit the pubkey to logcat so an agent on the machine can retrieve it
-    // with `adb logcat -d | grep 'phone-fprint-auth pubkey'` and run
-    // `sudo phone-approve pair <name> <pubkey>` without the user copying it.
+    // with `adb logcat -d | grep 'phone-fprint-auth pubkey'`.
     debugPrint('phone-fprint-auth pubkey: ${widget.identity.publicKeyBase64}');
   }
 
-  @override
-  void dispose() {
-    _discoveryTimer?.cancel();
-    unawaited(_discoverySub?.cancel());
-    _filterController.dispose();
-    super.dispose();
-  }
+  DaemonClient _client() => widget.clientFactory?.call() ??
+      DaemonClient(pubkey: widget.identity.publicKeyBase64);
 
-  Future<void> _scan() async {
-    if (_discovering) return;
-    final enabled = await _link.checkEnabled();
-    if (!enabled) {
-      _showError('Bluetooth is disabled — enable it and scan again.');
-      return;
-    }
-    final granted = await _link.requestPermissions();
-    if (!granted) {
-      _showError('Bluetooth permission denied.');
-      return;
-    }
-    await _discoverySub?.cancel();
-    _discoveryTimer?.cancel();
-    setState(() {
-      _discovering = true;
-      _hasScanned = true;
-      _discoveryError = null;
-      _devices.clear();
-    });
-    _discoverySub = _link.discover().listen(
-      _onDevice,
-      onError: (Object e) {
-        _stopDiscovery();
-        if (!mounted) return;
-        setState(() => _discoveryError = 'Discovery failed: $e');
-      },
-      onDone: _stopDiscovery,
-    );
-    _discoveryTimer = Timer(_discoveryTimeout, _stopDiscovery);
-  }
+  Future<List<TcpComputer>> _browse() =>
+      widget.browse?.call() ?? TcpTlsLink.browse();
 
-  void _stopDiscovery() {
-    _discoveryTimer?.cancel();
-    _discoveryTimer = null;
-    unawaited(_discoverySub?.cancel());
-    _discoverySub = null;
-    if (!mounted) return;
-    setState(() => _discovering = false);
-  }
-
-  void _onDevice(BtDevice device) {
-    if (!mounted) return;
-    // Many nearby BT peripherals report no name — pure noise here.
-    if (device.name.isEmpty) return;
-    setState(() {
-      final index = _devices.indexWhere((d) => d.address == device.address);
-      if (index >= 0) {
-        _devices[index] = device; // refresh the name
-      } else {
-        if (_devices.length >= _maxDevices) {
-          _devices.removeAt(0); // drop the oldest beyond the cap
-        }
-        _devices.add(device);
+  void _onDetect(BarcodeCapture capture) {
+    for (final barcode in capture.barcodes) {
+      final raw = barcode.rawValue;
+      if (raw != null && raw.startsWith('phonefprint://')) {
+        unawaited(handleQr(raw));
+        return;
       }
-    });
+    }
   }
 
-  /// Bonds (Android pairing dialog) and connects to [device], then persists
-  /// its address. The operator still has to register the public key on the
-  /// computer — the screen stays put until they tap START LISTENING.
-  Future<void> _selectDevice(BtDevice device) async {
-    if (_connectingAddress != null) return;
-    _stopDiscovery();
-    setState(() => _connectingAddress = device.address);
+  /// Handles one scanned QR payload: parse → connect → `registered` →
+  /// addComputer → [onPaired]. Public for tests to drive without a camera.
+  Future<void> handleQr(String raw) async {
+    if (_pairing || _paired) return;
+    setState(() {
+      _pairing = true;
+      _error = null;
+    });
     try {
-      await _link.bond(device.address);
-      try {
-        await _link.connect(device.address);
-      } on PlatformException catch (e) {
-        // An already-active socket means the link is up (e.g. re-pairing
-        // while the old socket is still live) — treat it as connected.
-        if (e.code != 'already_connected') rethrow;
-      }
-      await widget.keyStore.setBtAddress(device.address);
+      await pairFromQr(
+        qr: raw,
+        identity: widget.identity,
+        keyStore: widget.keyStore,
+        clientFactory: _client,
+        browse: _browse,
+      );
       if (!mounted) return;
-      setState(() => _connectedAddress = device.address);
+      _paired = true;
+      widget.onPaired(widget.identity);
     } catch (e) {
       if (!mounted) return;
-      setState(() => _connectedAddress = null);
-      _showError('Could not connect to ${device.address}: $e');
+      setState(() => _error = 'Pairing failed: $e');
     } finally {
-      if (mounted) setState(() => _connectingAddress = null);
+      if (mounted) setState(() => _pairing = false);
     }
-  }
-
-  void _showError(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(message)));
-  }
-
-  Future<void> _copyPublicKey() async {
-    await Clipboard.setData(
-        ClipboardData(text: widget.identity.publicKeyBase64));
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Public key copied to clipboard')),
-    );
-  }
-
-  void _continue() {
-    final address = _connectedAddress;
-    if (address == null) return;
-    widget.onPaired(widget.identity, address);
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final visibleDevices = _devices
-        .where((d) => d.name.toLowerCase().contains(_filter))
-        .toList();
     return Scaffold(
       appBar: AppBar(title: const Text('PAIR DEVICE')),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(24),
           children: [
-            Text('CONNECT TO COMPUTER', style: theme.textTheme.titleLarge),
+            Text('SCAN THE PAIRING CODE', style: theme.textTheme.titleLarge),
             const SizedBox(height: 8),
             Text(
-              'Run `sudo phone-approve bt-pair` on the computer, then pick '
-              'it from the list below.',
+              'On the computer, run `sudo phone-approve pair-qr <name>` and '
+              'scan the QR code it prints.',
               style: theme.textTheme.bodyMedium,
             ),
             const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: _discovering || _connectedAddress != null
-                  ? null
-                  : _scan,
-              icon: const Icon(Icons.bluetooth_searching),
-              label: Text(_discovering ? 'SCANNING…' : 'SCAN FOR COMPUTER'),
+            SizedBox(
+              height: 240,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: _pairing
+                    ? const ColoredBox(
+                        color: Color(0xFF1A1D22),
+                        child: Center(child: CircularProgressIndicator()),
+                      )
+                    : (widget.scannerBuilder?.call(context, handleQr) ??
+                        MobileScanner(onDetect: _onDetect)),
+              ),
             ),
-            if (_discoveryError != null) ...[
-              const SizedBox(height: 8),
+            if (_error != null) ...[
+              const SizedBox(height: 12),
               Text(
-                _discoveryError!,
+                _error!,
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: theme.colorScheme.error),
               ),
             ],
             const SizedBox(height: 12),
-            if (_devices.isNotEmpty) ...[
-              TextField(
-                controller: _filterController,
-                decoration: InputDecoration(
-                  hintText: 'Filter by name',
-                  prefixIcon: const Icon(Icons.search),
-                  suffixIcon: _filter.isEmpty
-                      ? null
-                      : IconButton(
-                          icon: const Icon(Icons.clear),
-                          onPressed: () {
-                            _filterController.clear();
-                            setState(() => _filter = '');
-                          },
-                        ),
-                  isDense: true,
-                  border: const OutlineInputBorder(),
-                ),
-                onChanged: (value) =>
-                    setState(() => _filter = value.toLowerCase()),
-              ),
-              const SizedBox(height: 12),
-            ],
-            if (_devices.isEmpty &&
-                !_discovering &&
-                _hasScanned &&
-                _discoveryError == null)
-              Text(
-                'No devices found — make sure the computer is discoverable '
-                'and scan again.',
-                style: theme.textTheme.bodySmall,
-              ),
-            if (_devices.isNotEmpty && visibleDevices.isEmpty)
-              Text(
-                'No devices match your filter.',
-                style: theme.textTheme.bodySmall,
-              ),
-            for (final device in visibleDevices) _deviceTile(theme, device),
-            const Divider(height: 32),
-            Text('AUTHORIZE THIS DEVICE', style: theme.textTheme.titleLarge),
-            const SizedBox(height: 8),
             Text(
-              'On the computer, register this phone with the public key '
-              'below:',
-              style: theme.textTheme.bodyMedium,
+              'This device key:',
+              style: theme.textTheme.labelSmall
+                  ?.copyWith(color: theme.colorScheme.outline),
             ),
-            const SizedBox(height: 8),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: const SelectableText(
-                'sudo phone-approve pair my-phone <pubkey>',
-                style: TextStyle(fontFamily: 'monospace', fontSize: 12),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: theme.colorScheme.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: SelectableText(
-                widget.identity.publicKeyBase64,
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton.icon(
-                onPressed: _copyPublicKey,
-                icon: const Icon(Icons.copy, size: 18),
-                label: const Text('COPY'),
-              ),
-            ),
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: _connectedAddress == null ? null : _continue,
-              icon: const Icon(Icons.fingerprint),
-              label: const Text('START LISTENING'),
+            const SizedBox(height: 4),
+            Text(
+              widget.identity.publicKeyBase64,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
             ),
           ],
         ),
-      ),
-    );
-  }
-
-  Widget _deviceTile(ThemeData theme, BtDevice device) {
-    final connecting = _connectingAddress == device.address;
-    final connected = _connectedAddress == device.address;
-    return Card(
-      child: ListTile(
-        enabled: _connectingAddress == null && _connectedAddress == null,
-        leading: Icon(
-          connected ? Icons.bluetooth_connected : Icons.computer,
-        ),
-        title: Text(device.name.isEmpty ? '(unnamed device)' : device.name),
-        subtitle: Text(
-          device.address,
-          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-        ),
-        trailing: connecting
-            ? const SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : connected
-                ? const Icon(Icons.check_circle)
-                : const Icon(Icons.chevron_right),
-        onTap: () => _selectDevice(device),
       ),
     );
   }
