@@ -10,24 +10,24 @@
 //	phone-approve pair <name> <pubkey_b64>
 //	phone-approve list
 //	phone-approve remove <name>
-//	phone-approve bt-pair
+//	phone-approve pair-qr <name>
 //
 // pair and remove require root (the keys directory is root/phonefprint-owned);
-// list and bt-pair do not.
+// list does not. pair-qr talks to the daemon over its root-only unix socket,
+// so it needs root unless the socket is reachable another way.
 package main
 
 import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // keysDir is where the daemon loads <name>.pub files from (daemon default
@@ -35,44 +35,55 @@ import (
 const keysDir = "/var/lib/phone-fprint-auth/keys"
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run dispatches one CLI invocation and returns the process exit code. It is
+// split from main so tests can exercise commands and their exit codes.
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 1 {
+		usage(stderr)
+		return 1
 	}
 	var err error
-	switch os.Args[1] {
+	switch args[0] {
 	case "pair":
-		if len(os.Args) != 4 {
-			usage()
-			os.Exit(1)
+		if len(args) != 3 {
+			usage(stderr)
+			return 1
 		}
-		err = pair(os.Args[2], os.Args[3])
+		err = pair(args[1], args[2])
 	case "list":
 		err = list()
 	case "remove":
-		if len(os.Args) != 3 {
-			usage()
-			os.Exit(1)
+		if len(args) != 2 {
+			usage(stderr)
+			return 1
 		}
-		err = remove(os.Args[2])
-	case "bt-pair":
-		err = btPair()
+		err = remove(args[1])
+	case "pair-qr":
+		if len(args) != 2 {
+			usage(stderr)
+			return 1
+		}
+		err = pairQR(args[1], stdout)
 	default:
-		usage()
-		os.Exit(1)
+		usage(stderr)
+		return 1
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "phone-approve:", err)
-		os.Exit(1)
+		fmt.Fprintln(stderr, "phone-approve:", err)
+		return 1
 	}
+	return 0
 }
 
-func usage() {
-	fmt.Fprintln(os.Stderr, `usage: phone-approve <command>
+func usage(w io.Writer) {
+	fmt.Fprintln(w, `usage: phone-approve <command>
   pair <name> <pubkey_b64>   pair a phone: store its Ed25519 public key
   list                       list paired key names
   remove <name>              unpair a phone
-  bt-pair                    make this machine discoverable so the phone app can bond (Bluetooth)`)
+  pair-qr <name>             print a scannable QR code pairing a phone as <name>`)
 }
 
 // pair validates the public key and stores it under keysDir as <name>.pub,
@@ -160,56 +171,6 @@ func remove(name string) error {
 		return err
 	}
 	fmt.Printf("unpaired %q\n", name)
-	return nil
-}
-
-// btPair makes this machine Bluetooth-discoverable so the phone app can find
-// and bond to it, prints the adapter MAC and hostname for the operator, and
-// turns discoverability back off after ~60 seconds. Pairing stays on (the
-// BlueZ default), so re-pairing later does not need this command again.
-func btPair() error {
-	run := func(args ...string) error {
-		cmd := exec.Command("bluetoothctl", args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		return cmd.Run()
-	}
-	if err := run("discoverable", "on"); err != nil {
-		return fmt.Errorf("bluetoothctl discoverable on: %v", err)
-	}
-	if err := run("pairable", "on"); err != nil {
-		return fmt.Errorf("bluetoothctl pairable on: %v", err)
-	}
-
-	out, err := exec.Command("bluetoothctl", "show").Output()
-	if err != nil {
-		return fmt.Errorf("bluetoothctl show: %v", err)
-	}
-	mac := ""
-	for _, line := range strings.Split(string(out), "\n") {
-		if f := strings.Fields(line); len(f) >= 2 && f[0] == "Controller" {
-			mac = f[1]
-			break
-		}
-	}
-	if mac == "" {
-		return fmt.Errorf("no controller address in bluetoothctl show output")
-	}
-	host, err := os.Hostname()
-	if err != nil {
-		return fmt.Errorf("hostname: %v", err)
-	}
-
-	fmt.Printf("Bluetooth adapter: %s\n", mac)
-	fmt.Printf("Hostname: %s\n", host)
-	fmt.Println("Now bond from the phone (app → discover → tap the computer), then run 'sudo phone-approve pair <name> <pubkey>'")
-
-	// ~60s to complete bonding on the phone, then stop advertising.
-	// Best-effort: pairable stays on, which is the BlueZ default.
-	time.Sleep(60 * time.Second)
-	if err := run("discoverable", "off"); err != nil {
-		fmt.Fprintf(os.Stderr, "phone-approve: warning: bluetoothctl discoverable off: %v\n", err)
-	}
 	return nil
 }
 

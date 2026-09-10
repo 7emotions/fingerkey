@@ -1,13 +1,12 @@
 [Unit]
 Description=Phone fingerprint approval daemon
-After=network.target bluetooth.service
-Wants=bluetooth.service
+After=network.target
 
 [Service]
 User=phonefprint
 RuntimeDirectory=phone-fprint-auth
 RuntimeDirectoryMode=0700
-ExecStart=/usr/local/libexec/phone-approve-daemon -socket /run/phone-fprint-auth/daemon.sock -keys-dir /var/lib/phone-fprint-auth/keys -adapter hci0
+ExecStart=/usr/local/libexec/phone-approve-daemon -socket /run/phone-fprint-auth/daemon.sock -keys-dir /var/lib/phone-fprint-auth/keys -addr :4443 -tls-dir /var/lib/phone-fprint-auth/tls -max-conns 16 -max-conns-per-ip 4
 Restart=on-failure
 
 [Install]
