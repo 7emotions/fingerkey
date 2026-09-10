@@ -37,7 +37,7 @@ func TestSocketSplit(t *testing.T) {
 	store := NewStore()
 	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 
-	local := httptest.NewServer(newLocalMux(store, keys))
+	local := httptest.NewServer(newLocalMux(store, keys, nil))
 	defer local.Close()
 
 	// The local mux must not serve the removed phone endpoints.
@@ -97,7 +97,7 @@ func TestSocketSplit(t *testing.T) {
 func TestLocalSessionCreateNoKeys(t *testing.T) {
 	store := NewStore()
 
-	local := httptest.NewServer(newLocalMux(store, newTestKeyProvider(t, nil)))
+	local := httptest.NewServer(newLocalMux(store, newTestKeyProvider(t, nil), nil))
 	defer local.Close()
 
 	ch, unsub := store.Subscribe()
@@ -125,7 +125,7 @@ func TestLocalSessionCreateNoKeys(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	linkPhone(t)
-	withKey := httptest.NewServer(newLocalMux(store, newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})))
+	withKey := httptest.NewServer(newLocalMux(store, newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub}), nil))
 	defer withKey.Close()
 	resp = postJSON(t, withKey.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)
 	if resp.StatusCode != http.StatusOK {

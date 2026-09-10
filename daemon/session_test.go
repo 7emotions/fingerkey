@@ -267,7 +267,7 @@ type testEnv struct {
 func newTestEnv(t *testing.T, keys *keyProvider) *testEnv {
 	t.Helper()
 	store := NewStore()
-	local := httptest.NewServer(newLocalMux(store, keys))
+	local := httptest.NewServer(newLocalMux(store, keys, nil))
 	t.Cleanup(local.Close)
 	return &testEnv{local: local, store: store}
 }

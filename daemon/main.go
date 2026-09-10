@@ -17,16 +17,18 @@ import (
 )
 
 func main() {
-	adapter := flag.String("adapter", "hci0", "Bluetooth HCI adapter for the SPP phone link")
 	socketPath := flag.String("socket", "/run/phone-fprint-auth/daemon.sock", "unix socket path for the root-only local surface")
 	keysDir := flag.String("keys-dir", "/var/lib/phone-fprint-auth/keys", "directory of <name>.pub Ed25519 public keys (base64)")
 	simSocketPath := flag.String("phone-sim-socket", "", "unix socket path for a test phone link (empty = disabled)")
+	addr := flag.String("addr", ":4443", "TCP address for the TLS phone listener")
+	tlsDir := flag.String("tls-dir", "/var/lib/phone-fprint-auth/tls", "directory holding the TLS identity (cert.pem/key.pem)")
+	maxConns := flag.Int("max-conns", 16, "maximum concurrent TLS phone connections")
+	maxConnsPerIP := flag.Int("max-conns-per-ip", 4, "maximum concurrent TLS phone connections per source IP")
 	flag.Parse()
-
-	log.Printf("phone-fprint-auth daemon: adapter=%s", *adapter)
 
 	keys := newKeyProvider(*keysDir)
 	store := NewStore()
+	pairs := newPairManager(*keysDir)
 
 	// Local surface: root-only session creation and status polling over a 0700
 	// unix socket. systemd's RuntimeDirectory normally owns the parent dir;
@@ -43,7 +45,7 @@ func main() {
 		log.Fatal(err)
 	}
 	go func() {
-		if err := http.Serve(localLn, newLocalMux(store, keys)); err != nil {
+		if err := http.Serve(localLn, newLocalMux(store, keys, pairs)); err != nil {
 			log.Fatal(err)
 		}
 	}()
@@ -52,7 +54,7 @@ func main() {
 	// Phone surface: the -phone-sim-socket listener is test-only: it accepts
 	// plain framed streams over a unix socket exactly like a phone link will.
 	if *simSocketPath != "" {
-		ln, err := servePhoneSimSocket(*simSocketPath, store, keys)
+		ln, err := servePhoneSimSocket(*simSocketPath, store, keys, pairs)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -60,11 +62,24 @@ func main() {
 		log.Printf("phone-fprint-auth daemon: phone sim socket listening on %s", *simSocketPath)
 	}
 
-	// Phone surface: the real link is the BlueZ SPP server (bt.go).
-	// Deliberately non-fatal: without Bluetooth the daemon still serves the
+	// Phone surface: the real link is the TLS TCP listener (tls.go).
+	// Deliberately non-fatal: without TLS the daemon still serves the
 	// unix-socket surface and PAM falls back to the password prompt.
-	if err := startSppServer(*adapter, store, keys); err != nil {
-		log.Printf("bluetooth unavailable: %v", err)
+	cert, fp, err := loadOrGenerateTLSIdentity(*tlsDir)
+	if err != nil {
+		log.Printf("tls unavailable: %v", err)
+	} else {
+		ln, err := serveTLS(*addr, cert, *maxConns, *maxConnsPerIP, store, keys, pairs)
+		if err != nil {
+			log.Printf("tls unavailable: %v", err)
+		} else {
+			port := ln.Addr().(*net.TCPAddr).Port
+			pairs.setTransport(fp, localIPv4(), port)
+			log.Printf("phone-fprint-auth daemon: tls listening on %s (fp=%s)", ln.Addr(), fp)
+			if err := publishMDNS(port, fp); err != nil {
+				log.Printf("mdns unavailable: %v", err)
+			}
+		}
 	}
 
 	select {}
@@ -74,7 +89,7 @@ func main() {
 // accepted connection to startPhoneLink. Any stale socket file from a
 // previous run is removed first; the socket file is chmodded 0700. The
 // returned listener must be closed by the caller to stop accepting.
-func servePhoneSimSocket(path string, store *Store, keys *keyProvider) (net.Listener, error) {
+func servePhoneSimSocket(path string, store *Store, keys *keyProvider, pairs *pairManager) (net.Listener, error) {
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
@@ -90,16 +105,19 @@ func servePhoneSimSocket(path string, store *Store, keys *keyProvider) (net.List
 			if err != nil {
 				return
 			}
-			startPhoneLink(conn, store, keys)
+			startPhoneLink(conn, store, keys, pairs)
 		}
 	}()
 	return ln, nil
 }
 
 // newLocalMux wires the root-only local surface (unix socket): session
-// creation (POST /v1/session) and status polling (GET /v1/session/{id}) only.
-func newLocalMux(store *Store, keys *keyProvider) http.Handler {
+// creation (POST /v1/session), status polling (GET /v1/session/{id}), and
+// pairing-token issue (POST /v1/pair).
+func newLocalMux(store *Store, keys *keyProvider, pairs *pairManager) http.Handler {
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("/v1/pair", pairs.handlePair)
 
 	// Go 1.18 ServeMux: "/v1/session" matches only the exact path.
 	mux.HandleFunc("/v1/session", func(w http.ResponseWriter, r *http.Request) {

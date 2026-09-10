@@ -231,7 +231,7 @@ func TestDecideNoPhoneLink503(t *testing.T) {
 	// No registered phone link here: no linkPhone(t) call.
 	store := NewStore()
 	pub, _ := newKey(t)
-	local := httptest.NewServer(newLocalMux(store, newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})))
+	local := httptest.NewServer(newLocalMux(store, newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub}), nil))
 	defer local.Close()
 
 	resp := postJSON(t, local.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)

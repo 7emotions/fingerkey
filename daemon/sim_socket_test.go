@@ -28,7 +28,7 @@ func TestSimSocketEndToEnd(t *testing.T) {
 	pub, priv := newKey(t)
 	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 
-	ln, err := servePhoneSimSocket(path, store, keys)
+	ln, err := servePhoneSimSocket(path, store, keys, nil)
 	if err != nil {
 		t.Fatalf("servePhoneSimSocket: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestSimSocketUnregisteredHello(t *testing.T) {
 	store := NewStore()
 	unpaired, _ := newKey(t)
 
-	ln, err := servePhoneSimSocket(path, store, newTestKeyProvider(t, nil))
+	ln, err := servePhoneSimSocket(path, store, newTestKeyProvider(t, nil), nil)
 	if err != nil {
 		t.Fatalf("servePhoneSimSocket: %v", err)
 	}

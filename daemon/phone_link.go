@@ -47,19 +47,27 @@ func newPhoneLink(rwc io.ReadWriteCloser) *phoneLink {
 
 // startPhoneLink wraps an accepted stream (a TLS socket in production, a
 // sim-socket or net.Pipe conn in tests) in a phoneLink and starts its run
-// loop.
-func startPhoneLink(rwc io.ReadWriteCloser, store *Store, keys *keyProvider) {
+// loop. pairs may be nil when no pairing manager is wired (tests); a hello
+// carrying a token is then treated as unregistered.
+func startPhoneLink(rwc io.ReadWriteCloser, store *Store, keys *keyProvider, pairs *pairManager) {
 	if c, ok := rwc.(net.Conn); ok {
 		enableKeepAlive(c)
 	}
-	go newPhoneLink(rwc).run(store, keys)
+	go newPhoneLink(rwc).run(store, keys, pairs)
 }
 
 // run drives the link lifecycle: it registers the link, gates it on a hello
 // frame, and — for registered links only — subscribes to the store, sends the
 // welcome control frame synchronously (direct write, before any push), and
 // then runs the push/write/read goroutines until the link dies.
-func (l *phoneLink) run(store *Store, keys *keyProvider) {
+//
+// A hello carrying a pairing token takes the pairing path instead: the token
+// is consumed atomically (see pairManager.consume) and the link answers
+// registered{key:name} — the hello's name field is display-only and never
+// trusted for identity; the token's name is the registration name. A stale or
+// unknown token is audited pair-failed inside consume and refused like any
+// unregistered hello.
+func (l *phoneLink) run(store *Store, keys *keyProvider, pairs *pairManager) {
 	id := registerPhoneLink(l)
 	defer unregisterPhoneLink(id)
 
@@ -84,26 +92,45 @@ func (l *phoneLink) run(store *Store, keys *keyProvider) {
 	var hello helloFrame
 	keyName := ""
 	registered := false
+	tokenRegistered := false
 	if err := json.Unmarshal(payload, &hello); err == nil && hello.Type == "hello" {
 		if pub, perr := decodePubKey(hello.PubKey); perr == nil {
-			keyName, registered = keys.Lookup(pub)
+			if hello.Token != "" && pairs != nil {
+				// Pairing path. consume deletes the token before validating,
+				// so a replayed token can never register twice; it also
+				// writes <name>.pub and audits pair-registered/pair-failed.
+				name, _, cerr := pairs.consume(hello.Token, pub)
+				if cerr == nil {
+					keyName, registered, tokenRegistered = name, true, true
+				}
+			} else {
+				keyName, registered = keys.Lookup(pub)
+			}
 		}
 	}
 	if !registered {
-		// Unregistered pubkey (or no valid hello): answer welcome{registered:false}
-		// and close. No subscription, no pushes, no decision-results.
+		// Unregistered pubkey, failed token (or no valid hello): answer
+		// welcome{registered:false} and close. No subscription, no pushes,
+		// no decision-results.
 		_ = l.writePayload(frameJSON(welcomeFrame{Type: "welcome", Registered: false, Pending: []pendingFrame{}}))
 		return
 	}
 
 	// Registered: subscribe BEFORE snapshotting Pending() so no session can
-	// slip between the two; the welcome control frame is written directly so
-	// it always precedes the first push and is never dropped. Duplicates
-	// across the snapshot and the live subscription are the phone's to dedup.
+	// slip between the two; the welcome/registered control frame is written
+	// directly so it always precedes the first push and is never dropped.
+	// Duplicates across the snapshot and the live subscription are the
+	// phone's to dedup.
 	ch, unsub := store.Subscribe()
 	defer unsub()
 	l.registered = true
-	if !l.writePayload(frameJSON(welcomeFrame{
+	if tokenRegistered {
+		// The pairing flow answers registered{key:name} instead of welcome;
+		// the phone treats either control frame as "this link is registered".
+		if !l.writePayload(frameJSON(registeredFrame{Type: "registered", Key: keyName})) {
+			return
+		}
+	} else if !l.writePayload(frameJSON(welcomeFrame{
 		Type:       "welcome",
 		Registered: true,
 		Key:        keyName,

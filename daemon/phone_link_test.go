@@ -37,7 +37,7 @@ func waitNoLinks(t *testing.T) {
 func dialPipeLink(t *testing.T, store *Store, kp *keyProvider) (daemonSide, phoneSide net.Conn) {
 	t.Helper()
 	daemonSide, phoneSide = net.Pipe()
-	go newPhoneLink(daemonSide).run(store, kp)
+	go newPhoneLink(daemonSide).run(store, kp, nil)
 	t.Cleanup(func() {
 		daemonSide.Close()
 		phoneSide.Close()
