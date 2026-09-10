@@ -1,13 +1,51 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
+
+// keyProvider serves paired keys lazily: every Lookup/Count/All re-reads the
+// keys directory, so phone-approve pair/remove takes effect on the next
+// decision without a daemon restart. The RWMutex serializes the directory
+// scans.
+type keyProvider struct {
+	mu  sync.RWMutex
+	dir string
+}
+
+// newKeyProvider returns a keyProvider rooted at dir.
+func newKeyProvider(dir string) *keyProvider {
+	return &keyProvider{dir: dir}
+}
+
+// All returns a fresh snapshot of the paired keys, keyed by name.
+func (kp *keyProvider) All() map[string]ed25519.PublicKey {
+	kp.mu.RLock()
+	defer kp.mu.RUnlock()
+	return loadPubKeys(kp.dir)
+}
+
+// Count reports how many keys are currently paired.
+func (kp *keyProvider) Count() int {
+	return len(kp.All())
+}
+
+// Lookup returns the name the given public key is paired under, if any.
+func (kp *keyProvider) Lookup(pub ed25519.PublicKey) (string, bool) {
+	for name, k := range kp.All() {
+		if bytes.Equal(k, pub) {
+			return name, true
+		}
+	}
+	return "", false
+}
 
 // loadPubKeys reads every <name>.pub file in dir and decodes each file as a
 // standard, padded base64 encoding of a 32-byte Ed25519 public key. The
@@ -19,9 +57,7 @@ import (
 func loadPubKeys(dir string) map[string]ed25519.PublicKey {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("keys: %s does not exist — no keys paired", dir)
-		} else {
+		if !os.IsNotExist(err) {
 			log.Printf("keys: cannot read %s: %v", dir, err)
 		}
 		return map[string]ed25519.PublicKey{}

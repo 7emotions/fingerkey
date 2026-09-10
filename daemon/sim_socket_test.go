@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"net"
 	"os"
@@ -12,8 +13,9 @@ import (
 
 // TestSimSocketEndToEnd proves servePhoneSimSocket + startPhoneLink work over
 // a real unix socket exactly as main() wires them: a stale socket file is
-// replaced, the accepted stream gets a pending frame on store.Create, and a
-// signed decision frame is answered with a decision-result.
+// replaced, the accepted stream answers a hello with a registered welcome,
+// gets a pending frame on store.Create, and a signed decision frame is
+// answered with a decision-result.
 func TestSimSocketEndToEnd(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sim.sock")
 	// Stale socket from a previous run: Listen must not fail, proving the
@@ -24,7 +26,7 @@ func TestSimSocketEndToEnd(t *testing.T) {
 
 	store := NewStore()
 	pub, priv := newKey(t)
-	keys := map[string]ed25519.PublicKey{"alice": pub}
+	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 
 	ln, err := servePhoneSimSocket(path, store, keys)
 	if err != nil {
@@ -44,14 +46,29 @@ func TestSimSocketEndToEnd(t *testing.T) {
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	// Wait until the accepted link is registered: run() subscribes before
-	// registering, so a Create after this cannot be missed.
-	deadline := time.Now().Add(5 * time.Second)
-	for !phoneConnected() {
-		if time.Now().After(deadline) {
-			t.Fatal("sim-socket link did not register")
-		}
-		time.Sleep(time.Millisecond)
+	// The v2 handshake: hello with the paired pubkey must be answered with a
+	// registered welcome before any push.
+	hello, err := json.Marshal(map[string]string{
+		"type":   "hello",
+		"pubkey": base64.StdEncoding.EncodeToString(pub),
+		"name":   "sim-phone",
+	})
+	if err != nil {
+		t.Fatalf("marshal hello: %v", err)
+	}
+	if err := writeFrame(conn, hello); err != nil {
+		t.Fatalf("writeFrame(hello): %v", err)
+	}
+	payload, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("readFrame(welcome): %v", err)
+	}
+	var welcome welcomeFrame
+	if err := json.Unmarshal(payload, &welcome); err != nil {
+		t.Fatalf("welcome frame is not valid JSON: %v", err)
+	}
+	if !welcome.Registered || welcome.Key != "alice" {
+		t.Fatalf("welcome = %+v, want registered key alice", welcome)
 	}
 
 	s, err := store.Create("alice", "sudo", "/dev/pts/0")
@@ -60,7 +77,7 @@ func TestSimSocketEndToEnd(t *testing.T) {
 	}
 
 	// The pusher must emit one pending frame with the session context.
-	payload, err := readFrame(conn)
+	payload, err = readFrame(conn)
 	if err != nil {
 		t.Fatalf("readFrame(pending): %v", err)
 	}
@@ -70,6 +87,9 @@ func TestSimSocketEndToEnd(t *testing.T) {
 	}
 	if f.Type != "pending" || f.ID != s.ID || f.User != "alice" || f.Service != "sudo" || f.TTY != "/dev/pts/0" {
 		t.Errorf("pending frame = %+v, want the created session", f)
+	}
+	if f.ExpiresAt != s.ExpiresAt.Unix() {
+		t.Errorf("expires_at = %d, want %d", f.ExpiresAt, s.ExpiresAt.Unix())
 	}
 
 	// A signed decision frame must be answered with an approved result.
@@ -98,5 +118,65 @@ func TestSimSocketEndToEnd(t *testing.T) {
 	}
 	if s.Status != StatusApproved {
 		t.Errorf("session status = %q, want %q", s.Status, StatusApproved)
+	}
+	if s.DecidedBy != "alice" {
+		t.Errorf("DecidedBy = %q, want %q", s.DecidedBy, "alice")
+	}
+}
+
+// TestSimSocketUnregisteredHello: a hello with an unpaired pubkey must be
+// answered with welcome{registered:false} and the link closed — and it must
+// not register the link for phoneConnected().
+func TestSimSocketUnregisteredHello(t *testing.T) {
+	waitNoLinks(t)
+	path := filepath.Join(t.TempDir(), "sim.sock")
+	store := NewStore()
+	unpaired, _ := newKey(t)
+
+	ln, err := servePhoneSimSocket(path, store, newTestKeyProvider(t, nil))
+	if err != nil {
+		t.Fatalf("servePhoneSimSocket: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	hello, err := json.Marshal(map[string]string{
+		"type":   "hello",
+		"pubkey": base64.StdEncoding.EncodeToString(unpaired),
+		"name":   "sim-phone",
+	})
+	if err != nil {
+		t.Fatalf("marshal hello: %v", err)
+	}
+	if err := writeFrame(conn, hello); err != nil {
+		t.Fatalf("writeFrame(hello): %v", err)
+	}
+	payload, err := readFrame(conn)
+	if err != nil {
+		t.Fatalf("readFrame(welcome): %v", err)
+	}
+	var welcome welcomeFrame
+	if err := json.Unmarshal(payload, &welcome); err != nil {
+		t.Fatalf("welcome frame is not valid JSON: %v", err)
+	}
+	if welcome.Registered {
+		t.Fatalf("welcome = %+v, want registered:false", welcome)
+	}
+	if len(welcome.Pending) != 0 {
+		t.Errorf("unregistered welcome must carry no pending sessions, got %d", len(welcome.Pending))
+	}
+	if phoneConnected() {
+		t.Fatal("phoneConnected() must be false for an unregistered hello")
+	}
+
+	// The link must be closed right after: the next read sees EOF.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := readFrame(conn); err == nil {
+		t.Fatal("expected the unregistered link to be closed")
 	}
 }

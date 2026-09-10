@@ -1,13 +1,11 @@
 package main
 
 import (
-	"crypto/ed25519"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/godbus/dbus/v5"
@@ -26,13 +24,10 @@ const (
 	sppAgentPath = dbus.ObjectPath("/com/phonefprint/agent")
 )
 
-// sppConn and sppProfile hold the live D-Bus state past startSppServer's
-// return: the connection's inWorker goroutine keeps serving incoming
-// Profile1 method calls as long as the conn is referenced and open.
-var (
-	sppConn    *dbus.Conn
-	sppProfile *sppProfileState
-)
+// sppConn holds the live D-Bus connection past startSppServer's return: its
+// inWorker goroutine keeps serving incoming method calls as long as the conn
+// is referenced and open.
+var sppConn *dbus.Conn
 
 // startSppServer registers an org.bluez.Profile1 (RFCOMM SPP server) on the
 // system bus and hands every accepted RFCOMM socket to startPhoneLink, so the
@@ -40,7 +35,10 @@ var (
 // sim-socket. Any failure is returned to the caller (which logs it as
 // non-fatal): the daemon keeps serving the unix-socket surface without
 // Bluetooth.
-func startSppServer(adapter string, store *Store, keys map[string]ed25519.PublicKey) error {
+//
+// TODO(todo 9): delete this whole file. The single-link sppProfileState was
+// removed in todo 5 (multi-link); profile registration is disabled below.
+func startSppServer(adapter string, store *Store, keys *keyProvider) error {
 	conn, err := dbus.SystemBus()
 	if err != nil {
 		return fmt.Errorf("connect to system bus: %w", err)
@@ -71,25 +69,10 @@ func startSppServer(adapter string, store *Store, keys map[string]ed25519.Public
 		return fmt.Errorf("request name %s: not primary owner (reply=%d)", sppProfileName, reply)
 	}
 
-	profile := &sppProfileState{store: store, keys: keys}
-	if err := conn.Export(profile, sppProfilePath, "org.bluez.Profile1"); err != nil {
-		conn.Close()
-		return fmt.Errorf("export profile: %w", err)
-	}
-
-	options := map[string]dbus.Variant{
-		"Role":                  dbus.MakeVariant("server"),
-		"Channel":               dbus.MakeVariant(sppChannel),
-		"RequireAuthentication": dbus.MakeVariant(true),
-		"Name":                  dbus.MakeVariant("phone-fprint-auth"),
-	}
-	call := conn.Object("org.bluez", "/org/bluez").Call(
-		"org.bluez.ProfileManager1.RegisterProfile", 0, sppProfilePath, sppUUID, options)
-	if call.Err != nil {
-		conn.Export(nil, sppProfilePath, "org.bluez.Profile1") // undo the export
-		conn.Close()
-		return fmt.Errorf("register profile: %w", call.Err)
-	}
+	// Profile registration removed with sppProfileState (todo 5): the SPP
+	// profile has no single-link state to export anymore and the LAN/TLS
+	// listener replaces the phone transport. Nothing here registers a
+	// profile; the code stays in place until todo 9 deletes it.
 
 	// Export and register the NoInputNoOutput pairing agent: without it
 	// bluetoothd rejects pairing with "Authentication attempt without agent".
@@ -98,7 +81,6 @@ func startSppServer(adapter string, store *Store, keys map[string]ed25519.Public
 	// registration, never from bonding.
 	agent := &sppAgent{}
 	if err := conn.Export(agent, sppAgentPath, "org.bluez.Agent1"); err != nil {
-		conn.Export(nil, sppProfilePath, "org.bluez.Profile1")
 		conn.Close()
 		return fmt.Errorf("export pairing agent: %w", err)
 	}
@@ -106,14 +88,12 @@ func startSppServer(adapter string, store *Store, keys map[string]ed25519.Public
 	if call := agentManager.Call(
 		"org.bluez.AgentManager1.RegisterAgent", 0, sppAgentPath, "NoInputNoOutput"); call.Err != nil {
 		conn.Export(nil, sppAgentPath, "org.bluez.Agent1")
-		conn.Export(nil, sppProfilePath, "org.bluez.Profile1")
 		conn.Close()
 		return fmt.Errorf("register pairing agent: %w", call.Err)
 	}
 	if call := agentManager.Call(
 		"org.bluez.AgentManager1.RequestDefaultAgent", 0, sppAgentPath); call.Err != nil {
 		conn.Export(nil, sppAgentPath, "org.bluez.Agent1")
-		conn.Export(nil, sppProfilePath, "org.bluez.Profile1")
 		conn.Close()
 		return fmt.Errorf("request default pairing agent: %w", call.Err)
 	}
@@ -121,15 +101,10 @@ func startSppServer(adapter string, store *Store, keys map[string]ed25519.Public
 	// Keep the live D-Bus state referenced and unregister best-effort on
 	// shutdown, then exit so SIGINT/SIGTERM still terminate the process.
 	sppConn = conn
-	sppProfile = profile
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		if err := conn.Object("org.bluez", "/org/bluez").Call(
-			"org.bluez.ProfileManager1.UnregisterProfile", 0, sppProfilePath).Err; err != nil {
-			log.Printf("bluetooth: unregister profile: %v", err)
-		}
 		if err := conn.Object("org.bluez", "/org/bluez").Call(
 			"org.bluez.AgentManager1.UnregisterAgent", 0, sppAgentPath).Err; err != nil {
 			log.Printf("bluetooth: unregister pairing agent: %v", err)
@@ -138,7 +113,6 @@ func startSppServer(adapter string, store *Store, keys map[string]ed25519.Public
 		os.Exit(0)
 	}()
 
-	log.Printf("spp profile registered (uuid=%s, channel=%d, adapter=%s)", sppUUID, sppChannel, path)
 	log.Printf("pairing agent registered (path=%s, capability=NoInputNoOutput)", sppAgentPath)
 	return nil
 }
@@ -176,68 +150,6 @@ func selectAdapterPath(managed map[dbus.ObjectPath]map[string]map[string]dbus.Va
 		}
 	}
 	return "", "", fmt.Errorf("no org.bluez.Adapter1 matching %q", adapter)
-}
-
-// sppProfileState implements org.bluez.Profile1. NewConnection receives the
-// RFCOMM socket as a dbus.UnixFD and hands it to startPhoneLink; at most one
-// phone link is active — a new connection replaces the previous one.
-type sppProfileState struct {
-	mu     sync.Mutex
-	active *os.File // the connected RFCOMM socket, one phone at a time
-	store  *Store
-	keys   map[string]ed25519.PublicKey
-}
-
-// Release is called by BlueZ when the profile is released (service stop or
-// profile removal): drop the active link.
-func (p *sppProfileState) Release() *dbus.Error {
-	log.Printf("bluetooth: profile released, closing active link")
-	p.closeActive()
-	return nil
-}
-
-// NewConnection is called by BlueZ when a phone connects the SPP profile.
-// The fd is the connected RFCOMM socket; ownership passes to us. If a
-// previous link is still active it is closed first (one phone at a time).
-func (p *sppProfileState) NewConnection(device dbus.ObjectPath, fd dbus.UnixFD, fdProps map[string]dbus.Variant) *dbus.Error {
-	f := wrapUnixFD(fd)
-	if f == nil {
-		log.Printf("bluetooth: rejecting connection from %s: invalid RFCOMM fd", device)
-		return dbus.NewError("org.bluez.Error.Rejected", []interface{}{"invalid file descriptor"})
-	}
-
-	p.mu.Lock()
-	prev := p.active
-	p.active = f
-	p.mu.Unlock()
-	if prev != nil {
-		log.Printf("bluetooth: closing previous phone link for new connection from %s", device)
-		_ = prev.Close()
-	}
-
-	log.Printf("bluetooth: SPP connection from %s", device)
-	startPhoneLink(f, p.store, p.keys)
-	return nil
-}
-
-// RequestDisconnection is called by BlueZ when a disconnect is requested
-// (e.g. the phone disconnects): drop the active link.
-func (p *sppProfileState) RequestDisconnection(device dbus.ObjectPath) *dbus.Error {
-	log.Printf("bluetooth: disconnection requested for %s", device)
-	p.closeActive()
-	return nil
-}
-
-// closeActive closes the active RFCOMM socket, if any. phoneLink.run closes
-// the same file when its loop finishes; the extra close here is harmless and
-// clears the reference so a new connection starts clean.
-func (p *sppProfileState) closeActive() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.active != nil {
-		_ = p.active.Close()
-		p.active = nil
-	}
 }
 
 // sppAgent implements org.bluez.Agent1 with the NoInputNoOutput capability.

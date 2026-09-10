@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -10,6 +12,15 @@ import (
 // sessionTTL is how long a pending session stays valid. It is a package var
 // so tests can shorten it.
 var sessionTTL = 60 * time.Second
+
+// maxSessions bounds the store: every Create evicts expired sessions and, at
+// the bound, the oldest terminal one; with no evictable terminal session
+// Create is rejected. A package var so tests can shrink it.
+var maxSessions = 256
+
+// errStoreFull is returned by Create when the store is at maxSessions and no
+// terminal session can be evicted.
+var errStoreFull = errors.New("session store full")
 
 // Session status values.
 const (
@@ -29,6 +40,7 @@ type Session struct {
 	TTY       string
 	CreatedAt time.Time
 	ExpiresAt time.Time
+	DecidedBy string
 }
 
 // CurrentStatus reports the effective status, mapping an expired pending
@@ -58,7 +70,9 @@ func NewStore() *Store {
 }
 
 // Create generates a new pending session with a random 128-bit id (hex
-// encoded) and a random 32-byte nonce.
+// encoded) and a random 32-byte nonce. Expired sessions are evicted first;
+// at maxSessions the oldest terminal session is evicted to make room; with
+// no evictable terminal session Create returns errStoreFull.
 func (st *Store) Create(user, service, tty string) (*Session, error) {
 	id, err := randomHex(16)
 	if err != nil {
@@ -80,6 +94,15 @@ func (st *Store) Create(user, service, tty string) (*Session, error) {
 		ExpiresAt: now.Add(sessionTTL),
 	}
 	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.evictExpiredLocked(now)
+	if len(st.sessions) >= maxSessions {
+		oldest := st.oldestTerminalLocked()
+		if oldest == nil {
+			return nil, errStoreFull
+		}
+		delete(st.sessions, oldest.ID)
+	}
 	st.sessions[id] = s
 	for sub := range st.subs {
 		select {
@@ -87,8 +110,32 @@ func (st *Store) Create(user, service, tty string) (*Session, error) {
 		default: // subscriber buffer full: skip this delivery
 		}
 	}
-	st.mu.Unlock()
 	return s, nil
+}
+
+// evictExpiredLocked drops expired pending sessions (TTL eviction). Terminal
+// sessions never expire; the maxSessions bound evicts them instead.
+func (st *Store) evictExpiredLocked(now time.Time) {
+	for id, s := range st.sessions {
+		if s.CurrentStatus() == StatusExpired {
+			delete(st.sessions, id)
+		}
+	}
+}
+
+// oldestTerminalLocked returns the terminal (approved/denied) session with
+// the earliest CreatedAt, or nil if none exists.
+func (st *Store) oldestTerminalLocked() *Session {
+	var oldest *Session
+	for _, s := range st.sessions {
+		if s.Status == StatusPending {
+			continue
+		}
+		if oldest == nil || s.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = s
+		}
+	}
+	return oldest
 }
 
 // Subscribe registers a broadcast subscriber: every Create delivers the new
@@ -112,6 +159,22 @@ func (st *Store) Subscribe() (<-chan *Session, func()) {
 	return ch, unsub
 }
 
+// Pending returns every non-expired pending session, oldest first.
+func (st *Store) Pending() []*Session {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	pending := make([]*Session, 0)
+	for _, s := range st.sessions {
+		if s.CurrentStatus() == StatusPending {
+			pending = append(pending, s)
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+	})
+	return pending
+}
+
 // Get returns the session with the given id, if known.
 func (st *Store) Get(id string) (*Session, bool) {
 	st.mu.Lock()
@@ -125,15 +188,16 @@ func (st *Store) Get(id string) (*Session, bool) {
 // the session is no longer pending (already approved, denied, or expired) and
 // no state change is made.
 func (st *Store) Approve(id string) (approved, found bool) {
-	ok, found := st.Decide(id, StatusApproved)
+	ok, found := st.Decide(id, StatusApproved, "")
 	return ok, found
 }
 
 // Decide transitions a pending session to the given terminal status
-// (StatusApproved or StatusDenied), once only. It returns (ok, found): found
-// is false for unknown ids; ok is false when the session is no longer pending
-// (already decided or expired) and no state change is made.
-func (st *Store) Decide(id, status string) (ok, found bool) {
+// (StatusApproved or StatusDenied), once only, recording the deciding key's
+// name in DecidedBy. It returns (ok, found): found is false for unknown ids;
+// ok is false when the session is no longer pending (already decided or
+// expired) and no state change is made.
+func (st *Store) Decide(id, status, decidedBy string) (ok, found bool) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	s, present := st.sessions[id]
@@ -144,6 +208,7 @@ func (st *Store) Decide(id, status string) (ok, found bool) {
 		return false, true
 	}
 	s.Status = status
+	s.DecidedBy = decidedBy
 	return true, true
 }
 

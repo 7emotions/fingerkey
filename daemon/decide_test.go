@@ -95,13 +95,13 @@ func TestStoreSubscribeSkipWhenFull(t *testing.T) {
 
 // ---- decide() tests ----
 
-// testDecideStore builds a store with one pending session and a keys map
+// testDecideStore builds a store with one pending session and a keyProvider
 // holding the paired pubkey under the name "alice".
-func testDecideStore(t *testing.T) (*Store, map[string]ed25519.PublicKey, ed25519.PrivateKey, *Session) {
+func testDecideStore(t *testing.T) (*Store, *keyProvider, ed25519.PrivateKey, *Session) {
 	t.Helper()
 	store := NewStore()
 	pub, priv := newKey(t)
-	keys := map[string]ed25519.PublicKey{"alice": pub}
+	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 	s, err := store.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -170,6 +170,9 @@ func TestDecideWrongKey(t *testing.T) {
 	}
 }
 
+// TestDecideTwice: deciding an already-decided session is an idempotent
+// replay, not a conflict — the second decide returns the original outcome
+// and the key that produced it.
 func TestDecideTwice(t *testing.T) {
 	store, keys, priv, s := testDecideStore(t)
 
@@ -177,9 +180,34 @@ func TestDecideTwice(t *testing.T) {
 	if code, _, _ := decide(store, keys, s.ID, "approve", sig); code != http.StatusOK {
 		t.Fatalf("first decide code = %d, want 200", code)
 	}
-	code, _, _ := decide(store, keys, s.ID, "approve", sig)
-	if code != http.StatusConflict {
-		t.Fatalf("second decide code = %d, want 409 (once-only)", code)
+	code, status, key := decide(store, keys, s.ID, "approve", sig)
+	if code != http.StatusOK {
+		t.Fatalf("second decide code = %d, want 200 (idempotent replay)", code)
+	}
+	if status != StatusApproved {
+		t.Errorf("second decide status = %q, want %q (original outcome)", status, StatusApproved)
+	}
+	if key != "alice" {
+		t.Errorf("second decide key = %q, want %q (DecidedBy)", key, "alice")
+	}
+}
+
+// TestDecideExpiredSession: deciding an expired session reports the expired
+// status as a success, never a 409.
+func TestDecideExpiredSession(t *testing.T) {
+	old := sessionTTL
+	sessionTTL = 20 * time.Millisecond
+	defer func() { sessionTTL = old }()
+
+	store, keys, priv, s := testDecideStore(t)
+	time.Sleep(50 * time.Millisecond)
+
+	code, status, _ := decide(store, keys, s.ID, "approve", signDecision(priv, "approve", s))
+	if code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 (expired is not an error)", code)
+	}
+	if status != StatusExpired {
+		t.Errorf("status = %q, want %q", status, StatusExpired)
 	}
 }
 
@@ -200,10 +228,10 @@ func TestDecideUnknown(t *testing.T) {
 // falls back to the password prompt instead of polling a request no phone
 // can approve.
 func TestDecideNoPhoneLink503(t *testing.T) {
-	// phoneLinks.active is 0 here: no linkPhone(t) call.
+	// No registered phone link here: no linkPhone(t) call.
 	store := NewStore()
 	pub, _ := newKey(t)
-	local := httptest.NewServer(newLocalMux(store, map[string]ed25519.PublicKey{"alice": pub}))
+	local := httptest.NewServer(newLocalMux(store, newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})))
 	defer local.Close()
 
 	resp := postJSON(t, local.URL+"/v1/session", `{"user":"alice","service":"sudo"}`)
@@ -212,5 +240,24 @@ func TestDecideNoPhoneLink503(t *testing.T) {
 	}
 	if m := decodeJSON(t, resp); m["error"] != "no phone connected" {
 		t.Errorf("body = %v, want error %q", m, "no phone connected")
+	}
+}
+
+// TestDecideUnpairedKeyMissingDir: with a missing keys directory, decide
+// answers unpaired-key instead of panicking.
+func TestDecideUnpairedKeyMissingDir(t *testing.T) {
+	store := NewStore()
+	_, priv := newKey(t)
+	s, err := store.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	code, _, key := decide(store, newKeyProvider(t.TempDir()+"/missing"), s.ID, "approve", signDecision(priv, "approve", s))
+	if code != http.StatusUnauthorized {
+		t.Fatalf("code = %d, want 401 (unpaired-key)", code)
+	}
+	if key != "" {
+		t.Errorf("key = %q, want empty on failure", key)
 	}
 }

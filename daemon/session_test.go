@@ -105,15 +105,18 @@ func TestDecideDeny(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	ok, found := st.Decide(s.ID, StatusDenied)
+	ok, found := st.Decide(s.ID, StatusDenied, "alice")
 	if !found || !ok {
 		t.Fatal("Decide(deny) should succeed on a pending session")
 	}
 	if s.Status != StatusDenied {
 		t.Fatalf("status = %q, want %q", s.Status, StatusDenied)
 	}
+	if s.DecidedBy != "alice" {
+		t.Fatalf("DecidedBy = %q, want %q", s.DecidedBy, "alice")
+	}
 	// deny is also once-only
-	if ok, found := st.Decide(s.ID, StatusDenied); found && ok {
+	if ok, found := st.Decide(s.ID, StatusDenied, "bob"); found && ok {
 		t.Fatal("second Decide must not succeed (once-only)")
 	}
 }
@@ -128,6 +131,129 @@ func TestUnknownSession(t *testing.T) {
 	}
 }
 
+// TestStorePending: Pending() returns exactly the non-expired pending
+// sessions, oldest first; decided and expired ones are excluded.
+func TestStorePending(t *testing.T) {
+	st := NewStore()
+	first, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	second, err := st.Create("bob", "su", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	third, err := st.Create("carol", "pkexec", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Decide the first session: it must drop out of Pending().
+	if ok, _ := st.Decide(first.ID, StatusDenied, "alice"); !ok {
+		t.Fatal("Decide(first) should succeed")
+	}
+
+	got := st.Pending()
+	if len(got) != 2 {
+		t.Fatalf("Pending() = %d sessions, want 2", len(got))
+	}
+	if got[0].ID != second.ID || got[1].ID != third.ID {
+		t.Errorf("Pending() = %q, %q; want %q, %q (oldest first)", got[0].ID, got[1].ID, second.ID, third.ID)
+	}
+}
+
+// TestStorePendingExcludesExpired: an expired pending session is not pending.
+func TestStorePendingExcludesExpired(t *testing.T) {
+	old := sessionTTL
+	sessionTTL = 20 * time.Millisecond
+	defer func() { sessionTTL = old }()
+
+	st := NewStore()
+	if _, err := st.Create("alice", "sudo", ""); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := st.Pending(); len(got) != 0 {
+		t.Fatalf("Pending() = %d sessions, want 0 (expired)", len(got))
+	}
+}
+
+// TestStoreBoundEvictsOldestTerminal: at maxSessions, a new Create evicts the
+// oldest terminal session to make room.
+func TestStoreBoundEvictsOldestTerminal(t *testing.T) {
+	old := maxSessions
+	maxSessions = 4
+	defer func() { maxSessions = old }()
+
+	st := NewStore()
+	var terminals []*Session
+	for i := 0; i < 4; i++ {
+		s, err := st.Create("alice", "sudo", "")
+		if err != nil {
+			t.Fatalf("Create #%d: %v", i, err)
+		}
+		if ok, _ := st.Decide(s.ID, StatusApproved, "alice"); !ok {
+			t.Fatalf("Decide #%d: %v", i, ok)
+		}
+		terminals = append(terminals, s)
+	}
+
+	fresh, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create at bound: %v", err)
+	}
+	if _, ok := st.Get(terminals[0].ID); ok {
+		t.Fatal("oldest terminal session must have been evicted")
+	}
+	for _, s := range terminals[1:] {
+		if _, ok := st.Get(s.ID); !ok {
+			t.Errorf("terminal session %s must survive the bound eviction", s.ID)
+		}
+	}
+	if _, ok := st.Get(fresh.ID); !ok {
+		t.Fatal("fresh session must be present")
+	}
+}
+
+// TestStoreFullRejects: at maxSessions with only pending sessions (nothing
+// evictable), Create rejects with errStoreFull.
+func TestStoreFullRejects(t *testing.T) {
+	old := maxSessions
+	maxSessions = 3
+	defer func() { maxSessions = old }()
+
+	st := NewStore()
+	for i := 0; i < 3; i++ {
+		if _, err := st.Create("alice", "sudo", ""); err != nil {
+			t.Fatalf("Create #%d: %v", i, err)
+		}
+	}
+	if _, err := st.Create("alice", "sudo", ""); err != errStoreFull {
+		t.Fatalf("Create at bound err = %v, want errStoreFull", err)
+	}
+}
+
+// TestStoreExpiredEvictedOnCreate: TTL eviction drops expired pending
+// sessions when a new Create runs.
+func TestStoreExpiredEvictedOnCreate(t *testing.T) {
+	old := sessionTTL
+	sessionTTL = 20 * time.Millisecond
+	defer func() { sessionTTL = old }()
+
+	st := NewStore()
+	expired, err := st.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := st.Create("alice", "sudo", ""); err != nil {
+		t.Fatalf("Create after expiry: %v", err)
+	}
+	if _, ok := st.Get(expired.ID); ok {
+		t.Fatal("expired session must be evicted by the next Create")
+	}
+}
+
 // ---- HTTP handler tests ----
 
 // testEnv bundles the root-only local mux (unix socket, session creation +
@@ -137,8 +263,8 @@ type testEnv struct {
 	store *Store
 }
 
-// newTestEnv builds one httptest server over a fresh store + key map.
-func newTestEnv(t *testing.T, keys map[string]ed25519.PublicKey) *testEnv {
+// newTestEnv builds one httptest server over a fresh store + key provider.
+func newTestEnv(t *testing.T, keys *keyProvider) *testEnv {
 	t.Helper()
 	store := NewStore()
 	local := httptest.NewServer(newLocalMux(store, keys))
@@ -153,27 +279,26 @@ func newTestServer(t *testing.T) *testEnv {
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
-	return newTestEnv(t, map[string]ed25519.PublicKey{"alice": pub})
+	return newTestEnv(t, newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub}))
 }
 
-// linkPhone marks one phone link as connected for the duration of the test.
-// Session creation over the local mux fails fast with 503 when no link is
-// active, so tests exercising the normal create path need this.
+// linkPhone marks one registered phone link as connected for the duration of
+// the test. Session creation over the local mux fails fast with 503 when no
+// registered link is active, so tests exercising the normal create path need
+// this.
 func linkPhone(t *testing.T) {
 	t.Helper()
-	phoneLinks.Lock()
-	phoneLinks.active++
-	phoneLinks.Unlock()
-	t.Cleanup(func() {
-		phoneLinks.Lock()
-		phoneLinks.active--
-		phoneLinks.Unlock()
-	})
+	id := registerPhoneLink(&phoneLink{registered: true})
+	t.Cleanup(func() { unregisterPhoneLink(id) })
 }
 
 func postJSON(t *testing.T, url, body string) *http.Response {
 	t.Helper()
-	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	// Disable keep-alives: the shared DefaultClient can reuse a dead pooled
+	// connection when the OS recycles a closed httptest server's port, and
+	// POST has no idempotent retry.
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := client.Post(url, "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST %s: %v", url, err)
 	}

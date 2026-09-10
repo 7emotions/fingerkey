@@ -1,96 +1,125 @@
 package main
 
 import (
-	"crypto/ed25519"
-	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"sync"
+	"time"
 )
 
-// phoneLink is one connected phone stream (the BlueZ SPP socket in
-// production, a net.Pipe in tests): the framed push-based approval link.
-// It runs exactly two goroutines — a pusher forwarding new pending sessions
-// and a reader handling inbound decision frames. All writes go through
-// writeMu so frames from the two goroutines never interleave.
+// connID identifies one accepted phone connection in the link registry.
+type connID uint64
+
+// Link lifecycle timeouts, package vars so tests can shorten them:
+// helloTimeout bounds the time between the (TLS) handshake completing and the
+// first frame arriving (which must be a hello); linkIdleTimeout closes a link
+// that receives no frame at all — the phone keeps its link healthy by sending
+// ping every ~15s, and every received frame resets the timer.
+var (
+	helloTimeout    = 5 * time.Second
+	linkIdleTimeout = 30 * time.Second
+)
+
+// queueDepth bounds a link's outbound push queue. Only pending pushes are
+// dropped when the queue is full (audited as push-dropped); control frames
+// (welcome, registered) are written directly and never enter the queue.
+const queueDepth = 8
+
+// phoneLink is one connected phone stream (a TLS TCP socket in production,
+// a net.Pipe in tests): the framed push-based approval link. It runs exactly
+// three goroutines after the hello handshake — a pusher forwarding new
+// pending sessions, a writer draining the outbound queue, and a reader
+// handling inbound frames. All writes go through writeMu so frames never
+// interleave.
 type phoneLink struct {
-	rwc     io.ReadWriteCloser
-	writeMu sync.Mutex
+	rwc        io.ReadWriteCloser
+	writeMu    sync.Mutex
+	registered bool        // set once hello's pubkey matched a paired key
+	queue      chan []byte // outbound pending pushes, bounded
 }
 
-// pendingFrame is the daemon→phone notification for a new pending session.
-// The nonce is standard-base64 of the 32 raw bytes. The shape is the
-// cross-language contract mirrored by app/lib/frame.dart.
-type pendingFrame struct {
-	Type    string `json:"type"`
-	ID      string `json:"id"`
-	Nonce   string `json:"nonce"`
-	User    string `json:"user"`
-	Service string `json:"service"`
-	TTY     string `json:"tty"`
+// newPhoneLink builds a phoneLink around a connected stream.
+func newPhoneLink(rwc io.ReadWriteCloser) *phoneLink {
+	return &phoneLink{rwc: rwc, queue: make(chan []byte, queueDepth)}
 }
 
-// decisionFrame is the phone→daemon frame: a signed approve/deny.
-type decisionFrame struct {
-	Type     string `json:"type"`
-	ID       string `json:"id"`
-	Decision string `json:"decision"`
-	Sig      string `json:"sig"`
+// startPhoneLink wraps an accepted stream (a TLS socket in production, a
+// sim-socket or net.Pipe conn in tests) in a phoneLink and starts its run
+// loop.
+func startPhoneLink(rwc io.ReadWriteCloser, store *Store, keys *keyProvider) {
+	if c, ok := rwc.(net.Conn); ok {
+		enableKeepAlive(c)
+	}
+	go newPhoneLink(rwc).run(store, keys)
 }
 
-// decisionResultFrame is the daemon→phone answer to a decision (or to any
-// unknown/malformed frame). id is deliberately NOT omitempty so a bad message
-// answers with "id":"". status/key carry the outcome of a 200; error carries
-// the reason otherwise.
-type decisionResultFrame struct {
-	Type   string `json:"type"`
-	ID     string `json:"id"`
-	Status string `json:"status,omitempty"`
-	Key    string `json:"key,omitempty"`
-	Error  string `json:"error,omitempty"`
-}
+// run drives the link lifecycle: it registers the link, gates it on a hello
+// frame, and — for registered links only — subscribes to the store, sends the
+// welcome control frame synchronously (direct write, before any push), and
+// then runs the push/write/read goroutines until the link dies.
+func (l *phoneLink) run(store *Store, keys *keyProvider) {
+	id := registerPhoneLink(l)
+	defer unregisterPhoneLink(id)
 
-// startPhoneLink wraps an accepted stream (an SPP RFCOMM socket in
-// production, a sim-socket or net.Pipe conn in tests) in a phoneLink and
-// starts its run loop.
-func startPhoneLink(rwc io.ReadWriteCloser, store *Store, keys map[string]ed25519.PublicKey) {
-	l := &phoneLink{rwc: rwc}
-	go l.run(store, keys)
-}
-
-// run drives the link: it subscribes to the store and spawns the pusher and
-// reader goroutines, then blocks until the link dies. It registers the link
-// so phoneConnected() reflects reality for its whole lifetime. The
-// subscription is taken BEFORE registering: once phoneConnected() turns true
-// the pusher is already subscribed, so a session created immediately after
-// the check can never be missed (no replay exists).
-func (l *phoneLink) run(store *Store, keys map[string]ed25519.PublicKey) {
-	ch, unsub := store.Subscribe()
-	registerPhoneLink(l)
-	defer unregisterPhoneLink(l)
-
-	// done closes exactly once — when the link is finished — so the pusher
-	// blocked on ch notices unsubscribe/link-close and the reader's
-	// readFrame error reaches everyone. finish is idempotent via once.
 	done := make(chan struct{})
 	var once sync.Once
 	finish := func() {
 		once.Do(func() {
-			unsub()
 			_ = l.rwc.Close()
 			close(done)
 		})
 	}
+	defer finish()
+
+	// The handshake gate: the first frame must be a well-formed hello within
+	// helloTimeout. Anything else — or nothing — is refused before the link
+	// can consume store resources.
+	setReadDeadline(l.rwc, time.Now().Add(helloTimeout))
+	payload, err := readFrame(l.rwc)
+	if err != nil {
+		return
+	}
+	var hello helloFrame
+	keyName := ""
+	registered := false
+	if err := json.Unmarshal(payload, &hello); err == nil && hello.Type == "hello" {
+		if pub, perr := decodePubKey(hello.PubKey); perr == nil {
+			keyName, registered = keys.Lookup(pub)
+		}
+	}
+	if !registered {
+		// Unregistered pubkey (or no valid hello): answer welcome{registered:false}
+		// and close. No subscription, no pushes, no decision-results.
+		_ = l.writePayload(frameJSON(welcomeFrame{Type: "welcome", Registered: false, Pending: []pendingFrame{}}))
+		return
+	}
+
+	// Registered: subscribe BEFORE snapshotting Pending() so no session can
+	// slip between the two; the welcome control frame is written directly so
+	// it always precedes the first push and is never dropped. Duplicates
+	// across the snapshot and the live subscription are the phone's to dedup.
+	ch, unsub := store.Subscribe()
+	defer unsub()
+	l.registered = true
+	if !l.writePayload(frameJSON(welcomeFrame{
+		Type:       "welcome",
+		Registered: true,
+		Key:        keyName,
+		Pending:    pendingFrames(store.Pending()),
+	})) {
+		return
+	}
 
 	go l.push(ch, done, finish)
-	go l.read(store, keys, finish)
-
-	<-done
+	go l.writeLoop(done, finish)
+	l.read(store, keys, finish)
 }
 
-// push forwards every created session to the phone as a pending frame until
-// the link finishes or a write fails.
+// push forwards every created session to the phone's outbound queue until the
+// link finishes. When the queue is full the pending push is dropped — never
+// silently — with a push-dropped audit line.
 func (l *phoneLink) push(ch <-chan *Session, done <-chan struct{}, finish func()) {
 	defer finish()
 	for {
@@ -98,41 +127,70 @@ func (l *phoneLink) push(ch <-chan *Session, done <-chan struct{}, finish func()
 		case <-done:
 			return
 		case s := <-ch:
-			payload, err := json.Marshal(pendingFrame{
-				Type:    "pending",
-				ID:      s.ID,
-				Nonce:   base64.StdEncoding.EncodeToString(s.Nonce),
-				User:    s.User,
-				Service: s.Service,
-				TTY:     s.TTY,
-			})
-			if err != nil || !l.writePayload(payload) {
+			select {
+			case l.queue <- frameJSON(pendingFrameFromSession(s)):
+			case <-done:
+				return
+			default:
+				audit("push-dropped", "id", s.ID, "user", s.User, "service", s.Service, "tty", s.TTY)
+			}
+		}
+	}
+}
+
+// writeLoop drains the outbound queue onto the wire until the link finishes
+// or a write fails.
+func (l *phoneLink) writeLoop(done <-chan struct{}, finish func()) {
+	defer finish()
+	for {
+		select {
+		case <-done:
+			return
+		case payload := <-l.queue:
+			if !l.writePayload(payload) {
 				return
 			}
 		}
 	}
 }
 
-// read consumes inbound frames: decision frames are verified and applied via
-// decide and answered with a decision-result; anything else is answered with
-// a bare bad-message. On a read error (EOF/closed link) or a failed write the
-// link is finished and the loop exits.
-func (l *phoneLink) read(store *Store, keys map[string]ed25519.PublicKey, finish func()) {
+// read consumes inbound frames under the idle timer: every frame resets the
+// deadline, so a silent healthy link dies after linkIdleTimeout while a
+// pinging one lives. On a read error (EOF/closed link/timeout) the link is
+// finished and the loop exits.
+func (l *phoneLink) read(store *Store, keys *keyProvider, finish func()) {
 	defer finish()
 	for {
+		setReadDeadline(l.rwc, time.Now().Add(linkIdleTimeout))
 		payload, err := readFrame(l.rwc)
 		if err != nil {
 			return
 		}
+		if !l.dispatch(store, keys, payload) {
+			return
+		}
+	}
+}
+
+// dispatch handles one inbound frame and reports whether the link should keep
+// reading. ping is answered with pong; decision frames are verified, applied
+// and their result broadcast to every registered link (only 200 outcomes
+// broadcast — failures answer the requester alone); anything else is a
+// bad-message.
+func (l *phoneLink) dispatch(store *Store, keys *keyProvider, payload []byte) bool {
+	var head struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &head); err != nil {
+		return l.writePayload(frameJSON(decisionResultFrame{Type: "decision-result", Error: "bad-message"}))
+	}
+	switch head.Type {
+	case "ping":
+		return l.writePayload(frameJSON(pongFrame{Type: "pong"}))
+	case "decision":
 		var f decisionFrame
-		if err := json.Unmarshal(payload, &f); err != nil || f.Type != "decision" {
-			// Unknown/other type or malformed JSON: no session id is
-			// recoverable, so the answer carries an empty id.
-			res, _ := json.Marshal(decisionResultFrame{Type: "decision-result", Error: "bad-message"})
-			if !l.writePayload(res) {
-				return
-			}
-			continue
+		if err := json.Unmarshal(payload, &f); err != nil {
+			return l.writePayload(frameJSON(decisionResultFrame{Type: "decision-result", Error: "bad-message"}))
 		}
 		code, status, key := decide(store, keys, f.ID, f.Decision, f.Sig)
 		res := decisionResultFrame{Type: "decision-result", ID: f.ID}
@@ -142,9 +200,33 @@ func (l *phoneLink) read(store *Store, keys map[string]ed25519.PublicKey, finish
 		} else {
 			res.Error = decisionError(code)
 		}
-		payload, _ = json.Marshal(res)
-		if !l.writePayload(payload) {
-			return
+		out := frameJSON(res)
+		if code != http.StatusOK {
+			return l.writePayload(out)
+		}
+		broadcastDecisionResult(out)
+		return true
+	default:
+		return l.writePayload(frameJSON(decisionResultFrame{Type: "decision-result", Error: "bad-message"}))
+	}
+}
+
+// broadcastDecisionResult enqueues a successful decision outcome to every
+// registered link (the decider included). Unregistered links never see it.
+func broadcastDecisionResult(payload []byte) {
+	phoneLinks.Lock()
+	targets := make([]*phoneLink, 0, len(phoneLinks.links))
+	for _, l := range phoneLinks.links {
+		if l.registered {
+			targets = append(targets, l)
+		}
+	}
+	phoneLinks.Unlock()
+	for _, l := range targets {
+		select {
+		case l.queue <- payload:
+		default:
+			audit("push-dropped", "frame", "decision-result")
 		}
 	}
 }
@@ -158,7 +240,7 @@ func (l *phoneLink) writePayload(payload []byte) bool {
 }
 
 // decisionError maps decide's status code to the phone-facing error reason.
-// decide only ever returns 200/400/401/404/409.
+// decide only ever returns 200/400/401/404.
 func decisionError(code int) string {
 	switch code {
 	case http.StatusBadRequest:
@@ -173,17 +255,36 @@ func decisionError(code int) string {
 	return "decision failed"
 }
 
-// registerPhoneLink bumps the active phone-link counter. The subscription is
-// always taken first (see run), so phoneConnected() implies a live pusher.
-func registerPhoneLink(l *phoneLink) {
-	phoneLinks.Lock()
-	phoneLinks.active++
-	phoneLinks.Unlock()
+// setReadDeadline sets the read deadline on streams that support one (TCP,
+// unix sockets, net.Pipe all do).
+func setReadDeadline(rwc io.ReadWriteCloser, t time.Time) {
+	if c, ok := rwc.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = c.SetReadDeadline(t)
+	}
 }
 
-// unregisterPhoneLink decrements the active phone-link counter.
-func unregisterPhoneLink(l *phoneLink) {
+// enableKeepAlive turns on TCP keepalive so a dead peer is eventually noticed
+// even without an application-level frame exchange. No-op on non-TCP conns.
+func enableKeepAlive(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
+}
+
+// registerPhoneLink adds the link to the registry and returns its connID.
+func registerPhoneLink(l *phoneLink) connID {
 	phoneLinks.Lock()
-	phoneLinks.active--
+	defer phoneLinks.Unlock()
+	phoneLinks.next++
+	id := phoneLinks.next
+	phoneLinks.links[id] = l
+	return id
+}
+
+// unregisterPhoneLink removes the link from the registry.
+func unregisterPhoneLink(id connID) {
+	phoneLinks.Lock()
+	delete(phoneLinks.links, id)
 	phoneLinks.Unlock()
 }

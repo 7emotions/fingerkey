@@ -4,12 +4,14 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -23,7 +25,7 @@ func main() {
 
 	log.Printf("phone-fprint-auth daemon: adapter=%s", *adapter)
 
-	keys := loadPubKeys(*keysDir)
+	keys := newKeyProvider(*keysDir)
 	store := NewStore()
 
 	// Local surface: root-only session creation and status polling over a 0700
@@ -45,11 +47,10 @@ func main() {
 			log.Fatal(err)
 		}
 	}()
-	log.Printf("phone-fprint-auth daemon: local=%s (%d paired key(s))", *socketPath, len(keys))
+	log.Printf("phone-fprint-auth daemon: local=%s (%d paired key(s))", *socketPath, keys.Count())
 
-	// Phone surface: the real link is the BlueZ SPP server (see bt.go). The
-	// -phone-sim-socket listener is test-only: it accepts plain framed streams
-	// over a unix socket exactly like the SPP RFCOMM socket will.
+	// Phone surface: the -phone-sim-socket listener is test-only: it accepts
+	// plain framed streams over a unix socket exactly like a phone link will.
 	if *simSocketPath != "" {
 		ln, err := servePhoneSimSocket(*simSocketPath, store, keys)
 		if err != nil {
@@ -73,7 +74,7 @@ func main() {
 // accepted connection to startPhoneLink. Any stale socket file from a
 // previous run is removed first; the socket file is chmodded 0700. The
 // returned listener must be closed by the caller to stop accepting.
-func servePhoneSimSocket(path string, store *Store, keys map[string]ed25519.PublicKey) (net.Listener, error) {
+func servePhoneSimSocket(path string, store *Store, keys *keyProvider) (net.Listener, error) {
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
@@ -97,10 +98,7 @@ func servePhoneSimSocket(path string, store *Store, keys map[string]ed25519.Publ
 
 // newLocalMux wires the root-only local surface (unix socket): session
 // creation (POST /v1/session) and status polling (GET /v1/session/{id}) only.
-// keys are the paired Ed25519 pubkeys: with none paired, session creation
-// fails fast with 503 so the PAM module falls back to the password prompt
-// instead of polling a request no phone can approve.
-func newLocalMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
+func newLocalMux(store *Store, keys *keyProvider) http.Handler {
 	mux := http.NewServeMux()
 
 	// Go 1.18 ServeMux: "/v1/session" matches only the exact path.
@@ -109,11 +107,7 @@ func newLocalMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		if len(keys) == 0 {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no paired keys"})
-			return
-		}
-		handleCreateSession(w, r, store)
+		handleCreateSession(w, r, store, keys)
 	})
 
 	// Subtree dispatch: one segment = session id (status).
@@ -130,24 +124,40 @@ func newLocalMux(store *Store, keys map[string]ed25519.PublicKey) http.Handler {
 	return mux
 }
 
-// phoneLinks tracks the number of active phone links (SPP-connected phones).
-// Link registration/unregistration happens in phone_link.go.
+// phoneLinks tracks every accepted phone link by connID. Link
+// registration/unregistration happens in phone_link.go; phoneConnected()
+// counts only the registered ones.
 var phoneLinks = struct {
 	sync.Mutex
-	active int
-}{}
+	links map[connID]*phoneLink
+	next  connID
+}{links: make(map[connID]*phoneLink)}
 
-// phoneConnected reports whether at least one phone link is active.
+// phoneConnected reports whether at least one registered phone link is
+// active: a link whose hello pubkey matched a paired key. Unregistered links
+// never count, so they cannot make the PAM module wait on a request no phone
+// can approve.
 func phoneConnected() bool {
 	phoneLinks.Lock()
 	defer phoneLinks.Unlock()
-	return phoneLinks.active > 0
+	for _, l := range phoneLinks.links {
+		if l.registered {
+			return true
+		}
+	}
+	return false
 }
 
-func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store) {
-	// Fail fast when no phone is connected: the PAM module falls back to the
+func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store, keys *keyProvider) {
+	// Fail fast with no paired keys: the PAM module falls back to the
 	// password prompt instead of polling a request no phone can approve.
-	// (The no-paired-keys 503 is checked earlier, in newLocalMux.)
+	// Keys are re-read on every call, so phone-approve remove takes effect
+	// without a daemon restart.
+	if keys.Count() == 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no paired keys"})
+		return
+	}
+	// Fail fast when no registered phone link is connected.
 	if !phoneConnected() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no phone connected"})
 		return
@@ -161,6 +171,11 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store) {
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	s, err := store.Create(req.User, req.Service, req.TTY)
 	if err != nil {
+		if errors.Is(err, errStoreFull) {
+			audit("session-store-full", "max", strconv.Itoa(maxSessions))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session store full"})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session creation failed"})
 		return
 	}
@@ -188,11 +203,14 @@ func handleGetSession(w http.ResponseWriter, r *http.Request, store *Store, id s
 
 // decide verifies an Ed25519 signature over the pinned decision message
 // against any paired pubkey and, on success, transitions the session. It
-// returns the HTTP-ish status code (reused by the SPP frame handler), the
+// returns the HTTP-ish status code (reused by the frame handler), the
 // session's new status, and the matching key's name: 200 decided + key name,
 // 400 bad decision value, 401 bad/absent sig or no matching key, 404 unknown
-// id, 409 not pending (already decided or expired).
-func decide(store *Store, keys map[string]ed25519.PublicKey, id, decision, sigB64 string) (code int, status string, key string) {
+// id. Deciding an already-decided or expired session is idempotent: a 200
+// carries the original outcome (already-decided: status + DecidedBy; expired:
+// status=expired) so a phone re-deciding after a reconnect recovers its
+// verdict instead of an error.
+func decide(store *Store, keys *keyProvider, id, decision, sigB64 string) (code int, status string, key string) {
 	s, ok := store.Get(id)
 	if !ok {
 		audit("decision-failed", "id", id, "reason", "unknown-session")
@@ -204,32 +222,48 @@ func decide(store *Store, keys map[string]ed25519.PublicKey, id, decision, sigB6
 		audit("decision-failed", "id", id, "reason", "bad-decision")
 		return http.StatusBadRequest, "", ""
 	}
-	if s.CurrentStatus() != StatusPending {
-		audit("decision-failed", "id", id, "reason", "not-pending")
-		return http.StatusConflict, "", ""
-	}
 	sig, err := base64.StdEncoding.Strict().DecodeString(sigB64)
 	if err != nil {
 		audit("decision-failed", "id", id, "reason", "invalid-signature")
 		return http.StatusUnauthorized, "", ""
 	}
 	msg := signedMessage(decision, s.User, s.Service, s.TTY, s.Nonce)
-	for name, k := range keys {
+	keyName := ""
+	for name, k := range keys.All() {
 		if ed25519.Verify(k, msg, sig) {
-			newStatus := StatusDenied
-			if decision == "approve" {
-				newStatus = StatusApproved
-			}
-			if ok, _ := store.Decide(id, newStatus); !ok {
-				audit("decision-failed", "id", id, "reason", "not-pending")
-				return http.StatusConflict, "", ""
-			}
-			audit("decision", "id", id, "decision", decision, "key", name)
-			return http.StatusOK, s.CurrentStatus(), name
+			keyName = name
+			break
 		}
 	}
-	audit("decision-failed", "id", id, "reason", "unpaired-key")
-	return http.StatusUnauthorized, "", ""
+	if keyName == "" {
+		audit("decision-failed", "id", id, "reason", "unpaired-key")
+		return http.StatusUnauthorized, "", ""
+	}
+	if cur := s.CurrentStatus(); cur != StatusPending {
+		if cur == StatusExpired {
+			return http.StatusOK, StatusExpired, ""
+		}
+		return http.StatusOK, cur, s.DecidedBy
+	}
+	newStatus := StatusDenied
+	if decision == "approve" {
+		newStatus = StatusApproved
+	}
+	if ok, found := store.Decide(id, newStatus, keyName); !ok {
+		if !found {
+			audit("decision-failed", "id", id, "reason", "unknown-session")
+			return http.StatusNotFound, "", ""
+		}
+		// Lost a race to another link: report the winner's outcome.
+		if s2, ok2 := store.Get(id); ok2 {
+			if cur := s2.CurrentStatus(); cur == StatusExpired {
+				return http.StatusOK, StatusExpired, ""
+			}
+			return http.StatusOK, s2.CurrentStatus(), s2.DecidedBy
+		}
+	}
+	audit("decision", "id", id, "decision", decision, "key", keyName)
+	return http.StatusOK, newStatus, keyName
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {

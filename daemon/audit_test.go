@@ -67,7 +67,7 @@ func TestAuditDecisionApprove(t *testing.T) {
 	buf := swapAudit(t)
 	store := NewStore()
 	pub, priv := newKey(t)
-	keys := map[string]ed25519.PublicKey{"alice": pub}
+	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 	s, err := store.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -96,7 +96,7 @@ func TestAuditDecisionFailed(t *testing.T) {
 	buf := swapAudit(t)
 	store := NewStore()
 	pub, _ := newKey(t)
-	keys := map[string]ed25519.PublicKey{"alice": pub}
+	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 	s, err := store.Create("alice", "sudo", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)

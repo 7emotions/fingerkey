@@ -3,7 +3,6 @@ package main
 import (
 	"io"
 	"os"
-	"syscall"
 	"testing"
 
 	"github.com/godbus/dbus/v5"
@@ -79,12 +78,12 @@ func TestSppAgentAutoAccepts(t *testing.T) {
 	// All NoInputNoOutput auto-accept callbacks must return nil so pairing
 	// succeeds: nil means accept/authorize for this agent.
 	callbacks := map[string]*dbus.Error{
-		"DisplayPinCode":      a.DisplayPinCode(device, "1234"),
-		"DisplayPasskey":      a.DisplayPasskey(device, 1234, 0),
-		"RequestConfirmation": a.RequestConfirmation(device, 1234),
+		"DisplayPinCode":       a.DisplayPinCode(device, "1234"),
+		"DisplayPasskey":       a.DisplayPasskey(device, 1234, 0),
+		"RequestConfirmation":  a.RequestConfirmation(device, 1234),
 		"RequestAuthorization": a.RequestAuthorization(device),
-		"AuthorizeService":    a.AuthorizeService(device, sppUUID),
-		"Cancel":              a.Cancel(),
+		"AuthorizeService":     a.AuthorizeService(device, sppUUID),
+		"Cancel":               a.Cancel(),
 	}
 	for name, err := range callbacks {
 		if err != nil {
@@ -130,50 +129,4 @@ func TestWrapUnixFDInvalid(t *testing.T) {
 		f.Close()
 		t.Fatal("wrapUnixFD(-1) returned non-nil")
 	}
-}
-
-// newSocketPairFiles returns a connected SOCK_STREAM pair wrapped as
-// *os.File: link is the daemon side (handed to NewConnection), phone is the
-// remote side the test writes to. Each fd is wrapped exactly once, so no
-// double-close hazard exists.
-func newSocketPairFiles(t *testing.T) (link, phone *os.File) {
-	t.Helper()
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	link = os.NewFile(uintptr(fds[0]), "link")
-	phone = os.NewFile(uintptr(fds[1]), "phone")
-	t.Cleanup(func() {
-		link.Close()
-		phone.Close()
-	})
-	return link, phone
-}
-
-func TestSppProfileReplacesActiveLink(t *testing.T) {
-	p := &sppProfileState{store: NewStore(), keys: nil}
-
-	firstLink, firstPhone := newSocketPairFiles(t)
-	p.NewConnection("/org/bluez/hci0/dev_11_22_33_44_55_66", dbus.UnixFD(firstLink.Fd()), nil)
-
-	secondLink, secondPhone := newSocketPairFiles(t)
-	p.NewConnection("/org/bluez/hci0/dev_77_88_99_AA_BB_CC", dbus.UnixFD(secondLink.Fd()), nil)
-
-	// The first link must have been closed by the replacement: writing from
-	// the phone side fails with EPIPE once the daemon side is closed.
-	if _, err := firstPhone.Write([]byte("x")); err == nil {
-		t.Error("first link still writable after replacement; expected closed")
-	}
-
-	// The second link stays usable until a disconnect is requested.
-	if _, err := secondPhone.Write([]byte("y")); err != nil {
-		t.Errorf("second link write: %v", err)
-	}
-	p.RequestDisconnection("/org/bluez/hci0/dev_77_88_99_AA_BB_CC")
-	if _, err := secondPhone.Write([]byte("z")); err == nil {
-		t.Error("second link still writable after RequestDisconnection; expected closed")
-	}
-
-	p.Release()
 }

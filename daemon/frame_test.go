@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"io"
 	"net"
+	"reflect"
 	"runtime"
 	"testing"
 )
@@ -127,4 +129,150 @@ func TestFrameTooLarge(t *testing.T) {
 	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 1<<20 {
 		t.Fatalf("readFrame moved %d bytes through the allocator for 1000 oversized headers, want < 1 MiB (payload must not be allocated)", alloc)
 	}
+}
+
+// ---- v2 business-frame codec tests ----
+
+// roundTripCodec marshals in to JSON, walks it through writeFrame/readFrame
+// over a net.Pipe and unmarshals it into out (a pointer to the same type as
+// in), failing the test on any error.
+func roundTripCodec(t *testing.T, in interface{}, out interface{}) {
+	t.Helper()
+	payload, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	c, s := net.Pipe()
+	defer c.Close()
+	defer s.Close()
+
+	writeErr := make(chan error, 1)
+	go func() { writeErr <- writeFrame(c, payload) }()
+	got, err := readFrame(s)
+	if err != nil {
+		t.Fatalf("readFrame: %v", err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("writeFrame: %v", err)
+	}
+	if err := json.Unmarshal(got, out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+}
+
+// TestBusinessFrameCodec pins the six v2 business frames through a
+// marshal → wire → unmarshal round trip.
+func TestBusinessFrameCodec(t *testing.T) {
+	nonce := make([]byte, 32)
+	for i := range nonce {
+		nonce[i] = byte(i)
+	}
+
+	t.Run("hello", func(t *testing.T) {
+		in := helloFrame{Type: "hello", PubKey: "cHVibGljLWtleQ==", Name: "pixel-8", Token: "tok"}
+		var out helloFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("welcome", func(t *testing.T) {
+		in := welcomeFrame{
+			Type:       "welcome",
+			Registered: true,
+			Key:        "alice",
+			Pending: []pendingFrame{{
+				Type:      "pending",
+				ID:        "abc",
+				Nonce:     "bm9uY2U=",
+				User:      "alice",
+				Service:   "sudo",
+				TTY:       "/dev/pts/0",
+				ExpiresAt: 1780000000,
+			}},
+		}
+		var out welcomeFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("welcome-unregistered", func(t *testing.T) {
+		payload, err := json.Marshal(welcomeFrame{Type: "welcome", Registered: false, Pending: []pendingFrame{}})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !bytes.Contains(payload, []byte(`"registered":false`)) {
+			t.Errorf("payload = %s, want explicit registered:false", payload)
+		}
+		if !bytes.Contains(payload, []byte(`"pending":[]`)) {
+			t.Errorf("payload = %s, want explicit empty pending array", payload)
+		}
+	})
+
+	t.Run("registered", func(t *testing.T) {
+		in := registeredFrame{Type: "registered", Key: "pixel-8"}
+		var out registeredFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("pending", func(t *testing.T) {
+		in := pendingFrame{Type: "pending", ID: "abc", Nonce: "bm9uY2U=", User: "alice", Service: "sudo", TTY: "/dev/pts/0", ExpiresAt: 1780000000}
+		var out pendingFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("decision", func(t *testing.T) {
+		in := decisionFrame{Type: "decision", ID: "abc", Decision: "approve", Sig: "c2ln"}
+		var out decisionFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("decision-result-success", func(t *testing.T) {
+		in := decisionResultFrame{Type: "decision-result", ID: "abc", Status: "approved", Key: "alice"}
+		var out decisionResultFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("decision-result-error", func(t *testing.T) {
+		in := decisionResultFrame{Type: "decision-result", ID: "abc", Error: "unpaired-key"}
+		var out decisionResultFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("ping", func(t *testing.T) {
+		in := pingFrame{Type: "ping"}
+		var out pingFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("pong", func(t *testing.T) {
+		in := pongFrame{Type: "pong"}
+		var out pongFrame
+		roundTripCodec(t, in, &out)
+		if !reflect.DeepEqual(in, out) {
+			t.Errorf("round trip = %+v, want %+v", out, in)
+		}
+	})
 }
