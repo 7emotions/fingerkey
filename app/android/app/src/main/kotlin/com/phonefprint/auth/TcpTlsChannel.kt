@@ -29,10 +29,9 @@ import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
 /**
- * Native Android LAN TCP+TLS client exposed to Flutter. Replaces the old
- * Classic SPP transport: the daemon now listens TLS on :4443 and publishes
- * `_phonefprint._tcp` over mDNS; the phone pins the LEAF certificate's
- * SHA-256 (lowercase hex) instead of bonding.
+ * Native Android LAN TCP+TLS client exposed to Flutter. The daemon listens
+ * TLS on :4443 and publishes `_phonefprint._tcp` over mDNS; the phone pins
+ * the LEAF certificate's SHA-256 (lowercase hex) as the sole identity check.
  *
  * MethodChannel "com.phonefprint.auth/tcp":
  *   - connect({host, port, fp}) -> int connectionId (throws fingerprint_mismatch)

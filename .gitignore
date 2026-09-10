@@ -1,2 +1,3 @@
 .omo/
 *.so
+daemon/daemon
