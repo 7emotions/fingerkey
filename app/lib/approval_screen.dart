@@ -26,6 +26,7 @@ class ApprovalScreen extends StatefulWidget {
     required this.onReset,
     required this.onRosterChanged,
     this.manager,
+    this.authenticate,
   });
 
   final DeviceIdentity identity;
@@ -44,6 +45,10 @@ class ApprovalScreen extends StatefulWidget {
 
   /// The connection manager; injectable for tests, otherwise built here.
   final ConnectionManager? manager;
+
+  /// Test seam: runs the biometric prompt and returns whether the user
+  /// authenticated. Defaults to the real [LocalAuthentication] flow.
+  final Future<bool> Function(String reason)? authenticate;
 
   @override
   State<ApprovalScreen> createState() => _ApprovalScreenState();
@@ -92,10 +97,14 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     final dup = _cards.any((c) =>
         c.session.id == session.id && c.session.source == session.source);
     if (dup) return;
+    final card = _RequestCard(session);
     setState(() {
-      _cards.add(_RequestCard(session));
+      _cards.add(card);
       _status = 'Request pending — approve or deny.';
     });
+    // Pop the biometric prompt immediately, so a request is approved with a
+    // single fingerprint scan instead of a tap on APPROVE first.
+    unawaited(_approve(card));
   }
 
   void _onDecisionResult(DecisionResult result) {
@@ -190,19 +199,10 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     if (_busy || card.expired) return;
     _busy = true;
     try {
-      final canCheck = await _auth.canCheckBiometrics;
-      final supported = await _auth.isDeviceSupported();
-      if (!canCheck && !supported) {
-        if (_disposed) return;
-        setState(() => _status = 'No biometric hardware available.');
-        return;
-      }
-      final ok = await _auth.authenticate(
-        localizedReason:
-            'Approve for ${card.session.user} on ${card.session.service}',
-        biometricOnly: true,
-        persistAcrossBackgrounding: true,
-      );
+      final reason =
+          'Approve for ${card.session.user} on ${card.session.service}';
+      final ok = await (widget.authenticate?.call(reason) ??
+          _authenticateWithBiometrics(reason));
       if (_disposed) return;
       if (!ok) {
         setState(() => _status = 'Biometric cancelled — tap APPROVE to retry.');
@@ -215,6 +215,21 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     } finally {
       _busy = false;
     }
+  }
+
+  Future<bool> _authenticateWithBiometrics(String reason) async {
+    final canCheck = await _auth.canCheckBiometrics;
+    final supported = await _auth.isDeviceSupported();
+    if (!canCheck && !supported) {
+      if (_disposed) return false;
+      setState(() => _status = 'No biometric hardware available.');
+      return false;
+    }
+    return _auth.authenticate(
+      localizedReason: reason,
+      biometricOnly: true,
+      persistAcrossBackgrounding: true,
+    );
   }
 
   void _deny(_RequestCard card) {
