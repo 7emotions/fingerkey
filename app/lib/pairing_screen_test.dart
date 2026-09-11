@@ -33,6 +33,10 @@ class _FakeClient extends DaemonClient {
   String? fp;
   String? token;
 
+  /// Whether [connect] reports the link as registered (default true).
+  @override
+  bool registered = true;
+
   @override
   Future<Welcome> connect({
     required String host,
@@ -44,7 +48,7 @@ class _FakeClient extends DaemonClient {
     this.port = port;
     this.fp = fp;
     this.token = token;
-    return const Welcome(registered: true, key: 'desk', pending: []);
+    return Welcome(registered: registered, key: 'desk', pending: const []);
   }
 
   @override
@@ -134,12 +138,89 @@ void main() {
     );
     await tester.pump();
 
+    // The camera is off until the user presses the button.
+    expect(find.text('scan'), findsNothing);
+    await tester.tap(find.text('START SCAN'));
+    await tester.pump();
+    expect(find.text('scan'), findsOneWidget);
+
     await tester.tap(find.text('scan'));
     await tester.pump();
     await tester.pump();
 
     expect(paired, 1);
     expect((await keyStore.roster()).single.name, 'desk');
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+  });
+
+  test('pairFromQr does not fall back to mDNS when the token is rejected',
+      () async {
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
+    final keyStore = KeyStore();
+    final identity = await _identity();
+    final client = _FakeClient()..registered = false;
+    var browsed = false;
+
+    await expectLater(
+      pairFromQr(
+        qr: 'phonefprint://192.0.2.1:4443?fp=deadbeef&t=t0ken&n=desk',
+        identity: identity,
+        keyStore: keyStore,
+        clientFactory: () => client,
+        browse: () async {
+          browsed = true;
+          return const [];
+        },
+      ),
+      throwsA(isA<PairRejected>()),
+    );
+
+    expect(browsed, isFalse,
+        reason: 'a rejected one-time token must not trigger the mDNS fallback');
+  });
+
+  testWidgets('a rejected scan stops the scanner and offers a manual rescan',
+      (tester) async {
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
+    final keyStore = KeyStore();
+    final identity = await _identity();
+    final client = _FakeClient()..registered = false;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PairingScreen(
+          keyStore: keyStore,
+          identity: identity,
+          onPaired: (_) => fail('must not pair on a rejected token'),
+          clientFactory: () => client,
+          browse: () async => const [],
+          scannerBuilder: (context, onScanned) => TextButton(
+            onPressed: () =>
+                onScanned('phonefprint://192.0.2.1:4443?fp=abc&t=t&n=desk'),
+            child: const Text('scan'),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.text('START SCAN'));
+    await tester.pump();
+
+    await tester.tap(find.text('scan'));
+    await tester.pump();
+    await tester.pump();
+    await tester.pump();
+
+    // The scanner must be gone (no camera restart / re-scan) and a manual
+    // rescan offered instead.
+    expect(find.text('scan'), findsNothing);
+    expect(find.text('SCAN AGAIN'), findsOneWidget);
+    expect(find.textContaining('Pairing failed'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();

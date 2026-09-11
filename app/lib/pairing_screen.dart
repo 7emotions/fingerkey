@@ -8,6 +8,7 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
 import 'daemon_client.dart';
@@ -84,15 +85,24 @@ Future<RosterComputer> pairFromQr({
         throw const PairRejected('connection refused (key not accepted)');
       }
     } finally {
-      await client.dispose();
+      try {
+        await client.dispose();
+      } catch (_) {
+        // The key is already registered on the daemon; a teardown failure
+        // must not fail the pairing.
+      }
     }
   }
 
   try {
     await connect(request.ip, request.port);
-  } catch (_) {
-    // Direct dial failed (or was refused): browse for the same fingerprint
-    // and try its advertised address.
+  } on PairRejected {
+    rethrow;
+  } on PlatformException catch (e) {
+    if (e.code != 'connect_failed') rethrow;
+    // Only a genuine TCP connect failure reaches here: the hello was never
+    // sent, so the one-time token is still valid. Browse for the same
+    // fingerprint and try its advertised address instead.
     TcpComputer? match;
     for (final c in await browse()) {
       if (c.fp.toLowerCase() == request.fp.toLowerCase()) {
@@ -104,6 +114,9 @@ Future<RosterComputer> pairFromQr({
       throw const PairNotFound('computer not found on the network');
     }
     await connect(match.host, match.port);
+  } catch (e) {
+    debugPrint('phone-fprint-auth: direct dial failed, no fallback: $e');
+    rethrow;
   }
 
   final computer = RosterComputer(
@@ -167,6 +180,11 @@ class PairingScreen extends StatefulWidget {
 class PairingScreenState extends State<PairingScreen> {
   bool _pairing = false;
   bool _paired = false;
+
+  /// Whether the camera scanner is active. It starts off (the user presses a
+  /// button to turn it on) and is turned off the moment a code is detected, so
+  /// a failed pairing cannot re-scan the same (one-time) token in a loop.
+  bool _scanning = false;
   String? _error;
 
   @override
@@ -196,8 +214,9 @@ class PairingScreenState extends State<PairingScreen> {
   /// Handles one scanned QR payload: parse → connect → `registered` →
   /// addComputer → [onPaired]. Public for tests to drive without a camera.
   Future<void> handleQr(String raw) async {
-    if (_pairing || _paired) return;
+    if (_pairing || _paired || !_scanning) return;
     setState(() {
+      _scanning = false;
       _pairing = true;
       _error = null;
     });
@@ -213,11 +232,19 @@ class PairingScreenState extends State<PairingScreen> {
       _paired = true;
       widget.onPaired(widget.identity);
     } catch (e) {
+      debugPrint('phone-fprint-auth: pairing failed: $e');
       if (!mounted) return;
       setState(() => _error = 'Pairing failed: $e');
     } finally {
       if (mounted) setState(() => _pairing = false);
     }
+  }
+
+  void _startScan() {
+    setState(() {
+      _scanning = true;
+      _error = null;
+    });
   }
 
   @override
@@ -246,8 +273,21 @@ class PairingScreenState extends State<PairingScreen> {
                         color: Color(0xFF1A1D22),
                         child: Center(child: CircularProgressIndicator()),
                       )
-                    : (widget.scannerBuilder?.call(context, handleQr) ??
-                        MobileScanner(onDetect: _onDetect)),
+                    : _scanning
+                        ? (widget.scannerBuilder?.call(context, handleQr) ??
+                            MobileScanner(onDetect: _onDetect))
+                        : ColoredBox(
+                            color: const Color(0xFF1A1D22),
+                            child: Center(
+                              child: TextButton.icon(
+                                onPressed: _startScan,
+                                icon: const Icon(Icons.qr_code_scanner),
+                                label: Text(
+                                  _error != null ? 'SCAN AGAIN' : 'START SCAN',
+                                ),
+                              ),
+                            ),
+                          ),
               ),
             ),
             if (_error != null) ...[
