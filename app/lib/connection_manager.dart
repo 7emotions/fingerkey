@@ -84,40 +84,48 @@ class ConnectionManager {
     if (link.stopped) return;
     link.connecting = true;
     try {
-      // 1. Re-discover via mDNS and pin by fingerprint.
+      Welcome? welcome;
       TcpComputer? discovered;
-      try {
-        for (final c in await _browse()) {
-          if (c.fp.toLowerCase() == link.computer.fingerprint.toLowerCase()) {
-            discovered = c;
-            break;
-          }
+
+      // Dial the cached lastAddr first: it is fast and usually still valid, so
+      // a fresh launch or resume is not gated on a slow mDNS browse (which
+      // would otherwise drop the first sudo request pushed right after).
+      final parsed = _parseLastAddr(link.computer.lastAddr);
+      if (parsed != null) {
+        try {
+          welcome = await link.client.connect(
+            host: parsed.$1,
+            port: parsed.$2,
+            fp: link.computer.fingerprint,
+          );
+        } catch (_) {
+          welcome = null; // stale or unreachable; fall through to mDNS.
         }
-      } catch (_) {
-        // mDNS unavailable this pass; fall back to lastAddr below.
       }
 
-      // 2. Resolve a dial target: mDNS result, else the stored lastAddr.
-      final String host;
-      final int port;
-      if (discovered != null) {
-        host = discovered.host;
-        port = discovered.port;
-      } else {
-        final parsed = _parseLastAddr(link.computer.lastAddr);
-        if (parsed == null) {
+      // lastAddr failed (or absent): discover via mDNS and pin by fingerprint.
+      if (welcome == null) {
+        try {
+          for (final c in await _browse()) {
+            if (c.fp.toLowerCase() ==
+                link.computer.fingerprint.toLowerCase()) {
+              discovered = c;
+              break;
+            }
+          }
+        } catch (_) {
+          // mDNS unavailable this pass.
+        }
+        if (discovered == null) {
           _scheduleRetry(link);
           return;
         }
-        host = parsed.$1;
-        port = parsed.$2;
+        welcome = await link.client.connect(
+          host: discovered.host,
+          port: discovered.port,
+          fp: link.computer.fingerprint,
+        );
       }
-
-      final welcome = await link.client.connect(
-        host: host,
-        port: port,
-        fp: link.computer.fingerprint,
-      );
       link.backoff = _initialBackoff;
 
       if (!welcome.registered) {
