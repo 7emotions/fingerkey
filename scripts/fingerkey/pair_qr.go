@@ -52,8 +52,23 @@ func pairQR(name string, w io.Writer) error {
 
 // qrEncode renders payload as a scannable terminal QR code. It is a var so
 // tests can capture the exact payload handed to the encoder.
+//
+// Half-block mode packs two QR rows into one terminal cell, halving the width
+// while keeping the code square. The mapping below uses the standard "dark
+// module = block, light module = space" convention (scannable on light
+// backgrounds); qrterminal's GenerateHalfBlock uses the inverted dark-terminal
+// mapping, so we build the config by hand instead.
 var qrEncode = func(payload string, w io.Writer) {
-	qrterminal.Generate(payload, qrterminal.M, w)
+	qrterminal.GenerateWithConfig(payload, qrterminal.Config{
+		Level:          qrterminal.M,
+		Writer:         w,
+		HalfBlocks:     true,
+		BlackChar:      "█",
+		WhiteChar:      " ",
+		BlackWhiteChar: "▀",
+		WhiteBlackChar: "▄",
+		QuietZone:      4,
+	})
 }
 
 // pairPayload builds the phonefprint:// connect string the app decodes.
@@ -83,7 +98,7 @@ func requestPairToken(socketPath, name string) (pairReply, error) {
 	}
 	resp, err := client.Post("http://unix/v1/pair", "application/json", bytes.NewReader(body))
 	if err != nil {
-		return pairReply{}, fmt.Errorf("cannot reach daemon at %s: %v (is phone-approve-daemon running?)", socketPath, err)
+		return pairReply{}, fmt.Errorf("cannot reach daemon at %s: %v (is fingerkeyd running?)", socketPath, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

@@ -96,8 +96,8 @@ func TestPairQR_renders_QR_blocks(t *testing.T) {
 	if code := run([]string{"pair-qr", "pixel-8"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
 	}
-	// qrterminal paints white modules with this ANSI escape.
-	if !strings.Contains(stdout.String(), "\x1b[47m") {
+	// qrterminal paints white modules with the full-block glyph.
+	if !strings.Contains(stdout.String(), "█") {
 		t.Errorf("stdout does not contain QR blocks:\n%s", stdout.String())
 	}
 }
