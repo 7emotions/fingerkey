@@ -4,7 +4,7 @@
 
 # FingerKey
 
-Approve sudo and pkexec with your fingerprint on your phone, over your LAN. No password typed.
+Authenticate sudo, pkexec, SSH, login and any other PAM-aware prompt with your fingerprint on your phone, over your LAN. No password typed.
 
 <p align="center">
   <a href="https://github.com/7emotions/fingerkey/blob/master/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
@@ -147,7 +147,7 @@ sudo fingerkey remove my-phone   # unpair; takes effect immediately
 ## Usage
 
 1. Keep the app open and the phone on the same LAN as the computer. The daemon pushes pending requests only to registered, connected phones; a closed app or a disconnected phone sees nothing.
-2. Run `sudo` or a pkexec action (for example `pkexec ...` or a GUI policy dialog).
+2. Run `sudo`, a pkexec action (for example `pkexec ...` or a GUI policy dialog), or any other PAM-authenticated command (`su`, `login`, `sshd`, …).
 3. The app shows the request with the user, service and tty context, plus a countdown. Approve with your fingerprint.
 4. The command proceeds. If you deny, or nothing happens within 60 seconds, the normal password prompt appears.
 5. If the app is closed or no phone is connected, the daemon answers session creation with 503 and PAM falls back to the password prompt immediately.
@@ -156,6 +156,21 @@ sudo fingerkey remove my-phone   # unpair; takes effect immediately
 
 - **One phone, many computers.** The app keeps one keypair and pairs with each computer separately by scanning its QR. It reconnects to every reachable computer and shows pending requests from all of them.
 - **One computer, many phones.** Run `pair-qr` once per phone. Any registered phone can approve; the first decision that arrives wins, and every registered phone gets the same `decision-result`. Deciding an already-decided session is idempotent, so a phone that reconnects recovers the verdict instead of an error.
+
+## Which services use it
+
+`pam_fingerkey.so` is a generic PAM `auth` module, so any PAM-aware service can use it. `install.sh` wires it into `sudo` and `polkit-1` (pkexec and GUI authorization dialogs), but `su`, `login`, `sshd`, display managers (`gdm`, `lightdm`), `passwd`, `chsh`, `chfn`, `vlock`, `cron`, `at` and the rest all work the same way: add this line as the first auth entry in `/etc/pam.d/<service>` (above any `@include common-auth`):
+
+```sh
+auth sufficient pam_fingerkey.so
+```
+
+Boundaries:
+
+- It implements only the `auth` stage — no `account`, `session`, or password-change hooks. It authenticates; it does not manage account validity or sessions.
+- `sufficient` means approve skips the rest of the stack and anything else falls through to the password prompt. Keep it first so the phone is asked instead of the password.
+- The phone must be reachable on the same LAN and `fingerkeyd` must be running when the prompt happens. Fine for interactive elevation and login; for SSH from outside the LAN the phone is unreachable and auth falls back to the password (the designed safe path).
+- Tools that bypass PAM (`doas`, setuid programs that read shadow directly) cannot use it.
 
 ## Test without a phone
 
