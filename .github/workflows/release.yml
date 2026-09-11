@@ -1,0 +1,60 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install PAM build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
+      - name: Build Linux binaries and PAM module
+        run: |
+          mkdir -p dist
+          go build -o dist/fingerkeyd ./daemon
+          go build -o dist/fingerkey ./scripts/fingerkey
+          make -C pam
+          cp pam/pam_fingerkey.so dist/
+          cp etc/systemd/fingerkeyd.service dist/
+          cp scripts/install-release.sh dist/install.sh
+          chmod +x dist/install.sh
+
+      - name: Package Linux tarball
+        run: tar -czf fingerkey-linux-x86_64.tar.gz -C dist .
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build Android APK
+        working-directory: app
+        run: flutter build apk --release
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fingerkey-linux-x86_64.tar.gz
+            app/build/app/outputs/flutter-apk/app-release.apk
+          generate_release_notes: true
