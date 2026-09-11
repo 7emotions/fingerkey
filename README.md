@@ -1,6 +1,16 @@
-# phone-fprint-auth
+<p align="center">
+  <img src="assets/icon.png" alt="FingerKey" width="128">
+</p>
+
+# FingerKey
 
 Approve sudo and pkexec with your fingerprint on your phone, over your LAN. No password typed.
+
+<p align="center">
+  <a href="https://github.com/7emotions/fingerkey/blob/master/LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.21%2B-00ADD8.svg?logo=go&logoColor=white">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20Android-lightgrey.svg">
+</p>
 
 When a privilege escalation runs, a PAM module asks a local daemon to create a pending approval session. The daemon pushes the request over TLS to your phone, you approve or deny with BiometricPrompt, and the phone returns an Ed25519-signed decision that the daemon verifies before PAM lets the command through. The computer and the phone talk directly over TCP on the local network; nothing leaves the LAN.
 
@@ -52,7 +62,7 @@ Frames are length-prefixed JSON (4-byte big-endian length plus payload):
 | `scripts/fingerkey/` | Pair CLI (root): `pair-qr <name>`, `pair <name> <pubkey_b64>`, `list`, `remove <name>`. |
 | `scripts/phone-sim/` | Simulator for testing. Dials the daemon's TLS listener, pins it by fingerprint, and speaks the same framed protocol as the app: `-addr <host:port> -fp <hex> -key <priv_b64> [-decision approve|deny|hold] [-once]`; `-keygen` prints a fresh keypair. |
 | `scripts/format/` | Shared Go helper for the pinned signed-message byte format, used by the simulator. |
-| `app/` | Flutter Android app (package `com.phonefprint.auth`). Scans the pairing QR, pins the certificate fingerprint, connects to every reachable computer, and signs approvals with BiometricPrompt. |
+| `app/` | Flutter Android app **FingerKey** (package `com.phonefprint.auth`). Scans the pairing QR, pins the certificate fingerprint, connects to every reachable computer, and signs approvals with BiometricPrompt. |
 | `etc/` | systemd unit. |
 
 ## Prerequisites
@@ -114,11 +124,11 @@ There is no copy-paste step and no daemon restart. Paired keys are read on every
 Manage paired phones:
 
 ```sh
-sudo fingerkey list              # names of paired keys (no root needed)
+sudo fingerkey list              # names of paired keys
 sudo fingerkey remove my-phone   # unpair; takes effect immediately
 ```
 
-`pair <name> <pubkey_b64>` still works for registering a key by hand. `pair`, `remove` and `pair-qr` require root (the key store is root/`phonefprint`-owned); `list` does not.
+`pair <name> <pubkey_b64>` still works for registering a key by hand. `pair`, `remove`, `pair-qr` and `list` all require root (the key store is root/`phonefprint`-owned).
 
 ## Usage
 
