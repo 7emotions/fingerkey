@@ -16,16 +16,20 @@ When a privilege escalation runs, a PAM module asks a local daemon to create a p
 
 ## How it works
 
-```
-sudo / pkexec
-  → PAM module (pam_fingerkey) POSTs /v1/session over the unix socket
-  → daemon creates a pending session: random nonce + context (user, service, tty)
-  → daemon pushes {"type":"pending",...} over TLS to every registered phone
-  → you approve or deny with BiometricPrompt (fingerprint)
-  → phone signs the decision with its private key, sends {"type":"decision",...}
-  → daemon verifies the Ed25519 signature against the paired keys
-  → daemon answers {"type":"decision-result",...} and PAM returns
-    PAM_SUCCESS or PAM_AUTH_ERR
+```mermaid
+sequenceDiagram
+    participant PAM as PAM module (pam_fingerkey.so)
+    participant D as daemon (fingerkeyd)
+    participant Ph as phone (app)
+
+    PAM->>D: POST /v1/session (unix socket)
+    Note over D: pending session = nonce + user/service/tty
+    D-->>Ph: {"type":"pending"} over TLS :4443
+    Ph->>Ph: BiometricPrompt (fingerprint)
+    Ph->>D: {"type":"decision"} Ed25519-signed
+    D->>D: verify signature against paired keys
+    D-->>Ph: {"type":"decision-result"}
+    D-->>PAM: PAM_SUCCESS / PAM_AUTH_ERR
 ```
 
 Approve: sudo/pkexec proceeds. Deny or timeout (60 seconds): the PAM module falls through and the normal password prompt appears.
@@ -51,6 +55,16 @@ Frames are length-prefixed JSON (4-byte big-endian length plus payload):
 - `{"type":"ping"}` / `{"type":"pong"}` keepalive
 
 ## Components
+
+```mermaid
+flowchart LR
+    sudo[pkexec / sudo] -->|PAM| PAM[pam_fingerkey.so]
+    PAM -->|unix socket: POST /v1/session| D[fingerkeyd daemon]
+    CLI[fingerkey CLI] -->|unix socket: POST /v1/pair| D
+    D -->|TLS :4443 / mDNS| App[FingerKey app]
+    D --> KS[(/var/lib/phone-fprint-auth/keys)]
+    D --> TC[(/var/lib/phone-fprint-auth/tls)]
+```
 
 | Path | What it is |
 | --- | --- |
