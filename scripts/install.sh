@@ -3,7 +3,7 @@
 #   - build + install the approval daemon, helper and PAM module
 #   - create the dedicated phonefprint system user, key store and TLS dirs
 #   - install + enable the systemd unit (TLS listener on :4443)
-#   - wire pam_phone_approve.so into /etc/pam.d/sudo (above @include common-auth)
+#   - wire pam_fingerkey.so into /etc/pam.d/sudo (above @include common-auth)
 #
 # Idempotent — safe to re-run. Must run as root.
 set -euo pipefail
@@ -16,16 +16,16 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-DAEMON_BIN="/usr/local/libexec/phone-approve-daemon"
-PAIR_BIN="/usr/local/bin/phone-approve"
-PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_phone_approve.so"
-UNIT_SRC="etc/systemd/phone-approve-daemon.service"
-UNIT_DST="/etc/systemd/system/phone-approve-daemon.service"
+DAEMON_BIN="/usr/local/libexec/fingerkeyd"
+PAIR_BIN="/usr/local/bin/fingerkey"
+PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_fingerkey.so"
+UNIT_SRC="etc/systemd/fingerkeyd.service"
+UNIT_DST="/etc/systemd/system/fingerkeyd.service"
 KEYS_PARENT="/var/lib/phone-fprint-auth"
 KEYS_DIR="/var/lib/phone-fprint-auth/keys"
 TLS_DIR="/var/lib/phone-fprint-auth/tls"
 DAEMON_USER="phonefprint"
-PAM_LINE="auth sufficient pam_phone_approve.so"
+PAM_LINE="auth sufficient pam_fingerkey.so"
 
 # wire_pam_file inserts the approval module line into a PAM service file
 # as the FIRST auth line, above @include common-auth. Idempotent.
@@ -33,7 +33,7 @@ wire_pam_file() {
     local file="$1"
     local backup
 
-    if grep -q 'pam_phone_approve.so' "${file}"; then
+    if grep -q 'pam_fingerkey.so' "${file}"; then
         echo "pam: '${PAM_LINE}' already present in ${file} — skipping"
         return 0
     fi
@@ -44,7 +44,7 @@ wire_pam_file() {
     fi
     # Insert as the FIRST auth line, above @include common-auth.
     sed -i "/^@include[[:space:]]\\+common-auth\$/i ${PAM_LINE}" "${file}"
-    if ! grep -q 'pam_phone_approve.so' "${file}"; then
+    if ! grep -q 'pam_fingerkey.so' "${file}"; then
         echo "error: failed to insert '${PAM_LINE}' into ${file}" >&2
         exit 1
     fi
@@ -59,13 +59,13 @@ chmod 0755 "${DAEMON_BIN}"
 echo "built ${DAEMON_BIN}"
 
 mkdir -p /usr/local/bin
-go build -o "${PAIR_BIN}" ./scripts/phone-approve
+go build -o "${PAIR_BIN}" ./scripts/fingerkey
 chown root:root "${PAIR_BIN}"
 chmod 0755 "${PAIR_BIN}"
 echo "built ${PAIR_BIN}"
 
 make -C pam
-echo "built pam/pam_phone_approve.so"
+echo "built pam/pam_fingerkey.so"
 
 echo "== system user =="
 if id -u "${DAEMON_USER}" &>/dev/null; then
@@ -88,15 +88,15 @@ install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${TLS_DIR}"
 echo "ensured ${TLS_DIR} (${DAEMON_USER} 0700)"
 
 echo "== install files =="
-install -o root -g root -m 0644 pam/pam_phone_approve.so "${PAM_MODULE}"
+install -o root -g root -m 0644 pam/pam_fingerkey.so "${PAM_MODULE}"
 install -o root -g root -m 0644 "${UNIT_SRC}" "${UNIT_DST}"
 echo "installed ${PAM_MODULE}, ${UNIT_DST}"
 
 echo "== systemd =="
 systemctl daemon-reload
-systemctl enable --now phone-approve-daemon
-systemctl restart phone-approve-daemon
-echo "enabled + restarted phone-approve-daemon"
+systemctl enable --now fingerkeyd
+systemctl restart fingerkeyd
+echo "enabled + restarted fingerkeyd"
 
 if [[ ! -S /run/phone-fprint-auth/daemon.sock ]]; then
     for _ in $(seq 1 25); do
@@ -106,7 +106,7 @@ if [[ ! -S /run/phone-fprint-auth/daemon.sock ]]; then
 fi
 if [[ ! -S /run/phone-fprint-auth/daemon.sock ]]; then
     echo "error: /run/phone-fprint-auth/daemon.sock not found after start" >&2
-    echo "error: check 'systemctl status phone-approve-daemon' and 'journalctl -u phone-approve-daemon'" >&2
+    echo "error: check 'systemctl status fingerkeyd' and 'journalctl -u fingerkeyd'" >&2
     exit 1
 fi
 echo "verified unix socket /run/phone-fprint-auth/daemon.sock"

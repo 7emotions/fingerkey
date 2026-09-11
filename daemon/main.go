@@ -169,7 +169,7 @@ func phoneConnected() bool {
 func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store, keys *keyProvider) {
 	// Fail fast with no paired keys: the PAM module falls back to the
 	// password prompt instead of polling a request no phone can approve.
-	// Keys are re-read on every call, so phone-approve remove takes effect
+	// Keys are re-read on every call, so fingerkey remove takes effect
 	// without a daemon restart.
 	if keys.Count() == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no paired keys"})

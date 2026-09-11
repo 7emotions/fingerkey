@@ -2,7 +2,7 @@
 # Revert the phone fingerprint approval installation:
 #   - disable + remove the systemd unit
 #   - restore /etc/pam.d/sudo and /etc/pam.d/polkit-1 from their newest
-#     .orig-* backups (or strip the pam_phone_approve.so line if no
+#     .orig-* backups (or strip the pam_fingerkey.so line if no
 #     backup exists; the .orig-* backups themselves are kept). This runs
 #     BEFORE the binaries are removed so a restored PAM file never
 #     references a deleted module.
@@ -20,10 +20,10 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
-UNIT="/etc/systemd/system/phone-approve-daemon.service"
-DAEMON_BIN="/usr/local/libexec/phone-approve-daemon"
-PAIR_BIN="/usr/local/bin/phone-approve"
-PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_phone_approve.so"
+UNIT="/etc/systemd/system/fingerkeyd.service"
+DAEMON_BIN="/usr/local/libexec/fingerkeyd"
+PAIR_BIN="/usr/local/bin/fingerkey"
+PAM_MODULE="/usr/lib/x86_64-linux-gnu/security/pam_fingerkey.so"
 STATE_PARENT="/var/lib/phone-fprint-auth"
 KEYS_DIR="${STATE_PARENT}/keys"
 TLS_DIR="${STATE_PARENT}/tls"
@@ -36,10 +36,10 @@ PAM_FILES=(
 
 echo "== systemd =="
 # Ignore failures when the unit is already disabled/inactive/absent.
-systemctl disable --now phone-approve-daemon 2>/dev/null || true
+systemctl disable --now fingerkeyd 2>/dev/null || true
 rm -f "${UNIT}"
 systemctl daemon-reload
-echo "disabled + removed phone-approve-daemon unit"
+echo "disabled + removed fingerkeyd unit"
 
 echo "== dbus policy =="
 # The repo-installed policy plus a leftover smoke-test policy from an earlier
@@ -52,7 +52,7 @@ fi
 echo "removed ${DBUS_POLICY} + ${DBUS_POLICY_LEFTOVER}, reloaded dbus"
 
 # restore_pam_file puts back the newest .orig-* backup of a PAM service
-# file, or strips the pam_phone_approve.so line if no backup exists.
+# file, or strips the pam_fingerkey.so line if no backup exists.
 # The .orig-* backups are never deleted (pre-install state is kept).
 # It returns non-zero on failure so the caller can accumulate errors.
 restore_pam_file() {
@@ -75,11 +75,11 @@ restore_pam_file() {
             echo "error: restoring ${pam_file} from ${newest_backup} failed" >&2
             rc=1
         fi
-    elif grep -q 'pam_phone_approve.so' "${pam_file}"; then
-        if sed -i '/pam_phone_approve.so/d' "${pam_file}"; then
-            echo "removed pam_phone_approve.so line from ${pam_file} (no backup found)"
+    elif grep -q 'pam_fingerkey.so' "${pam_file}"; then
+        if sed -i '/pam_fingerkey.so/d' "${pam_file}"; then
+            echo "removed pam_fingerkey.so line from ${pam_file} (no backup found)"
         else
-            echo "error: stripping pam_phone_approve.so from ${pam_file} failed" >&2
+            echo "error: stripping pam_fingerkey.so from ${pam_file} failed" >&2
             rc=1
         fi
     else

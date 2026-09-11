@@ -2,8 +2,8 @@ CC      := cc
 CFLAGS  := -O2 -Wall -Werror -fPIC
 LDFLAGS := -shared
 
-TARGET := pam_phone_approve.so
-SRC    := pam_phone_approve.c
+TARGET := pam_fingerkey.so
+SRC    := pam_fingerkey.c
 
 all: $(TARGET)
 

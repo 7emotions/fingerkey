@@ -8,7 +8,7 @@ When a privilege escalation runs, a PAM module asks a local daemon to create a p
 
 ```
 sudo / pkexec
-  → PAM module (pam_phone_approve) POSTs /v1/session over the unix socket
+  → PAM module (pam_fingerkey) POSTs /v1/session over the unix socket
   → daemon creates a pending session: random nonce + context (user, service, tty)
   → daemon pushes {"type":"pending",...} over TLS to every registered phone
   → you approve or deny with BiometricPrompt (fingerprint)
@@ -44,12 +44,12 @@ Frames are length-prefixed JSON (4-byte big-endian length plus payload):
 
 | Path | What it is |
 | --- | --- |
-| `daemon/` | Go single binary `phone-approve-daemon`, run as the `phonefprint` user. Holds pending sessions, issues nonces, verifies signed decisions. Two surfaces: the root-only unix socket `/run/phone-fprint-auth/daemon.sock` (`POST /v1/session`, `GET /v1/session/{id}`, `POST /v1/pair`, used by the PAM module and the pair CLI) and the TLS phone listener. Flags include `-keys-dir`, `-addr` (default `:4443`), `-tls-dir`, `-max-conns` (default 16), and `-max-conns-per-ip` (default 4). |
-| `pam/pam_phone_approve.c` | Native C PAM module. `pam_sm_authenticate` creates a session and polls up to 60 seconds, returns `PAM_SUCCESS` on approve, `PAM_AUTH_ERR` otherwise. A non-2xx session creation (daemon down, no paired keys, no phone connected) fails fast instead of hanging the 60 seconds. The `socket=<path>` argument overrides the daemon socket (used by tests and throwaway PAM services). |
+| `daemon/` | Go single binary `fingerkeyd`, run as the `phonefprint` user. Holds pending sessions, issues nonces, verifies signed decisions. Two surfaces: the root-only unix socket `/run/phone-fprint-auth/daemon.sock` (`POST /v1/session`, `GET /v1/session/{id}`, `POST /v1/pair`, used by the PAM module and the pair CLI) and the TLS phone listener. Flags include `-keys-dir`, `-addr` (default `:4443`), `-tls-dir`, `-max-conns` (default 16), and `-max-conns-per-ip` (default 4). |
+| `pam/pam_fingerkey.c` | Native C PAM module. `pam_sm_authenticate` creates a session and polls up to 60 seconds, returns `PAM_SUCCESS` on approve, `PAM_AUTH_ERR` otherwise. A non-2xx session creation (daemon down, no paired keys, no phone connected) fails fast instead of hanging the 60 seconds. The `socket=<path>` argument overrides the daemon socket (used by tests and throwaway PAM services). |
 | `scripts/install.sh` | Root install: builds and installs the daemon, pair CLI and PAM module; creates the `phonefprint` user plus the key and TLS directories; installs and starts the systemd unit (TLS on `:4443`); wires the module into `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`. |
 | `scripts/rollback.sh` | Reverses the install and restores the original PAM files. |
 | `scripts/e2e-local.sh` | One-command local end-to-end test (no root, no phone): builds the daemon and simulator into a throwaway tmpdir and runs the approve, deny, reconnect, unregistered-gating, timeout and wrong-fingerprint scenarios. Needs `go`, `curl` and `jq`; about 90 seconds. |
-| `scripts/phone-approve/` | Pair CLI (root): `pair-qr <name>`, `pair <name> <pubkey_b64>`, `list`, `remove <name>`. |
+| `scripts/fingerkey/` | Pair CLI (root): `pair-qr <name>`, `pair <name> <pubkey_b64>`, `list`, `remove <name>`. |
 | `scripts/phone-sim/` | Simulator for testing. Dials the daemon's TLS listener, pins it by fingerprint, and speaks the same framed protocol as the app: `-addr <host:port> -fp <hex> -key <priv_b64> [-decision approve|deny|hold] [-once]`; `-keygen` prints a fresh keypair. |
 | `scripts/format/` | Shared Go helper for the pinned signed-message byte format, used by the simulator. |
 | `app/` | Flutter Android app (package `com.phonefprint.auth`). Scans the pairing QR, pins the certificate fingerprint, connects to every reachable computer, and signs approvals with BiometricPrompt. |
@@ -82,12 +82,12 @@ sudo ./scripts/install.sh
 
 Run as root (the script refuses otherwise; `sudo` is fine). The script is **idempotent**, so re-running is safe. What it does:
 
-1. Builds `phone-approve-daemon`, the `phone-approve` pair CLI, and the PAM module (`make -C pam`).
+1. Builds `fingerkeyd`, the `fingerkey` pair CLI, and the PAM module (`make -C pam`).
 2. Creates the system user `phonefprint` (no home, `nologin`).
 3. Creates `/var/lib/phone-fprint-auth` (0755), plus `keys/` and `tls/` (both `phonefprint` 0700).
-4. Installs the daemon to `/usr/local/libexec/phone-approve-daemon`, the pair CLI to `/usr/local/bin/phone-approve`, the module to `/usr/lib/x86_64-linux-gnu/security/pam_phone_approve.so`, and the systemd unit to `/etc/systemd/system/phone-approve-daemon.service`.
-5. Enables and starts `phone-approve-daemon` as `phonefprint`, listening on `:4443` for TLS plus the root-only unix socket.
-6. Waits for `/run/phone-fprint-auth/daemon.sock`, then inserts `auth sufficient pam_phone_approve.so` as the first auth line in both `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`.
+4. Installs the daemon to `/usr/local/libexec/fingerkeyd`, the pair CLI to `/usr/local/bin/fingerkey`, the module to `/usr/lib/x86_64-linux-gnu/security/pam_fingerkey.so`, and the systemd unit to `/etc/systemd/system/fingerkeyd.service`.
+5. Enables and starts `fingerkeyd` as `phonefprint`, listening on `:4443` for TLS plus the root-only unix socket.
+6. Waits for `/run/phone-fprint-auth/daemon.sock`, then inserts `auth sufficient pam_fingerkey.so` as the first auth line in both `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`.
 
 Before touching a PAM file, the script copies it to `<file>.orig-<timestamp>`. The module line sits above `@include common-auth`, so an approve skips the password prompt and anything else falls through to normal password auth.
 
@@ -104,7 +104,7 @@ GOPROXY=https://goproxy.cn,direct GOSUMDB=off go build ./...
 1. On the computer, print a pairing QR for a name you choose. The name is how the key shows up in `list` and in audit logs:
 
 ```sh
-sudo phone-approve pair-qr my-phone
+sudo fingerkey pair-qr my-phone
 ```
 
 2. Open the app, choose "Add computer", and scan the terminal QR. The code carries the computer's LAN address, TLS fingerprint, and a one-time token (`phonefprint://<ip>:<port>?fp=<hex>&t=<token>&n=<hostname>`). The app dials the computer, pins the fingerprint, and sends its Ed25519 public key with the token. The daemon registers the key as `my-phone` automatically.
@@ -114,8 +114,8 @@ There is no copy-paste step and no daemon restart. Paired keys are read on every
 Manage paired phones:
 
 ```sh
-sudo phone-approve list              # names of paired keys (no root needed)
-sudo phone-approve remove my-phone   # unpair; takes effect immediately
+sudo fingerkey list              # names of paired keys (no root needed)
+sudo fingerkey remove my-phone   # unpair; takes effect immediately
 ```
 
 `pair <name> <pubkey_b64>` still works for registering a key by hand. `pair`, `remove` and `pair-qr` require root (the key store is root/`phonefprint`-owned); `list` does not.
@@ -156,7 +156,7 @@ go run ./scripts/phone-sim -addr <host:port> -fp <hex> -key <priv_b64> -decision
 The daemon writes one `key=value` line per event to its journal (captured by journald from stderr):
 
 ```sh
-journalctl -u phone-approve-daemon -o cat | grep 'event='
+journalctl -u fingerkeyd -o cat | grep 'event='
 ```
 
 Events:
@@ -192,7 +192,7 @@ Rollback removes `/var/lib/phone-fprint-auth/tls`, so a later reinstall generate
 - **Only public keys live on the daemon.** The phone keeps its private key. Compromising the daemon does not leak anything that can sign an approval.
 - **No password is ever transmitted.** Not by the PAM module, not by the daemon, not by the phone.
 - **TLS protects the link in transit.** The daemon requires TLS 1.2 or newer. The certificate is self-signed, so confidentiality rests on the phone pinning the fingerprint, not on a public CA.
-- **Fast fallback without a phone.** With no keys paired or no registered phone connected, session creation returns 503 and PAM falls back to the password prompt immediately. `pam_phone_approve.so` is `sufficient`, not `required`, so the password path always remains.
+- **Fast fallback without a phone.** With no keys paired or no registered phone connected, session creation returns 503 and PAM falls back to the password prompt immediately. `pam_fingerkey.so` is `sufficient`, not `required`, so the password path always remains.
 
 Residual risks:
 
@@ -208,4 +208,4 @@ Residual risks:
 | `daemon/` | Go approval daemon: unix socket surface, TLS phone listener, pairing tokens, mDNS, session store, lazy key loading, Ed25519 verification, unit tests. |
 | `etc/` | systemd unit. |
 | `pam/` | PAM module C source and build Makefile. |
-| `scripts/` | `install.sh`, `rollback.sh`, `phone-approve` pair CLI, `phone-sim` simulator, shared `format` package. |
+| `scripts/` | `install.sh`, `rollback.sh`, `fingerkey` pair CLI, `phone-sim` simulator, shared `format` package. |

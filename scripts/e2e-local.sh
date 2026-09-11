@@ -30,7 +30,7 @@ TLS="$TMP/tls"
 SOCK="$TMP/daemon.sock"
 mkdir -p "$KEYS"
 
-DAEMON_BIN="$TMP/phone-approve-daemon"
+DAEMON_BIN="$TMP/fingerkeyd"
 SIM_BIN="$TMP/phone-sim"
 DAEMON_LOG="$TMP/daemon.log"
 DAEMON_PID=""

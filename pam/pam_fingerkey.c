@@ -1,5 +1,5 @@
 /*
- * pam_phone_approve.c - PAM authentication module backed by a local
+ * pam_fingerkey.c - PAM authentication module backed by a local
  * phone-approval daemon listening on a root-only UNIX socket.
  *
  * Flow:

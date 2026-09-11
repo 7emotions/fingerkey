@@ -1,4 +1,4 @@
-// Command phone-approve manages the paired phone public keys that the
+// Command fingerkey manages the paired phone public keys that the
 // phone-fprint-auth daemon verifies decisions against. Each paired key is a
 // file /var/lib/phone-fprint-auth/keys/<name>.pub containing the standard,
 // padded base64 encoding of a 32-byte Ed25519 public key, mode 0600, owned by
@@ -7,10 +7,10 @@
 //
 // Usage:
 //
-//	phone-approve pair <name> <pubkey_b64>
-//	phone-approve list
-//	phone-approve remove <name>
-//	phone-approve pair-qr <name>
+//	fingerkey pair <name> <pubkey_b64>
+//	fingerkey list
+//	fingerkey remove <name>
+//	fingerkey pair-qr <name>
 //
 // pair and remove require root (the keys directory is root/phonefprint-owned);
 // list does not. pair-qr talks to the daemon over its root-only unix socket,
@@ -72,14 +72,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err != nil {
-		fmt.Fprintln(stderr, "phone-approve:", err)
+		fmt.Fprintln(stderr, "fingerkey:", err)
 		return 1
 	}
 	return 0
 }
 
 func usage(w io.Writer) {
-	fmt.Fprintln(w, `usage: phone-approve <command>
+	fmt.Fprintln(w, `usage: fingerkey <command>
   pair <name> <pubkey_b64>   pair a phone: store its Ed25519 public key
   list                       list paired key names
   remove <name>              unpair a phone

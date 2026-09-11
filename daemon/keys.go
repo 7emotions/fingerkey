@@ -12,7 +12,7 @@ import (
 )
 
 // keyProvider serves paired keys lazily: every Lookup/Count/All re-reads the
-// keys directory, so phone-approve pair/remove takes effect on the next
+// keys directory, so fingerkey pair/remove takes effect on the next
 // decision without a daemon restart. The RWMutex serializes the directory
 // scans.
 type keyProvider struct {
