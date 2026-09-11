@@ -1,3 +1,5 @@
 .omo/
 *.so
 daemon/daemon
+/phone-approve
+app/android/build/
