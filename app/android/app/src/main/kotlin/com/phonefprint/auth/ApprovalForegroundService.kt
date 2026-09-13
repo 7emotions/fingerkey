@@ -57,8 +57,12 @@ class ApprovalForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ensureEngine()
-        // Keepalive (START_STICKY + boot restart) lands in a later task.
-        return START_NOT_STICKY
+        // START_STICKY (task 13): the system recreates the service with a null
+        // intent when it is killed under memory pressure; onCreate re-enters
+        // startInForeground and ensureEngine rebuilds the headless engine, so
+        // the approval link survives an app swipe-away. The boot receiver
+        // (BootReceiver) brings it back after a reboot.
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -142,6 +146,10 @@ class ApprovalForegroundService : Service() {
             engine.plugins.add(EngineHolder.serviceChannel(this))
             engine.plugins.add(EngineHolder.overlayChannel(this))
             engine.plugins.add(EngineHolder.notifier(this))
+            // Roster writes happen in this engine too (forget + mDNS lastAddr
+            // refresh), so the boot-receiver marker channel is registered here
+            // as well as on the UI engine (task 13).
+            KeepalivePrefs.register(engine.dartExecutor.binaryMessenger, applicationContext)
             EngineHolder.serviceEngine = engine
         }
     }

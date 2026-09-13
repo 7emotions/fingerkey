@@ -57,5 +57,12 @@ class MainActivity : FlutterFragmentActivity() {
         )
         // Replay overlay-APPROVE payloads to the UI isolate (task 12).
         flutterEngine.plugins.add(OverlayLaunchBridge())
+        // Settings plumbing (task 13): battery-optimization state + the
+        // user-triggered exemption dialog, and the roster-configured marker
+        // consumed by the boot receiver. The marker is also registered on the
+        // service engine (ApprovalForegroundService) because roster writes
+        // happen in both.
+        PowerChannel.register(flutterEngine.dartExecutor.binaryMessenger, applicationContext)
+        KeepalivePrefs.register(flutterEngine.dartExecutor.binaryMessenger, applicationContext)
     }
 }

@@ -1,11 +1,13 @@
 /// Settings page pushed from the approval screen's AppBar gear. Holds the
 /// persistent approval-sound toggle (stored in [KeyStore] under
-/// `sound_enabled`) and the paired-computer management entries that used to
-/// live in the gear bottom sheet: per-computer "Forget X" (keeps the key)
-/// and "Reset identity" (wipes the key + roster).
+/// `sound_enabled`), the battery-optimization exemption entry (task 13), and
+/// the paired-computer management entries that used to live in the gear
+/// bottom sheet: per-computer "Forget X" (keeps the key) and "Reset identity"
+/// (wipes the key + roster).
 library;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'key_store.dart';
 
@@ -36,14 +38,25 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsScreenState extends State<SettingsScreen>
+    with WidgetsBindingObserver {
+  /// Native battery-optimization plumbing (PowerChannel.kt, task 13).
+  static const MethodChannel _powerChannel =
+      MethodChannel('com.phonefprint.auth/power');
+
   /// Default true, matching [KeyStore.loadSoundEnabled]'s fallback.
   bool _soundEnabled = true;
   bool _loaded = false;
 
+  /// Whether the app already holds the battery-optimization exemption.
+  /// `null` while the native answer is still loading; the entry is hidden
+  /// until it resolves to `false`.
+  bool? _batteryExempt;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     widget.keyStore.loadSoundEnabled().then((enabled) {
       if (!mounted) return;
       setState(() {
@@ -51,6 +64,50 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _loaded = true;
       });
     });
+    _loadBatteryState();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// The exemption dialog covers the app; when the user comes back, re-read
+  /// the state so the entry hides itself once the grant was accepted.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _loadBatteryState();
+    }
+  }
+
+  Future<void> _loadBatteryState() async {
+    bool exempt;
+    try {
+      exempt = await _powerChannel
+              .invokeMethod<bool>('isIgnoringBatteryOptimizations') ??
+          false;
+    } on MissingPluginException {
+      exempt = false; // Tests / non-Android hosts have no native handler.
+    } on PlatformException {
+      exempt = false;
+    }
+    if (!mounted) return;
+    setState(() => _batteryExempt = exempt);
+  }
+
+  /// Opens the SYSTEM exemption dialog. Only ever fired from this tile's tap;
+  /// the user decides in the system UI, the app never enables it silently.
+  Future<void> _requestIgnoreBattery() async {
+    try {
+      await _powerChannel
+          .invokeMethod<void>('requestIgnoreBatteryOptimizations');
+    } on MissingPluginException {
+      return;
+    } on PlatformException catch (e) {
+      debugPrint('phone-fprint-auth: battery request failed: $e');
+    }
   }
 
   Future<void> _setSoundEnabled(bool enabled) async {
@@ -73,6 +130,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onChanged: _loaded ? _setSoundEnabled : null,
             ),
             const Divider(),
+            if (_batteryExempt == false)
+              ListTile(
+                leading: const Icon(Icons.battery_saver),
+                title: const Text('Ignore battery optimizations'),
+                subtitle: const Text(
+                    'Keep the approval link alive in the background'),
+                onTap: _requestIgnoreBattery,
+              ),
+            if (_batteryExempt == false) const Divider(),
             ListTile(
               leading: const Icon(Icons.computer),
               title: Text(

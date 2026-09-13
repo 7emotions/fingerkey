@@ -9,6 +9,7 @@ library;
 import 'dart:convert';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class DeviceIdentity {
@@ -50,6 +51,14 @@ class KeyStore {
   static const String _kPrivateKey = 'ed25519_private_key';
   static const String _kRoster = 'roster';
   static const String _kSoundEnabled = 'sound_enabled';
+
+  /// Mirrors "is the roster non-empty" into a native-readable SharedPreferences
+  /// flag (task 13): the Android boot receiver cannot read
+  /// FlutterSecureStorage, so it reads this marker instead and only restarts
+  /// the foreground service when the app is configured. Handled natively by
+  /// KeepalivePrefs.kt on both engines.
+  static const MethodChannel _keepaliveChannel =
+      MethodChannel('com.phonefprint.auth/keepalive');
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
@@ -130,6 +139,7 @@ class KeyStore {
   Future<void> resetIdentity() async {
     await _storage.delete(key: _kRoster);
     await _storage.delete(key: _kPrivateKey);
+    _syncConfiguredFlag(false);
   }
 
   /// The approval-sound preference. Defaults to `true` when the key is
@@ -152,5 +162,27 @@ class KeyStore {
         roster.map((c) => c.toJson()).toList(),
       ),
     );
+    _syncConfiguredFlag(roster.isNotEmpty);
+  }
+
+  /// Updates the native boot-receiver marker (see [_keepaliveChannel]).
+  ///
+  /// Fire-and-forget on purpose: the mirror must never block or break a
+  /// roster write, and under flutter_test's FakeAsync an unhandled channel
+  /// call never completes (the future hangs), so awaiting it here would
+  /// deadlock pairing in widget tests. Errors are swallowed because the
+  /// flag is self-correcting — every roster mutation rewrites it — and a
+  /// stale value is harmless: the service's Dart `_bootstrap` waits for the
+  /// identity instead of crashing, and the boot receiver is best-effort.
+  void _syncConfiguredFlag(bool configured) {
+    _keepaliveChannel
+        .invokeMethod<void>(
+          'setRosterConfigured',
+          <String, dynamic>{'configured': configured},
+        )
+        .catchError((Object e) {
+      // No native handler (tests / non-Android), no ServicesBinding (plain
+      // unit tests), or the channel not yet attached on a cold engine start.
+    });
   }
 }
