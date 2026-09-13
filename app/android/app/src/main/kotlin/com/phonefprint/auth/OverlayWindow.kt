@@ -37,18 +37,21 @@ import java.util.concurrent.CopyOnWriteArraySet
  *   - hide()
  *
  * EventChannel "com.phonefprint.auth/overlay_events":
- *   - {type: decision, id, decision: "approve"|"deny"} on a button press
+ *   - {type: decision, id, decision: "deny", source} on DENY (task 12: the
+ *     service isolate signs the deny and posts it through the signed-decision
+ *     path — no biometric, no Activity)
  *   - {type: expired, id} when the countdown runs out
+ *
+ * APPROVE never posts a decision event: it launches [MainActivity] with
+ * FLAG_ACTIVITY_NEW_TASK carrying the pending session payload (see
+ * [OverlayLaunchBridge]); the Activity's approval screen runs the biometric
+ * prompt ONCE and posts the SIGNED decision through the UI bridge. This
+ * window never calls BiometricPrompt — it has no Activity context.
  *
  * SINGLE OWNERSHIP: exactly one instance exists per process, held by
  * [EngineHolder] and attached to the headless engine of
  * [ApprovalForegroundService] — the service engine is its only owner, like
  * [TcpTlsChannel].
- *
- * The APPROVE/DENY buttons deliberately do NOT start an Activity or call
- * BiometricPrompt here; they post a decision event to the Dart listener.
- * TODO(task 12): route the "approve" decision to the biometric flow (a
- * BiometricPrompt in the main Activity or a PendingIntent back to it).
  */
 class OverlayWindow(context: Context? = null) :
     FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
@@ -78,6 +81,10 @@ class OverlayWindow(context: Context? = null) :
     private var countdownText: TextView? = null
     private var sessionId: String? = null
     private var expiresAtMs: Long = 0L
+
+    /** Full session payload of the shown request (the show() arguments), kept
+     * so APPROVE can hand it to the main Activity (task 12). */
+    private var pendingRequest: Map<*, *>? = null
 
     /** True once the Settings grant page was opened; reset when granted. */
     private var permissionPrompted = false
@@ -173,7 +180,8 @@ class OverlayWindow(context: Context? = null) :
             val command = call.argument<String>("command") ?: ""
             val expiresAt = call.argument<Number>("expiresAt")?.toLong()
                 ?: (System.currentTimeMillis() + DEFAULT_TTL_MS)
-            showOverlay(context, id, user, service, reason, command, expiresAt)
+            val request = call.arguments as? Map<*, *>
+            showOverlay(context, id, user, service, reason, command, expiresAt, request)
             result.success("shown")
         }
     }
@@ -186,12 +194,14 @@ class OverlayWindow(context: Context? = null) :
         reason: String,
         command: String,
         expiresAt: Long,
+        request: Map<*, *>?,
     ) {
         // One request at a time: a newer request replaces the old window.
         removeView()
         val view = buildCard(context, id, user, service, reason, command)
         sessionId = id
         expiresAtMs = expiresAt
+        pendingRequest = request
         rootView = view
         try {
             val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -217,6 +227,7 @@ class OverlayWindow(context: Context? = null) :
         rootView = null
         countdownText = null
         sessionId = null
+        pendingRequest = null
         try {
             val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
             windowManager.removeView(view)
@@ -232,11 +243,59 @@ class OverlayWindow(context: Context? = null) :
     }
 
     private fun onDecision(id: String, decision: String) {
-        // TODO(task 12): route "approve" to the biometric flow (BiometricPrompt
-        // in the main Activity, or a PendingIntent back to it). Until then the
-        // decision is posted to the Dart listener, which owns the routing.
+        val request = pendingRequest
+        if (decision == "approve") {
+            // Biometric MUST run in the main Activity (task 12): launch it
+            // with the full session payload and hand over the request. The
+            // overlay hides once the launch is accepted so the Activity's
+            // own card (bridge snapshot replay) owns it and prompts ONCE.
+            // No decision event is posted: the Activity posts the SIGNED
+            // decision through the UI bridge.
+            if (launchApprovalActivity(request)) hideOverlay()
+            return
+        }
+        // DENY needs no biometric and no Activity: the service isolate signs
+        // the deny decision and posts it through the single signed-decision
+        // path, then the daemon answers with the usual decision-result.
         hideOverlay()
-        postEvent(mapOf("type" to "decision", "id" to id, "decision" to decision))
+        postEvent(
+            mapOf(
+                "type" to "decision",
+                "id" to id,
+                "decision" to decision,
+                "source" to request?.get("source"),
+            ),
+        )
+    }
+
+    /**
+     * Launches the main Activity with FLAG_ACTIVITY_NEW_TASK carrying the
+     * pending session payload (id/user/service/tty/reason/command/source,
+     * task 12). Returns false when the launch was rejected (e.g. background
+     * activity start restrictions), so the caller keeps the overlay visible.
+     */
+    private fun launchApprovalActivity(request: Map<*, *>?): Boolean {
+        val context = applicationContext ?: return false
+        fun str(key: String): String = (request?.get(key) as? String).orEmpty()
+        fun num(key: String): Long = (request?.get(key) as? Number)?.toLong() ?: 0L
+        val intent = Intent(context, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .putExtra(OverlayLaunchBridge.EXTRA_ID, str("id"))
+            .putExtra(OverlayLaunchBridge.EXTRA_NONCE, str("nonce"))
+            .putExtra(OverlayLaunchBridge.EXTRA_USER, str("user"))
+            .putExtra(OverlayLaunchBridge.EXTRA_SERVICE, str("service"))
+            .putExtra(OverlayLaunchBridge.EXTRA_TTY, str("tty"))
+            .putExtra(OverlayLaunchBridge.EXTRA_REASON, str("reason"))
+            .putExtra(OverlayLaunchBridge.EXTRA_COMMAND, str("command"))
+            .putExtra(OverlayLaunchBridge.EXTRA_SOURCE, str("source"))
+            .putExtra(OverlayLaunchBridge.EXTRA_SOURCE_NAME, str("sourceName"))
+            .putExtra(OverlayLaunchBridge.EXTRA_EXPIRES_AT, num("expiresAt"))
+        return try {
+            context.startActivity(intent)
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun promptOverlayPermissionOnce(context: Context) {

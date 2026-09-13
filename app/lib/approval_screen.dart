@@ -32,6 +32,7 @@ class ApprovalScreen extends StatefulWidget {
     this.manager,
     this.authenticate,
     this.playSound,
+    this.overlayApproveStream,
   });
 
   final DeviceIdentity identity;
@@ -59,11 +60,21 @@ class ApprovalScreen extends StatefulWidget {
   /// to [SystemSound.play] with [SystemSoundType.alert].
   final Future<void> Function()? playSound;
 
+  /// Test seam: overlay-APPROVE payloads (task 12). Defaults to the native
+  /// launch EventChannel (`com.phonefprint.auth/launch_events`), which
+  /// emits the session payload carried by the Activity's launch Intent.
+  final Stream<Map<String, dynamic>>? overlayApproveStream;
+
   @override
   State<ApprovalScreen> createState() => _ApprovalScreenState();
 }
 
 class _ApprovalScreenState extends State<ApprovalScreen> {
+  /// Native launch EventChannel replaying the overlay-APPROVE payload
+  /// (see OverlayLaunchBridge.kt). Replaced by the injected seam in tests.
+  static const EventChannel _overlayApproveEvents =
+      EventChannel('com.phonefprint.auth/launch_events');
+
   // In production the UI engine never dials: the foreground service's
   // headless engine owns every socket, and this facade rides the
   // cross-engine bridge (pending stream + decision RPC) instead.
@@ -76,10 +87,17 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
   StreamSubscription<PendingSession>? _pendingSub;
   StreamSubscription<DecisionResult>? _decisionsSub;
   StreamSubscription<String>? _unregisteredSub;
+  StreamSubscription<Map<String, dynamic>>? _overlayApproveSub;
   Timer? _ticker;
 
   bool _disposed = false;
   bool _busy = false;
+
+  /// Overlay APPROVE taps waiting for their card: the card is delivered by
+  /// the bridge snapshot replay after this Activity's engine attaches, so
+  /// the biometric prompt fires exactly once, only once the bridge is up.
+  final List<_OverlayApproveRequest> _overlayApproves =
+      <_OverlayApproveRequest>[];
 
   /// The persisted approval-sound preference, read once at init; defaults
   /// to on while the load is in flight.
@@ -93,6 +111,12 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     _pendingSub = _manager.pending().listen(_onPending);
     _decisionsSub = _manager.decisions().listen(_onDecisionResult);
     _unregisteredSub = _manager.unregistered().listen(_onUnregistered);
+    _overlayApproveSub = (widget.overlayApproveStream ??
+            _overlayApproveEvents
+                .receiveBroadcastStream()
+                .map((dynamic event) =>
+                    Map<String, dynamic>.from(event as Map)))
+        .listen(_onOverlayApprove);
     _ticker = Timer.periodic(const Duration(seconds: 1), _tick);
     unawaited(_manager.start());
     widget.keyStore.loadSoundEnabled().then((enabled) {
@@ -107,6 +131,7 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     unawaited(_pendingSub?.cancel());
     unawaited(_decisionsSub?.cancel());
     unawaited(_unregisteredSub?.cancel());
+    unawaited(_overlayApproveSub?.cancel());
     unawaited(_manager.dispose());
     super.dispose();
   }
@@ -125,7 +150,10 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     // One alert per request; _onPending is deduped by session id above.
     if (_soundEnabled) unawaited(_playAlert());
     // The card is shown first; the biometric prompt fires only when the user
-    // taps APPROVE (see _RequestCardView.onApprove).
+    // taps APPROVE (see _RequestCardView.onApprove). The one exception is an
+    // overlay APPROVE tap that landed while the UI was detached (task 12):
+    // its card arrives here via the snapshot replay, so try to match it.
+    _drainOverlayApproves();
   }
 
   Future<void> _playAlert() =>
@@ -192,6 +220,7 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
 
   void _tick(Timer _) {
     if (_disposed) return;
+    _overlayApproves.removeWhere((r) => r.expiry.isBefore(DateTime.now()));
     setState(() {
       for (final card in _cards) {
         if (!card.expired) {
@@ -219,6 +248,64 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
         .showSnackBar(SnackBar(content: Text(message)));
   }
 
+  /// An overlay APPROVE tap landed: the overlay launched this Activity with
+  /// the session payload (task 12). Record the request and approve its card
+  /// once the bridge snapshot replay delivers it — the prompt must fire
+  /// exactly once and only after the bridge is attached.
+  void _onOverlayApprove(Map<String, dynamic> payload) {
+    if (_disposed) return;
+    final id = payload['id'] as String?;
+    if (id == null) return;
+    final source = payload['source'] as String?;
+    final expiresAt = payload['expiresAt'];
+    final expiry = expiresAt is int
+        ? DateTime.fromMillisecondsSinceEpoch(expiresAt)
+        : DateTime.now().add(const Duration(seconds: 60));
+    // Idempotent: a replayed payload replaces the pending marker.
+    _overlayApproves.removeWhere((r) => r.id == id && r.source == source);
+    _overlayApproves
+        .add(_OverlayApproveRequest(id: id, source: source, expiry: expiry));
+    _drainOverlayApproves();
+  }
+
+  /// Runs the first overlay-APPROVE request whose card has arrived. Waits
+  /// while another approval is in flight (the biometric prompt must never
+  /// run twice at once); expired markers without a card are dropped.
+  void _drainOverlayApproves() {
+    if (_disposed || _busy) return;
+    _overlayApproves.removeWhere((r) => r.expiry.isBefore(DateTime.now()));
+    for (final request in _overlayApproves.toList()) {
+      _RequestCard? match;
+      for (final card in _cards) {
+        if (card.session.id == request.id &&
+            card.session.source == request.source) {
+          match = card;
+          break;
+        }
+      }
+      if (match == null) continue;
+      _overlayApproves.remove(request);
+      unawaited(_approveFromOverlay(match));
+      break;
+    }
+  }
+
+  /// Approve triggered by an overlay APPROVE tap: runs the shared `_approve`
+  /// flow (biometric + signed decision) and then makes sure the native
+  /// overlay is hidden (idempotent; the overlay already hid itself on tap).
+  Future<void> _approveFromOverlay(_RequestCard card) async {
+    await _approve(card);
+    final manager = _manager;
+    if (manager is ServiceLinkManager) {
+      try {
+        await manager.hideOverlay();
+      } catch (_) {
+        // The overlay hid itself when the Activity launched; this is
+        // belt-and-braces, so a failed RPC is not a decision failure.
+      }
+    }
+  }
+
   Future<void> _approve(_RequestCard card) async {
     if (_busy || card.expired) return;
     _busy = true;
@@ -238,6 +325,8 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
       setState(() => _status = 'Biometric error: $e');
     } finally {
       _busy = false;
+      // A queued overlay APPROVE may now run (task 12).
+      _drainOverlayApproves();
     }
   }
 
@@ -422,6 +511,20 @@ class _RequestCard {
   Duration remaining = Duration.zero;
 
   bool get expired => remaining <= Duration.zero;
+}
+
+/// An overlay APPROVE tap (task 12) awaiting its card: the card is delivered
+/// by the bridge snapshot replay, so the prompt runs only once it exists.
+class _OverlayApproveRequest {
+  _OverlayApproveRequest({
+    required this.id,
+    required this.source,
+    required this.expiry,
+  });
+
+  final String id;
+  final String? source;
+  final DateTime expiry;
 }
 
 class _RequestCardView extends StatelessWidget {

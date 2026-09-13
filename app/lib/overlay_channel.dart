@@ -3,8 +3,10 @@
 ///
 /// The overlay is owned by the headless service engine, so this client is
 /// meant to be used from the background isolate (`mainBackground`); task 11
-/// wires pending sessions to [show], task 12 routes [decisions] to the
-/// biometric flow.
+/// wired pending sessions to [show]. Task 12 routes the buttons: DENY comes
+/// back as a decision event here (the service isolate signs and posts it),
+/// while APPROVE launches the main Activity with the session payload
+/// (OverlayLaunchBridge.kt) and never emits a decision event.
 library;
 
 import 'dart:async';
@@ -22,7 +24,8 @@ class OverlayChannel {
 
   /// Shows the approval card for one pending request. [request] mirrors
   /// [PendingSession.toJson] (`id`, `user`, `service`, `reason`, `command`,
-  /// `expiresAt` in ms). Returns `shown`, or `permission_required` when the
+  /// `expiresAt` in ms, plus the full payload the overlay keeps for the
+  /// APPROVE handoff). Returns `shown`, or `permission_required` when the
   /// SYSTEM_ALERT_WINDOW access is missing (the user is routed to the
   /// Settings grant page).
   static Future<String> show(Map<String, dynamic> request) async {
@@ -35,9 +38,10 @@ class OverlayChannel {
     await _method.invokeMethod<dynamic>('hide');
   }
 
-  /// Button presses and timeouts from the overlay:
-  /// `{"type": "decision", "id": ..., "decision": "approve"|"deny"}` and
-  /// `{"type": "expired", "id": ...}`.
+  /// DENY presses and timeouts from the overlay:
+  /// `{"type": "decision", "id": ..., "decision": "deny", "source": ...}`
+  /// and `{"type": "expired", "id": ...}`. APPROVE taps never appear here —
+  /// they launch the main Activity (task 12).
   static Stream<Map<String, dynamic>> decisions() => _events
       .receiveBroadcastStream()
       .map((dynamic event) => Map<String, dynamic>.from(event as Map));

@@ -1,6 +1,7 @@
 package com.phonefprint.auth
 
 import android.content.Context
+import android.content.Intent
 import android.os.Bundle
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -17,6 +18,11 @@ import io.flutter.plugins.GeneratedPluginRegistrant
  *    [TcpTlsChannel] through [TcpTlsChannelDelegate],
  *  - renders the service's pending stream via the cross-engine Dart bridge
  *    (lib/service_bridge.dart), never dialing for approvals.
+ *
+ * Overlay APPROVE taps (task 12) land here via [OverlayWindow]'s launch
+ * Intent; the payload is handed to [OverlayLaunchBridge], which replays it
+ * to the Dart approval screen so the biometric prompt runs here ONCE — this
+ * Activity is the only place [local_auth] may run.
  */
 class MainActivity : FlutterFragmentActivity() {
 
@@ -24,6 +30,15 @@ class MainActivity : FlutterFragmentActivity() {
         super.onCreate(savedInstanceState)
         // Keep the approval link alive whenever the app is in use.
         ApprovalForegroundService.start(this)
+        // An overlay APPROVE tap launches this Activity with the session
+        // payload; store it for the Dart approval flow (task 12).
+        OverlayLaunchBridge.ingest(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        OverlayLaunchBridge.ingest(intent)
     }
 
     override fun provideFlutterEngine(context: Context): FlutterEngine? =
@@ -40,5 +55,7 @@ class MainActivity : FlutterFragmentActivity() {
         flutterEngine.plugins.add(
             TcpTlsChannelDelegate { EngineHolder.serviceChannel(applicationContext) },
         )
+        // Replay overlay-APPROVE payloads to the UI isolate (task 12).
+        flutterEngine.plugins.add(OverlayLaunchBridge())
     }
 }

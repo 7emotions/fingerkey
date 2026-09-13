@@ -28,6 +28,7 @@ import 'package:flutter/widgets.dart';
 
 import 'connection_manager.dart';
 import 'daemon_client.dart';
+import 'format.dart';
 import 'key_store.dart';
 import 'overlay_channel.dart';
 
@@ -60,6 +61,7 @@ class BackgroundLinkService {
 
   ConnectionManager? _manager;
   KeyStore? _keyStore;
+  DeviceIdentity? _identity;
 
   /// Most recent pending sessions, replayed to the UI on attach so a request
   /// pushed while the UI was dead is not lost. Keyed by session id; pruned
@@ -72,6 +74,9 @@ class BackgroundLinkService {
     ui.IsolateNameServer.removePortNameMapping(kServicePortName);
     ui.IsolateNameServer.registerPortWithName(_port.sendPort, kServicePortName);
     _port.listen(_onMessage);
+    // Overlay button events (deny / expired). APPROVE never arrives here:
+    // the overlay launches the main Activity for the biometric flow.
+    OverlayChannel.decisions().listen(_onOverlayEvent);
     await _bootstrap();
   }
 
@@ -93,6 +98,7 @@ class BackgroundLinkService {
       }
     }
     _keyStore = keyStore;
+    _identity = identity;
     final manager = ConnectionManager(keyStore: keyStore, identity: identity);
     _manager = manager;
     manager.pending().listen(_onPending);
@@ -143,6 +149,61 @@ class BackgroundLinkService {
   void _onUnregistered(String fingerprint) {
     _sendToUi(
         <String, dynamic>{'type': 'unregistered', 'fingerprint': fingerprint});
+  }
+
+  /// Overlay button events from the native overlay window. Only `expired`
+  /// and a DENY decision arrive here: APPROVE launches the main Activity
+  /// instead (task 12). A deny needs no biometric, but it must still be
+  /// SIGNED — this isolate signs it with the shared identity and posts it
+  /// through the single signed-decision path (never bypassing it).
+  void _onOverlayEvent(Map<String, dynamic> event) {
+    final type = event['type'] as String?;
+    final id = event['id'] as String?;
+    if (id == null) return;
+    if (type == 'expired') {
+      _pendingCache.removeWhere((key, _) => key.startsWith('$id@'));
+      return;
+    }
+    if (type != 'decision' || event['decision'] != 'deny') return;
+    unawaited(_signAndPostDeny(id, event['source'] as String?));
+  }
+
+  Future<void> _signAndPostDeny(String id, String? source) async {
+    final manager = _manager;
+    final identity = _identity;
+    if (manager == null || identity == null) return;
+    final session = _sessionById(id, source);
+    if (session == null) return; // already decided or expired; nothing to sign.
+    try {
+      final sig = await signDecision(
+        keyPair: identity.keyPair,
+        action: kActionDeny,
+        user: session.user,
+        service: session.service,
+        tty: session.tty,
+        nonce: session.nonce,
+      );
+      final result = await manager.postDecision(
+        session: session,
+        decision: kActionDeny,
+        signatureBase64: sig,
+      );
+      debugPrint('phone-fprint-auth: overlay deny for ${session.id}: '
+          '${result.status ?? result.error}');
+    } catch (e) {
+      debugPrint('phone-fprint-auth: overlay deny failed: $e');
+    }
+  }
+
+  /// The cached session for an overlay event: exact `id@source` first (the
+  /// event carries the source), then any computer with that id.
+  PendingSession? _sessionById(String id, String? source) {
+    final keyed = _pendingCache['$id@$source'];
+    if (keyed != null) return keyed;
+    for (final entry in _pendingCache.entries) {
+      if (entry.key.startsWith('$id@')) return entry.value;
+    }
+    return null;
   }
 
   void _pruneExpired() {
@@ -238,6 +299,9 @@ class BackgroundLinkService {
           reply(result.toJson());
         case 'forgetComputer':
           await manager.forgetComputer(argMap['fingerprint'] as String);
+          reply(null);
+        case 'hideOverlay':
+          await OverlayChannel.hide();
           reply(null);
         default:
           replyError('unknown method: $method');
@@ -409,6 +473,11 @@ class UiBridge {
 
   Future<void> forgetComputer(String fingerprint) =>
       _request('forgetComputer', <String, dynamic>{'fingerprint': fingerprint});
+
+  /// Asks the service engine to hide the native overlay window (task 12).
+  /// Idempotent: a no-op RPC when nothing is showing.
+  Future<void> hideOverlay() =>
+      _request('hideOverlay', const <String, dynamic>{});
 }
 
 /// UI-engine facade with the [ConnectionManager] surface. The approval screen
@@ -462,6 +531,10 @@ class ServiceLinkManager extends ConnectionManager {
   @override
   Future<void> forgetComputer(String fingerprint) =>
       _bridge.forgetComputer(fingerprint);
+
+  /// UI-side hook for task 12: hides the service-owned native overlay after
+  /// an overlay-triggered approval ran in this Activity.
+  Future<void> hideOverlay() => _bridge.hideOverlay();
 
   @override
   Future<void> dispose() async {

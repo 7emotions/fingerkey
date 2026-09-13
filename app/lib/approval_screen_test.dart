@@ -325,6 +325,177 @@ void main() {
     await _dispose(tester);
   });
 
+  testWidgets(
+      'overlay APPROVE before the card prompts biometric exactly once',
+      (tester) async {
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    final launch = StreamController<Map<String, dynamic>>.broadcast();
+    var authCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          authenticate: (_) async {
+            authCalls++;
+            return true;
+          },
+          overlayApproveStream: launch.stream,
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester);
+
+    // Real cold-start order (task 12): the overlay launch event lands while
+    // the bridge is still attaching, before the snapshot replay delivers the
+    // card. No prompt may fire until the card exists.
+    launch.add(<String, dynamic>{
+      'id': 's1',
+      'source': 'fp1',
+      'expiresAt': DateTime.now()
+          .add(const Duration(seconds: 60))
+          .millisecondsSinceEpoch,
+    });
+    await _settle(tester);
+    expect(authCalls, 0);
+    expect(manager.postedDecisions, isEmpty);
+
+    // The snapshot replay delivers the card: the biometric prompt fires once
+    // and the signed approve decision is posted.
+    manager.pendingCtrl
+        .add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+
+    expect(authCalls, 1);
+    expect(manager.postedDecisions, <String>['approve']);
+    expect(find.text('desk'), findsNothing);
+
+    // A replayed payload for the already-approved session is idempotent.
+    launch.add(<String, dynamic>{
+      'id': 's1',
+      'source': 'fp1',
+      'expiresAt': DateTime.now()
+          .add(const Duration(seconds: 60))
+          .millisecondsSinceEpoch,
+    });
+    await _settle(tester);
+    expect(authCalls, 1);
+    expect(manager.postedDecisions, <String>['approve']);
+
+    await launch.close();
+    await _dispose(tester);
+  });
+
+  testWidgets('overlay APPROVE after the card prompts biometric exactly once',
+      (tester) async {
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    final launch = StreamController<Map<String, dynamic>>.broadcast();
+    var authCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          authenticate: (_) async {
+            authCalls++;
+            return true;
+          },
+          overlayApproveStream: launch.stream,
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester);
+
+    // Card first (snapshot replay won the race), then the launch event:
+    // the prompt still fires exactly once.
+    manager.pendingCtrl
+        .add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+    expect(authCalls, 0);
+
+    launch.add(<String, dynamic>{
+      'id': 's1',
+      'source': 'fp1',
+      'expiresAt': DateTime.now()
+          .add(const Duration(seconds: 60))
+          .millisecondsSinceEpoch,
+    });
+    await _settle(tester);
+
+    expect(authCalls, 1);
+    expect(manager.postedDecisions, <String>['approve']);
+    expect(find.text('desk'), findsNothing);
+
+    await launch.close();
+    await _dispose(tester);
+  });
+
+  testWidgets(
+      'overlay APPROVE for an unknown session prompts nothing and expires',
+      (tester) async {
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    final launch = StreamController<Map<String, dynamic>>.broadcast();
+    var authCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          authenticate: (_) async {
+            authCalls++;
+            return true;
+          },
+          overlayApproveStream: launch.stream,
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester);
+
+    // The session was already decided/expired elsewhere: its card never
+    // arrives, so no prompt fires and the marker is pruned at expiry.
+    launch.add(<String, dynamic>{
+      'id': 'gone',
+      'source': 'fp1',
+      'expiresAt': DateTime.now()
+          .add(const Duration(seconds: 1))
+          .millisecondsSinceEpoch,
+    });
+    await _settle(tester);
+    expect(authCalls, 0);
+
+    await tester.pump(const Duration(seconds: 2));
+    await _settle(tester);
+    expect(authCalls, 0);
+    expect(manager.postedDecisions, isEmpty);
+
+    await launch.close();
+    await _dispose(tester);
+  });
+
   testWidgets('unregistered computer clears its cards and prompts re-pair',
       (tester) async {
     final identity = await _identity();
