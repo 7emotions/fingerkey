@@ -177,6 +177,37 @@ func TestPairTokenRejectsBadNames(t *testing.T) {
 	}
 }
 
+// TestPairConsumeRefusesSymlink: a symlink planted at <name>.pub pointing at
+// an arbitrary file must be refused, not followed — the target's bytes must
+// survive the consume attempt untouched (CWE-59).
+func TestPairConsumeRefusesSymlink(t *testing.T) {
+	pm := newTestPairManager(t)
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("SENTINEL"), 0600); err != nil {
+		t.Fatalf("write sentinel target: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(pm.keysDir, "alice.pub")); err != nil {
+		t.Fatalf("plant symlink: %v", err)
+	}
+
+	token, err := pm.issue("alice")
+	if err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	pub, _ := newKey(t)
+	if _, _, err := pm.consume(token, pub); err == nil {
+		t.Fatal("consume followed a symlinked key path, want refusal")
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read sentinel target: %v", err)
+	}
+	if string(got) != "SENTINEL" {
+		t.Fatalf("target bytes = %q, want SENTINEL (not truncated/overwritten)", got)
+	}
+}
+
 // TestPairTokenCleanup: issue purges expired tokens, so the map does not grow
 // unboundedly across pairing windows.
 func TestPairTokenCleanup(t *testing.T) {

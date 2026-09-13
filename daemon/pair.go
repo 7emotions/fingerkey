@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -122,7 +123,17 @@ func (pm *pairManager) consume(token string, pub ed25519.PublicKey) (name string
 		replaced = true
 	}
 	data := base64.StdEncoding.EncodeToString(pub) + "\n"
-	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
+		return "", false, err
+	}
+	if _, err := f.Write([]byte(data)); err != nil {
+		f.Close()
+		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
+		return "", false, err
+	}
+	if err := f.Close(); err != nil {
 		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
 		return "", false, err
 	}
