@@ -123,7 +123,7 @@ func (pm *pairManager) consume(token string, pub ed25519.PublicKey) (name string
 		replaced = true
 	}
 	data := base64.StdEncoding.EncodeToString(pub) + "\n"
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
 		return "", false, err

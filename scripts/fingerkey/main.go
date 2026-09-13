@@ -1,8 +1,8 @@
 // Command fingerkey manages the paired phone public keys that the
 // phone-fprint-auth daemon verifies decisions against. Each paired key is a
 // file /var/lib/phone-fprint-auth/keys/<name>.pub containing the standard,
-// padded base64 encoding of a 32-byte Ed25519 public key, mode 0600, owned by
-// the phonefprint user (so the daemon can read it and nobody else can write
+// padded base64 encoding of a 32-byte Ed25519 public key, mode 0644, owned by
+// the phonefprint user (so any user can list it and nobody else can write
 // it).
 //
 // Usage:
@@ -88,7 +88,7 @@ func usage(w io.Writer) {
 }
 
 // pair validates the public key and stores it under keysDir as <name>.pub,
-// mode 0600, owned by the phonefprint user (falling back to the current
+// mode 0644, owned by the phonefprint user (falling back to the current
 // euid when no phonefprint user exists).
 func pair(name, pubkeyB64 string) error {
 	if err := requireRoot("pair"); err != nil {
@@ -106,13 +106,14 @@ func pair(name, pubkeyB64 string) error {
 	}
 
 	uid, gid, ok := lookupPhonefprint()
-	if err := os.MkdirAll(keysDir, 0700); err != nil {
+	if err := os.MkdirAll(keysDir, 0755); err != nil {
 		return err
 	}
-	// MkdirAll also creates missing parents with the same 0700 mode; the
+	// MkdirAll also creates missing parents with the same 0755 mode; the
 	// parent /var/lib/phone-fprint-auth must be world-traversable (0755) so
 	// the daemon, running as phonefprint, can reach the keys dir. The keys
-	// dir itself stays 0700.
+	// dir is world-listable (0755) so any user can run `fingerkey list`;
+	// writes stay root/phonefprint-owned.
 	_ = os.Chmod(filepath.Dir(keysDir), 0755)
 	if ok {
 		if err := os.Chown(keysDir, uid, gid); err != nil {
@@ -120,7 +121,7 @@ func pair(name, pubkeyB64 string) error {
 		}
 	}
 	path := filepath.Join(keysDir, name+".pub")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		return err
 	}

@@ -40,7 +40,7 @@ fi
 
 echo "== key store + tls dirs =="
 install -d -m 0755 "${KEYS_PARENT}"
-install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${KEYS_DIR}"
+install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0755 "${KEYS_DIR}"
 install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${TLS_DIR}"
 
 echo "== binaries =="
