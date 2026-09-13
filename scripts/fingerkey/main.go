@@ -109,6 +109,12 @@ func pair(name, pubkeyB64 string) error {
 	if err := os.MkdirAll(keysDir, 0755); err != nil {
 		return err
 	}
+	// MkdirAll does not change the mode of an existing directory, and its
+	// requested mode is umask-masked, so an upgraded 0700 store (or a 077
+	// umask) would otherwise stay non-world-listable. Enforce 0755 explicitly.
+	if err := os.Chmod(keysDir, 0755); err != nil {
+		return err
+	}
 	// MkdirAll also creates missing parents with the same 0755 mode; the
 	// parent /var/lib/phone-fprint-auth must be world-traversable (0755) so
 	// the daemon, running as phonefprint, can reach the keys dir. The keys
@@ -125,15 +131,21 @@ func pair(name, pubkeyB64 string) error {
 	if err != nil {
 		return err
 	}
+	if _, err := f.Write([]byte(pubkeyB64)); err != nil {
+		f.Close()
+		return err
+	}
+	// OpenFile's mode is umask-masked and ignored for an existing file, so
+	// enforce 0644 here too (public key — no secret).
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
+		return err
+	}
 	if ok {
 		if err := f.Chown(uid, gid); err != nil {
 			f.Close()
 			return fmt.Errorf("chown %s: %v", path, err)
 		}
-	}
-	if _, err := f.Write([]byte(pubkeyB64)); err != nil {
-		f.Close()
-		return err
 	}
 	if err := f.Close(); err != nil {
 		return err

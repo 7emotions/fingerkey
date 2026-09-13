@@ -133,6 +133,14 @@ func (pm *pairManager) consume(token string, pub ed25519.PublicKey) (name string
 		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
 		return "", false, err
 	}
+	// OpenFile's mode is umask-masked and ignored for an existing file, so a
+	// re-paired key (or one created by the old 0600 code) stays private unless
+	// the mode is enforced here. Public keys carry no secret, so 0644 is safe.
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
+		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
+		return "", false, err
+	}
 	if err := f.Close(); err != nil {
 		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
 		return "", false, err

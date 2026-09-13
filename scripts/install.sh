@@ -80,6 +80,9 @@ install -d -m 0755 "${KEYS_PARENT}"
 echo "ensured ${KEYS_PARENT} (0755, traversable by ${DAEMON_USER})"
 install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0755 "${KEYS_DIR}"
 echo "ensured ${KEYS_DIR} (${DAEMON_USER} 0755)"
+# Migrate any public keys written with the old 0600 mode (public keys carry
+# no secret); the directory itself is handled by install -d above.
+find "${KEYS_DIR}" -maxdepth 1 -type f -name '*.pub' -exec chmod 0644 {} + 2>/dev/null || true
 
 echo "== tls dir =="
 # The daemon generates cert.pem/key.pem here on first start — the dir
