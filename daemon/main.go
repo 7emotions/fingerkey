@@ -49,7 +49,7 @@ func main() {
 			log.Fatal(err)
 		}
 	}()
-	log.Printf("phone-fprint-auth daemon: local=%s (%d paired key(s))", *socketPath, keys.Count())
+	log.Printf("fingerkeyd: local=%s (%d paired key(s))", *socketPath, keys.Count())
 
 	// Phone surface: the -phone-sim-socket listener is test-only: it accepts
 	// plain framed streams over a unix socket exactly like a phone link will.
@@ -59,7 +59,7 @@ func main() {
 			log.Fatal(err)
 		}
 		defer ln.Close()
-		log.Printf("phone-fprint-auth daemon: phone sim socket listening on %s", *simSocketPath)
+		log.Printf("fingerkeyd: phone sim socket listening on %s", *simSocketPath)
 	}
 
 	// Phone surface: the real link is the TLS TCP listener (tls.go).
@@ -75,7 +75,7 @@ func main() {
 		} else {
 			port := ln.Addr().(*net.TCPAddr).Port
 			pairs.setTransport(fp, localIPv4(), port)
-			log.Printf("phone-fprint-auth daemon: tls listening on %s (fp=%s)", ln.Addr(), fp)
+			log.Printf("fingerkeyd: tls listening on %s (fp=%s)", ln.Addr(), fp)
 			if err := publishMDNS(port, fp); err != nil {
 				log.Printf("mdns unavailable: %v", err)
 			}
