@@ -24,6 +24,7 @@ import 'package:auth/approval_screen.dart';
 import 'package:auth/connection_manager.dart';
 import 'package:auth/daemon_client.dart';
 import 'package:auth/key_store.dart';
+import 'package:auth/service_bridge.dart';
 
 Future<DeviceIdentity> _identity() async {
   final keyPair = await Ed25519().newKeyPair();
@@ -97,6 +98,26 @@ class _FakeManager extends ConnectionManager {
     await decisionsCtrl.close();
     await unregisteredCtrl.close();
   }
+}
+
+/// Records [ServiceLinkManager.setForeground] calls without touching the real
+/// cross-engine bridge (no service isolate exists in widget tests).
+class _FakeServiceLinkManager extends ServiceLinkManager {
+  _FakeServiceLinkManager(DeviceIdentity identity)
+      : super(keyStore: KeyStore(), identity: identity);
+
+  final List<bool> foregroundCalls = <bool>[];
+
+  @override
+  Future<void> start() async {} // no bridge attach in tests
+
+  @override
+  Future<void> setForeground(bool foreground) async {
+    foregroundCalls.add(foreground);
+  }
+
+  @override
+  Future<void> dispose() async {} // skip the real bridge teardown
 }
 
 Future<void> _settle(WidgetTester tester) async {
@@ -691,5 +712,53 @@ void main() {
     await _dispose(tester);
     // ignore: invalid_use_of_visible_for_testing_member
     FlutterSecureStorage.setMockInitialValues({});
+  });
+
+  testWidgets(
+      'backgrounding detaches the bridge (foreground=false) and resume '
+      're-attaches it (task 15)', (tester) async {
+    final identity = await _identity();
+    final manager = _FakeServiceLinkManager(identity);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester);
+    // No lifecycle transition while the screen just opened: foreground claim
+    // is untouched (the in-app card + SystemSound path still owns alerts).
+    expect(manager.foregroundCalls, isEmpty);
+
+    // Backgrounded: the observer must detach so the service engine's
+    // `_sendToUi` sees no registered UI port and fires the overlay path.
+    // ignore: invalid_use_of_protected_member
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+    await _settle(tester);
+    expect(manager.foregroundCalls, <bool>[false]);
+
+    // Any further non-resumed state keeps it detached (idempotent calls are
+    // harmless; the real ServiceLinkManager.detach is a no-op when detached).
+    // ignore: invalid_use_of_protected_member
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+    await _settle(tester);
+    expect(manager.foregroundCalls, <bool>[false, false]);
+
+    // Resumed: re-attach re-registers the port and replays the snapshot.
+    // ignore: invalid_use_of_protected_member
+    tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+    await _settle(tester);
+    expect(manager.foregroundCalls, <bool>[false, false, true]);
+
+    await _dispose(tester);
   });
 }

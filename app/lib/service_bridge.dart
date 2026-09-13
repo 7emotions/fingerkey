@@ -490,8 +490,31 @@ class ServiceLinkManager extends ConnectionManager {
   final UiBridge _bridge = UiBridge();
   Timer? _attachRetry;
 
+  /// Whether the UI engine considers itself foregrounded (the approval screen
+  /// is resumed). While false, [_attachWithRetry] never re-attaches, so the
+  /// service engine's `_sendToUi` finds no registered `phonefprint.ui` port
+  /// and routes alerts to the background path (overlay + notification).
+  bool _foreground = true;
+
   @override
   Future<void> start() => _attachWithRetry();
+
+  /// Lifecycle hook driven by the approval screen's [WidgetsBindingObserver].
+  /// On background ([foreground] false: paused/hidden/inactive) it detaches
+  /// the UI bridge — unregistering the `phonefprint.ui` port, which is the
+  /// service engine's "UI foregrounded" signal — while keeping the exposed
+  /// streams open. On resume it re-attaches, which re-registers the port and
+  /// replays the pending snapshot.
+  Future<void> setForeground(bool foreground) async {
+    _foreground = foreground;
+    if (foreground) {
+      await _attachWithRetry();
+    } else {
+      _attachRetry?.cancel();
+      _attachRetry = null;
+      await _bridge.detach();
+    }
+  }
 
   Future<void> _attachWithRetry() async {
     _attachRetry?.cancel();
@@ -499,6 +522,8 @@ class ServiceLinkManager extends ConnectionManager {
       await _bridge.attach();
     } catch (e) {
       debugPrint('phone-fprint-auth: ui bridge attach failed: $e');
+      // Do not retry (and re-register the foreground port) while backgrounded.
+      if (!_foreground) return;
       _attachRetry = Timer(
           const Duration(seconds: 5), () => unawaited(_attachWithRetry()));
     }

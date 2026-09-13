@@ -69,7 +69,8 @@ class ApprovalScreen extends StatefulWidget {
   State<ApprovalScreen> createState() => _ApprovalScreenState();
 }
 
-class _ApprovalScreenState extends State<ApprovalScreen> {
+class _ApprovalScreenState extends State<ApprovalScreen>
+    with WidgetsBindingObserver {
   /// Native launch EventChannel replaying the overlay-APPROVE payload
   /// (see OverlayLaunchBridge.kt). Replaced by the injected seam in tests.
   static const EventChannel _overlayApproveEvents =
@@ -108,6 +109,12 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
   @override
   void initState() {
     super.initState();
+    // Observe the app lifecycle so the bridge can detach on backgrounding:
+    // the registered `phonefprint.ui` port is the service engine's
+    // "UI foregrounded" signal, and it must vanish when this screen is no
+    // longer resumed or the background alert (overlay + notification) never
+    // fires for a request pushed after the app was once opened.
+    WidgetsBinding.instance.addObserver(this);
     _pendingSub = _manager.pending().listen(_onPending);
     _decisionsSub = _manager.decisions().listen(_onDecisionResult);
     _unregisteredSub = _manager.unregistered().listen(_onUnregistered);
@@ -127,6 +134,7 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
   @override
   void dispose() {
     _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     _ticker?.cancel();
     unawaited(_pendingSub?.cancel());
     unawaited(_decisionsSub?.cancel());
@@ -134,6 +142,20 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     unawaited(_overlayApproveSub?.cancel());
     unawaited(_manager.dispose());
     super.dispose();
+  }
+
+  /// Keeps the bridge's foreground claim in sync with the app lifecycle:
+  /// whenever the app leaves [AppLifecycleState.resumed] (paused, hidden,
+  /// inactive — or detached), the UI port `phonefprint.ui` is unregistered so
+  /// the service engine's `_sendToUi` reports "backgrounded" and a pushed
+  /// request fires the overlay + notification alert. On resume the port is
+  /// re-registered and the pending snapshot replayed (task 15).
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final manager = _manager;
+    if (manager is ServiceLinkManager) {
+      unawaited(manager.setForeground(state == AppLifecycleState.resumed));
+    }
   }
 
   void _onPending(PendingSession session) {
