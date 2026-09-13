@@ -140,6 +140,7 @@ class ApprovalForegroundService : Service() {
             // Activity-bound and never run headless (no biometric here).
             engine.plugins.add(FlutterSecureStoragePlugin())
             engine.plugins.add(EngineHolder.serviceChannel(this))
+            engine.plugins.add(EngineHolder.overlayChannel(this))
             EngineHolder.serviceEngine = engine
         }
     }

@@ -23,6 +23,9 @@ object EngineHolder {
     private var channel: TcpTlsChannel? = null
 
     @Volatile
+    private var overlay: OverlayWindow? = null
+
+    @Volatile
     var serviceEngine: FlutterEngine? = null
 
     fun engineGroup(context: Context): FlutterEngineGroup =
@@ -33,5 +36,10 @@ object EngineHolder {
     fun serviceChannel(context: Context): TcpTlsChannel =
         channel ?: synchronized(this) {
             channel ?: TcpTlsChannel(context.applicationContext).also { channel = it }
+        }
+
+    fun overlayChannel(context: Context): OverlayWindow =
+        overlay ?: synchronized(this) {
+            overlay ?: OverlayWindow(context.applicationContext).also { overlay = it }
         }
 }
