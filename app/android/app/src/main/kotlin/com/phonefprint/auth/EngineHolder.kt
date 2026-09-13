@@ -26,6 +26,9 @@ object EngineHolder {
     private var overlay: OverlayWindow? = null
 
     @Volatile
+    private var notifier: ApprovalNotifier? = null
+
+    @Volatile
     var serviceEngine: FlutterEngine? = null
 
     fun engineGroup(context: Context): FlutterEngineGroup =
@@ -41,5 +44,10 @@ object EngineHolder {
     fun overlayChannel(context: Context): OverlayWindow =
         overlay ?: synchronized(this) {
             overlay ?: OverlayWindow(context.applicationContext).also { overlay = it }
+        }
+
+    fun notifier(context: Context): ApprovalNotifier =
+        notifier ?: synchronized(this) {
+            notifier ?: ApprovalNotifier(context.applicationContext).also { notifier = it }
         }
 }

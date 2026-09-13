@@ -141,6 +141,7 @@ class ApprovalForegroundService : Service() {
             engine.plugins.add(FlutterSecureStoragePlugin())
             engine.plugins.add(EngineHolder.serviceChannel(this))
             engine.plugins.add(EngineHolder.overlayChannel(this))
+            engine.plugins.add(EngineHolder.notifier(this))
             EngineHolder.serviceEngine = engine
         }
     }

@@ -23,11 +23,13 @@ import 'dart:async';
 import 'dart:isolate';
 import 'dart:ui' as ui;
 
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 import 'connection_manager.dart';
 import 'daemon_client.dart';
 import 'key_store.dart';
+import 'overlay_channel.dart';
 
 /// Well-known port names for the cross-engine bridge. These must match the
 /// documentation above; they are process-local and never leave the device.
@@ -48,6 +50,13 @@ Future<void> startBackgroundService() async {
 /// answers RPC requests (postDecision / forget / snapshot) from the UI.
 class BackgroundLinkService {
   final ReceivePort _port = ReceivePort();
+
+  /// High-priority approval-request notifier (native [ApprovalNotifier],
+  /// channel `com.phonefprint.auth/notify`). Only the service engine
+  /// registers that handler, so this channel is usable from this isolate
+  /// only — the UI engine's pending path never touches it.
+  static const MethodChannel _notifyChannel =
+      MethodChannel('com.phonefprint.auth/notify');
 
   ConnectionManager? _manager;
   KeyStore? _keyStore;
@@ -107,7 +116,16 @@ class BackgroundLinkService {
     }
     _pendingCache[key] = session;
     _pruneExpired();
-    _sendToUi(<String, dynamic>{'type': 'pending', 'session': session.toJson()});
+    final json = session.toJson();
+    // The registered UI port doubles as the foreground signal: attached
+    // means the approval screen (in-app card + SystemSound, task 7) is
+    // alive and owns the alert; unattached means the app is backgrounded
+    // or killed and the alert must come from the service engine itself.
+    final deliveredToUi =
+        _sendToUi(<String, dynamic>{'type': 'pending', 'session': json});
+    if (!deliveredToUi) {
+      unawaited(_alertInBackground(json));
+    }
   }
 
   void _onDecision(DecisionResult result) {
@@ -132,10 +150,43 @@ class BackgroundLinkService {
     _pendingCache.removeWhere((_, s) => s.expiresAt.isBefore(now));
   }
 
-  void _sendToUi(Map<String, dynamic> message) {
+  /// Sends [message] to the UI isolate and reports whether the UI port was
+  /// registered (the "is the app foregrounded" signal used by [_onPending]).
+  bool _sendToUi(Map<String, dynamic> message) {
     final port = ui.IsolateNameServer.lookupPortByName(kUiPortName);
-    if (port == null) return;
+    if (port == null) return false;
     port.send(message);
+    return true;
+  }
+
+  /// Background-only alert for a pending request that could not reach the
+  /// UI isolate: shows the native overlay card AND posts a high-priority
+  /// notification (silent when the user disabled the approval sound). The
+  /// foreground path never gets here because the UI port is registered.
+  /// Both calls are fire-and-forget from [_onPending] and must not throw.
+  Future<void> _alertInBackground(Map<String, dynamic> json) async {
+    final overlay = OverlayChannel.show(json).catchError((Object e) {
+      debugPrint('phone-fprint-auth: bg overlay show failed: $e');
+      return '';
+    });
+    var soundEnabled = true;
+    try {
+      soundEnabled =
+          await (_keyStore?.loadSoundEnabled() ?? Future<bool>.value(true));
+    } catch (e) {
+      debugPrint('phone-fprint-auth: bg sound pref load failed: $e');
+    }
+    try {
+      await _notifyChannel.invokeMethod<void>('showApproval', <String, dynamic>{
+        ...json,
+        'sound': soundEnabled,
+      });
+    } on MissingPluginException catch (e) {
+      debugPrint('phone-fprint-auth: bg notify handler missing: $e');
+    } on PlatformException catch (e) {
+      debugPrint('phone-fprint-auth: bg notify failed: $e');
+    }
+    await overlay;
   }
 
   void _onMessage(dynamic raw) {
