@@ -120,8 +120,10 @@ The daemon generates `cert.pem`/`key.pem` under `/var/lib/phone-fprint-auth/tls`
 If Go module downloads are blocked from your network, build through the China proxy:
 
 ```sh
-GOPROXY=https://goproxy.cn,direct GOSUMDB=off go build ./...
+GOPROXY=https://goproxy.cn,direct go build ./...
 ```
+
+The Go checksum database verification against `sum.golang.org` stays enabled; the proxy serves the checksum database too.
 
 ## Pair your phone
 
