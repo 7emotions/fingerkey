@@ -441,4 +441,84 @@ void main() {
 
     await _dispose(tester);
   });
+
+  testWidgets('approval sound plays once per request when enabled',
+      (tester) async {
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    var soundCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          playSound: () async {
+            soundCalls++;
+          },
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester); // loadSoundEnabled resolves (defaults on)
+
+    manager.pendingCtrl
+        .add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+    expect(soundCalls, 1);
+
+    // A duplicate frame for the same session does not replay the sound.
+    manager.pendingCtrl
+        .add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+    expect(soundCalls, 1);
+
+    await _dispose(tester);
+  });
+
+  testWidgets('approval sound is muted when the toggle is off',
+      (tester) async {
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({'sound_enabled': '0'});
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    var soundCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          playSound: () async {
+            soundCalls++;
+          },
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester); // loadSoundEnabled resolves to false
+
+    manager.pendingCtrl
+        .add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+
+    expect(find.text('desk'), findsOneWidget);
+    expect(soundCalls, 0);
+
+    await _dispose(tester);
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
+  });
 }

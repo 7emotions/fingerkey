@@ -11,6 +11,7 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:local_auth/local_auth.dart';
 
 import 'connection_manager.dart';
@@ -29,6 +30,7 @@ class ApprovalScreen extends StatefulWidget {
     required this.onRosterChanged,
     this.manager,
     this.authenticate,
+    this.playSound,
   });
 
   final DeviceIdentity identity;
@@ -52,6 +54,10 @@ class ApprovalScreen extends StatefulWidget {
   /// authenticated. Defaults to the real [LocalAuthentication] flow.
   final Future<bool> Function(String reason)? authenticate;
 
+  /// Test seam: plays the alert sound when a new request arrives. Defaults
+  /// to [SystemSound.play] with [SystemSoundType.alert].
+  final Future<void> Function()? playSound;
+
   @override
   State<ApprovalScreen> createState() => _ApprovalScreenState();
 }
@@ -70,6 +76,10 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
 
   bool _disposed = false;
   bool _busy = false;
+
+  /// The persisted approval-sound preference, read once at init; defaults
+  /// to on while the load is in flight.
+  bool _soundEnabled = true;
   String _status = 'Listening for requests…';
   final List<_RequestCard> _cards = <_RequestCard>[];
 
@@ -81,6 +91,9 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     _unregisteredSub = _manager.unregistered().listen(_onUnregistered);
     _ticker = Timer.periodic(const Duration(seconds: 1), _tick);
     unawaited(_manager.start());
+    widget.keyStore.loadSoundEnabled().then((enabled) {
+      _soundEnabled = enabled;
+    });
   }
 
   @override
@@ -105,9 +118,14 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
       _status =
           'Request pending — review reason/command, then approve or deny.';
     });
+    // One alert per request; _onPending is deduped by session id above.
+    if (_soundEnabled) unawaited(_playAlert());
     // The card is shown first; the biometric prompt fires only when the user
     // taps APPROVE (see _RequestCardView.onApprove).
   }
+
+  Future<void> _playAlert() =>
+      widget.playSound?.call() ?? SystemSound.play(SystemSoundType.alert);
 
   void _onDecisionResult(DecisionResult result) {
     if (_disposed) return;
