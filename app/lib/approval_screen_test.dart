@@ -1,7 +1,8 @@
 /// Widget tests for the multi-computer approval screen, driven by a fake
 /// [ConnectionManager] so no platform channel or real transport is involved.
 /// Covers: gear menu split (forget vs reset identity), multi-computer card
-/// grouping, deadline countdown disabling APPROVE/DENY, and "approved by
+/// grouping, deadline countdown disabling APPROVE/DENY, deferred biometric
+/// prompt (fires on APPROVE tap, not on arrival), and "approved by
 /// another phone" card reconciliation.
 ///
 /// Canonical location per the build plan is lib/approval_screen_test.dart;
@@ -259,6 +260,59 @@ void main() {
     expect(find.text('desk'), findsNothing);
     expect(find.text('No pending requests'), findsOneWidget);
     expect(find.text('已被 otherpc 批准'), findsOneWidget);
+
+    await _dispose(tester);
+  });
+
+  testWidgets(
+      'pending frame shows the card first; biometric fires only on APPROVE',
+      (tester) async {
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    var authCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          authenticate: (_) async {
+            authCalls++;
+            return true;
+          },
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester);
+
+    // A newly-arrived request renders the card immediately; no biometric
+    // prompt is fired on arrival.
+    manager.pendingCtrl
+        .add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+
+    expect(authCalls, 0);
+    expect(find.text('desk'), findsOneWidget);
+    expect(
+      find.text(
+          'Request pending — review reason/command, then approve or deny.'),
+      findsOneWidget,
+    );
+
+    // Tapping APPROVE is what fires the biometric prompt; on success the
+    // signed decision is posted and the card clears.
+    await tester.tap(find.widgetWithText(FilledButton, 'APPROVE'));
+    await _settle(tester);
+
+    expect(authCalls, 1);
+    expect(find.text('desk'), findsNothing);
+    expect(find.text('No pending requests'), findsOneWidget);
 
     await _dispose(tester);
   });

@@ -1,8 +1,9 @@
 /// Multi-computer approval flow: the [ConnectionManager] keeps one TLS link
 /// per roster computer and aggregates their pending requests; this screen
 /// shows one card per request (tagged with the source computer) with a
-/// monotonic deadline countdown, pops the biometric prompt to approve, and
-/// reconciles cards that another phone decided or that expired. The gear menu
+/// monotonic deadline countdown, prompts for biometrics when the user taps
+/// APPROVE, and reconciles cards that another phone decided or that expired.
+/// The gear menu
 /// splits "forget this computer" (keeps the key) from "reset identity"
 /// (wipes the key + roster).
 library;
@@ -100,11 +101,11 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     final card = _RequestCard(session);
     setState(() {
       _cards.add(card);
-      _status = 'Request pending — approve or deny.';
+      _status =
+          'Request pending — review reason/command, then approve or deny.';
     });
-    // Pop the biometric prompt immediately, so a request is approved with a
-    // single fingerprint scan instead of a tap on APPROVE first.
-    unawaited(_approve(card));
+    // The card is shown first; the biometric prompt fires only when the user
+    // taps APPROVE (see _RequestCardView.onApprove).
   }
 
   void _onDecisionResult(DecisionResult result) {
