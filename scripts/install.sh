@@ -53,13 +53,16 @@ wire_pam_file() {
 
 echo "== build =="
 mkdir -p /usr/local/libexec
-go build -o "${DAEMON_BIN}" ./daemon
+# Build from the vendored copies: GOWORK=off exits workspace mode (which
+# forces -mod=readonly) so the builds use daemon/vendor and scripts/vendor
+# and never touch the network.
+( cd daemon && GOWORK=off go build -mod=vendor -o "${DAEMON_BIN}" . )
 chown root:root "${DAEMON_BIN}"
 chmod 0755 "${DAEMON_BIN}"
 echo "built ${DAEMON_BIN}"
 
 mkdir -p /usr/local/bin
-go build -o "${PAIR_BIN}" ./scripts/fingerkey
+( cd scripts/fingerkey && GOWORK=off go build -mod=vendor -o "${PAIR_BIN}" . )
 chown root:root "${PAIR_BIN}"
 chmod 0755 "${PAIR_BIN}"
 echo "built ${PAIR_BIN}"
