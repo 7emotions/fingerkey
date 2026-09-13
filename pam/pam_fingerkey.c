@@ -5,7 +5,7 @@
  * Flow:
  *   1. resolve PAM_USER / PAM_SERVICE / PAM_TTY (NULL or "unknown" -> "")
  *   2. show one PAM_TEXT_INFO "Approve on phone..." via PAM_CONV
- *   3. POST /v1/session {"user":...,"service":...,"tty":...}
+ *   3. POST /v1/session {"user":...,"service":...,"tty":...,"reason":...,"command":...}
  *   4. poll GET /v1/session/{id} every 500ms up to 60s
  *      - short-circuit on denied/expired
  *      - fail FAST on session-creation error (daemon down)
@@ -17,6 +17,7 @@
 #include <security/pam_modules.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,24 +34,48 @@
 #define IO_TIMEOUT_S     5
 #define RESP_BUF_SIZE    8192
 
+/* The self-reported reason the phone shows alongside the objective command.
+ * Untrusted: getenv() in a setuid PAM module returns attacker values, and
+ * sudo's env sanitization drops it unless sudoers env_keeps it. */
+#define REASON_ENV "FINGERKEY_REASON"
+
+/* Every body field is truncated to FIELD_MAX bytes before escaping, so an
+ * oversized value degrades instead of failing the session. ESC_BUF_SIZE is
+ * the worst case: all FIELD_MAX bytes escaping to 6-char \uXXXX runs. */
+#define FIELD_MAX   255
+#define ESC_BUF_SIZE (FIELD_MAX * 6 + 1)
+
 /* Module argument `socket=<path>` overrides the default daemon socket. */
 static const char *socket_path = SOCKET_PATH;
 
-/* Escape '"' and '\\' so usernames cannot break the JSON body. */
+/* Escape '"', '\\' and control characters (< 0x20, emitted as \uXXXX) so
+ * untrusted values cannot break the JSON body. */
 static int json_escape(const char *src, char *dst, size_t dst_cap)
 {
+    static const char hex[] = "0123456789abcdef";
     size_t i = 0;
 
     for (; *src != '\0'; src++) {
-        if (*src == '"' || *src == '\\') {
+        unsigned char c = (unsigned char)*src;
+
+        if (c < 0x20) {
+            if (i + 6 >= dst_cap)
+                return -1;
+            dst[i++] = '\\';
+            dst[i++] = 'u';
+            dst[i++] = '0';
+            dst[i++] = '0';
+            dst[i++] = hex[c >> 4];
+            dst[i++] = hex[c & 0x0f];
+        } else if (c == '"' || c == '\\') {
             if (i + 2 >= dst_cap)
                 return -1;
             dst[i++] = '\\';
-            dst[i++] = *src;
+            dst[i++] = (char)c;
         } else {
             if (i + 1 >= dst_cap)
                 return -1;
-            dst[i++] = *src;
+            dst[i++] = (char)c;
         }
     }
     dst[i] = '\0';
@@ -155,7 +180,7 @@ static int http_exchange(const char *method, const char *path, const char *body,
 {
     int fd;
     int reqlen;
-    char req[4096];
+    char req[8192];
 
     if (body != NULL) {
         reqlen = snprintf(req, sizeof(req),
@@ -200,6 +225,62 @@ static const char *canonicalize(const char *value)
     return value;
 }
 
+/* Copy at most max bytes (NUL-terminated) of src into dst. Fields are
+ * truncated to FIELD_MAX instead of failing the session. */
+static void truncate_field(const char *src, char *dst, size_t max)
+{
+    size_t len = strlen(src);
+
+    if (len > max)
+        len = max;
+    memmove(dst, src, len);
+    dst[len] = '\0';
+}
+
+/* Read /proc/self/cmdline (a NUL-separated argv stream) and join every
+ * argument after argv[0] (the "sudo"/"pkexec" wrapper) with spaces into
+ * dst. This is the objective command, unlike the self-reported reason.
+ * Robust: open/read failure or an empty stream leaves dst empty — never
+ * an error, and the output is capped at cap-1 bytes. */
+static void read_command(char *dst, size_t cap)
+{
+    char raw[4096];
+    ssize_t n;
+    size_t i = 0, out = 0;
+    int fd, first = 1;
+
+    dst[0] = '\0';
+    fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0)
+        return;
+    n = read(fd, raw, sizeof(raw) - 1);
+    close(fd);
+    if (n <= 0)
+        return;
+
+    while (i < (size_t)n) {
+        size_t start = i;
+
+        while (i < (size_t)n && raw[i] != '\0')
+            i++;
+        if (first) {
+            first = 0; /* skip argv[0]: the "sudo"/"pkexec" wrapper */
+        } else {
+            size_t alen = i - start;
+
+            if (out > 0 && out + 1 < cap)
+                dst[out++] = ' ';
+            if (alen > cap - out - 1)
+                alen = cap - out - 1;
+            memcpy(dst + out, raw + start, alen);
+            out += alen;
+        }
+        if (i < (size_t)n)
+            i++; /* step over the NUL separator */
+    }
+    dst[out] = '\0';
+}
+
 static void show_info(pam_handle_t *pamh)
 {
     static const struct pam_message msgs[] = {
@@ -226,21 +307,39 @@ static void show_info(pam_handle_t *pamh)
 static int create_session(const char *user, const char *service, const char *tty,
                           char *id, size_t id_cap)
 {
-    char esc_user[256], esc_service[256], esc_tty[256];
-    char body[1024];
+    char f_user[FIELD_MAX + 1], f_service[FIELD_MAX + 1], f_tty[FIELD_MAX + 1];
+    char f_reason[FIELD_MAX + 1], f_command[FIELD_MAX + 1];
+    char esc_user[ESC_BUF_SIZE], esc_service[ESC_BUF_SIZE], esc_tty[ESC_BUF_SIZE];
+    char esc_reason[ESC_BUF_SIZE], esc_command[ESC_BUF_SIZE];
+    char body[4096];
     char buf[RESP_BUF_SIZE];
+    const char *reason;
     char *resp_body = NULL, *idp;
     size_t i;
     int status = 0, n;
 
-    if (json_escape(user, esc_user, sizeof(esc_user)) != 0 ||
-        json_escape(service, esc_service, sizeof(esc_service)) != 0 ||
-        json_escape(tty, esc_tty, sizeof(esc_tty)) != 0)
+    /* reason: self-reported, untrusted (env var, absent for sshd/login/
+     * polkit unless sudoers env_keeps it). command: the objective cmdline.
+     * Every field is truncated to FIELD_MAX before escaping so a hostile
+     * or oversized value degrades to 255 bytes instead of failing. */
+    truncate_field(user, f_user, FIELD_MAX);
+    truncate_field(service, f_service, FIELD_MAX);
+    truncate_field(tty, f_tty, FIELD_MAX);
+    reason = canonicalize(getenv(REASON_ENV));
+    truncate_field(reason, f_reason, FIELD_MAX);
+    read_command(f_command, sizeof(f_command)); /* "" on any failure */
+
+    if (json_escape(f_user, esc_user, sizeof(esc_user)) != 0 ||
+        json_escape(f_service, esc_service, sizeof(esc_service)) != 0 ||
+        json_escape(f_tty, esc_tty, sizeof(esc_tty)) != 0 ||
+        json_escape(f_reason, esc_reason, sizeof(esc_reason)) != 0 ||
+        json_escape(f_command, esc_command, sizeof(esc_command)) != 0)
         return PAM_AUTH_ERR;
 
     n = snprintf(body, sizeof(body),
-                 "{\"user\":\"%s\",\"service\":\"%s\",\"tty\":\"%s\"}",
-                 esc_user, esc_service, esc_tty);
+                 "{\"user\":\"%s\",\"service\":\"%s\",\"tty\":\"%s\","
+                 "\"reason\":\"%s\",\"command\":\"%s\"}",
+                 esc_user, esc_service, esc_tty, esc_reason, esc_command);
     if (n < 0 || (size_t)n >= sizeof(body))
         return PAM_AUTH_ERR;
 

@@ -29,6 +29,7 @@ KEYS_DIR="${STATE_PARENT}/keys"
 TLS_DIR="${STATE_PARENT}/tls"
 DBUS_POLICY="/etc/dbus-1/system.d/phone-fprint-auth.conf"
 DBUS_POLICY_LEFTOVER="/etc/dbus-1/system.d/com.phonefprint.auth.conf"
+SUDOERS_DROPIN="/etc/sudoers.d/phone-fprint-auth"
 PAM_FILES=(
     "/etc/pam.d/sudo"
     "/etc/pam.d/polkit-1"
@@ -50,6 +51,16 @@ if ! dbus-send --system --type=method_call --print-reply \
     echo "warning: dbus ReloadConfig failed — check system bus" >&2
 fi
 echo "removed ${DBUS_POLICY} + ${DBUS_POLICY_LEFTOVER}, reloaded dbus"
+
+echo "== sudoers =="
+# Undo the install-time env_keep drop-in; without it sudo sanitizes
+# FINGERKEY_REASON away and the phone shows an empty reason.
+if [[ -e "${SUDOERS_DROPIN}" ]]; then
+    rm -f "${SUDOERS_DROPIN}"
+    echo "removed ${SUDOERS_DROPIN}"
+else
+    echo "${SUDOERS_DROPIN} not present — nothing to remove"
+fi
 
 # restore_pam_file puts back the newest .orig-* backup of a PAM service
 # file, or strips the pam_fingerkey.so line if no backup exists.
@@ -120,5 +131,6 @@ echo "== rollback complete =="
 echo "  unit:     disabled + removed"
 echo "  binaries: ${DAEMON_BIN}, ${PAIR_BIN}, ${PAM_MODULE} removed"
 echo "  dbus:     ${DBUS_POLICY} + ${DBUS_POLICY_LEFTOVER} removed, dbus reloaded"
+echo "  sudoers:  ${SUDOERS_DROPIN} removed"
 echo "  pam:      ${PAM_FILES[*]} restored from backup (or module line stripped)"
 echo "  state:    ${TLS_DIR} + ${KEYS_DIR} removed (${STATE_PARENT} left in place)"
