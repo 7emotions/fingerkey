@@ -1,0 +1,421 @@
+/// Cross-engine bridge between the headless background engine (inside
+/// `ApprovalForegroundService`) and the Activity's UI engine.
+///
+/// SINGLE OWNERSHIP: the daemon sockets live in the service engine only —
+/// its Dart isolate runs the real [ConnectionManager] and is the single
+/// frame consumer. The UI engine never dials for approvals. The two isolates
+/// talk over `dart:ui` [IsolateNameServer] ports, which the engine registers
+/// process-wide (natives, so it works across the two engines in one process):
+///
+///   - `phonefprint.service`: registered by the service isolate
+///     ([BackgroundLinkService]); receives RPC requests from the UI.
+///   - `phonefprint.ui`: registered by the UI isolate while an approval
+///     screen is alive; receives pushed events (pending / decision-result /
+///     unregistered) and RPC replies.
+///
+/// The UI still performs a direct TLS dial for QR pairing; that traffic is
+/// delegated at the channel level to the same process-wide [TcpTlsChannel]
+/// (see `TcpTlsChannelDelegate.kt`), so even pairing sockets are owned by
+/// the service engine.
+library;
+
+import 'dart:async';
+import 'dart:isolate';
+import 'dart:ui' as ui;
+
+import 'package:flutter/widgets.dart';
+
+import 'connection_manager.dart';
+import 'daemon_client.dart';
+import 'key_store.dart';
+
+/// Well-known port names for the cross-engine bridge. These must match the
+/// documentation above; they are process-local and never leave the device.
+const String kServicePortName = 'phonefprint.service';
+const String kUiPortName = 'phonefprint.ui';
+
+/// Entry point of the background link owner (the headless engine's isolate).
+/// Called from the `mainBackground()` Dart entrypoint that
+/// `ApprovalForegroundService` executes.
+Future<void> startBackgroundService() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final service = BackgroundLinkService();
+  await service.run();
+}
+
+/// The service engine's side of the bridge: runs the real [ConnectionManager],
+/// subscribes to its streams and forwards events to the UI isolate, and
+/// answers RPC requests (postDecision / forget / snapshot) from the UI.
+class BackgroundLinkService {
+  final ReceivePort _port = ReceivePort();
+
+  ConnectionManager? _manager;
+  KeyStore? _keyStore;
+
+  /// Most recent pending sessions, replayed to the UI on attach so a request
+  /// pushed while the UI was dead is not lost. Keyed by session id; pruned
+  /// on decision-result and on expiry.
+  final Map<String, PendingSession> _pendingCache = <String, PendingSession>{};
+  static const int _pendingCacheLimit = 100;
+
+  Future<void> run() async {
+    // Re-register in case a previous engine in this process left a stale name.
+    ui.IsolateNameServer.removePortNameMapping(kServicePortName);
+    ui.IsolateNameServer.registerPortWithName(_port.sendPort, kServicePortName);
+    _port.listen(_onMessage);
+    await _bootstrap();
+  }
+
+  /// Loads the shared identity and starts the link owner. Retries: the
+  /// entrypoint starts before the engine's plugins are attached on a cold
+  /// start, so the first secure-storage reads can miss the channel; and the
+  /// identity does not exist until the UI has generated it once.
+  Future<void> _bootstrap() async {
+    final keyStore = KeyStore();
+    DeviceIdentity? identity;
+    while (identity == null) {
+      try {
+        identity = await keyStore.load();
+      } catch (e) {
+        debugPrint('phone-fprint-auth: bg identity load failed: $e');
+      }
+      if (identity == null) {
+        await Future<void>.delayed(const Duration(seconds: 5));
+      }
+    }
+    _keyStore = keyStore;
+    final manager = ConnectionManager(keyStore: keyStore, identity: identity);
+    _manager = manager;
+    manager.pending().listen(_onPending);
+    manager.decisions().listen(_onDecision);
+    manager.unregistered().listen(_onUnregistered);
+    while (true) {
+      try {
+        await manager.start();
+        return;
+      } catch (e) {
+        debugPrint('phone-fprint-auth: bg link start failed: $e');
+        await Future<void>.delayed(const Duration(seconds: 5));
+      }
+    }
+  }
+
+  void _onPending(PendingSession session) {
+    final key = '${session.id}@${session.source ?? ''}';
+    if (_pendingCache.length >= _pendingCacheLimit) {
+      _pendingCache.remove(_pendingCache.keys.first);
+    }
+    _pendingCache[key] = session;
+    _pruneExpired();
+    _sendToUi(<String, dynamic>{'type': 'pending', 'session': session.toJson()});
+  }
+
+  void _onDecision(DecisionResult result) {
+    if (result.id != null) {
+      _pendingCache.remove('${result.id}@${result.source ?? ''}');
+    }
+    final source = result.source;
+    _sendToUi(<String, dynamic>{
+      'type': 'decision',
+      'result': result.toJson(),
+      'myKey': source == null ? null : _manager?.welcomeKeyFor(source),
+    });
+  }
+
+  void _onUnregistered(String fingerprint) {
+    _sendToUi(
+        <String, dynamic>{'type': 'unregistered', 'fingerprint': fingerprint});
+  }
+
+  void _pruneExpired() {
+    final now = DateTime.now();
+    _pendingCache.removeWhere((_, s) => s.expiresAt.isBefore(now));
+  }
+
+  void _sendToUi(Map<String, dynamic> message) {
+    final port = ui.IsolateNameServer.lookupPortByName(kUiPortName);
+    if (port == null) return;
+    port.send(message);
+  }
+
+  void _onMessage(dynamic raw) {
+    if (raw is! Map || raw['type'] != 'request') return;
+    unawaited(_handleRequest(raw));
+  }
+
+  Future<void> _handleRequest(Map<dynamic, dynamic> raw) async {
+    final id = raw['id'] as int?;
+    final replyTo = raw['replyTo'] as SendPort?;
+    final method = raw['method'] as String?;
+    final args = raw['args'];
+    final argMap = args is Map
+        ? Map<String, dynamic>.from(args)
+        : <String, dynamic>{};
+
+    void reply(dynamic value) => replyTo
+        ?.send(<String, dynamic>{'type': 'reply', 'id': id, 'value': value});
+    void replyError(Object error) => replyTo
+        ?.send(<String, dynamic>{'type': 'reply', 'id': id, 'error': '$error'});
+
+    final manager = _manager;
+    if (manager == null) {
+      replyError('background link not ready');
+      return;
+    }
+    try {
+      switch (method) {
+        case 'start':
+          await manager.start();
+          reply(null);
+        case 'snapshot':
+          _pruneExpired();
+          reply(_pendingCache.values.map((s) => s.toJson()).toList());
+        case 'welcomeKeys':
+          final keys = <String, String?>{};
+          for (final c in await _keyStore!.roster()) {
+            keys[c.fingerprint] = manager.welcomeKeyFor(c.fingerprint);
+          }
+          reply(keys);
+        case 'postDecision':
+          final session = PendingSession.fromJson(
+              Map<String, dynamic>.from(argMap['session'] as Map));
+          final result = await manager.postDecision(
+            session: session,
+            decision: argMap['decision'] as String,
+            signatureBase64: argMap['sig'] as String,
+          );
+          reply(result.toJson());
+        case 'forgetComputer':
+          await manager.forgetComputer(argMap['fingerprint'] as String);
+          reply(null);
+        default:
+          replyError('unknown method: $method');
+      }
+    } catch (e) {
+      replyError(e);
+    }
+  }
+}
+
+/// The UI engine's side of the bridge: consumes the service's pushed events,
+/// exposes them as streams, and issues RPC requests. Backed by
+/// [ServiceLinkManager] so [ApprovalScreen] keeps its [ConnectionManager]
+/// surface unchanged.
+class UiBridge {
+  ReceivePort? _port;
+  final StreamController<PendingSession> _pending =
+      StreamController<PendingSession>.broadcast();
+  final StreamController<DecisionResult> _decisions =
+      StreamController<DecisionResult>.broadcast();
+  final StreamController<String> _unregistered =
+      StreamController<String>.broadcast();
+  final Map<String, String> _welcomeKeys = <String, String>{};
+  final Map<int, Completer<Map<dynamic, dynamic>>> _inflight =
+      <int, Completer<Map<dynamic, dynamic>>>{};
+
+  int _nextRequestId = 0;
+  bool _attached = false;
+
+  Stream<PendingSession> get pendingStream => _pending.stream;
+  Stream<DecisionResult> get decisionsStream => _decisions.stream;
+  Stream<String> get unregisteredStream => _unregistered.stream;
+
+  /// Registers the UI port, replays the snapshot of currently pending
+  /// sessions, refreshes the welcome-key cache and asks the service to
+  /// (re)connect every roster computer. Throws when the service isolate is
+  /// not reachable yet; the caller retries, and a failed attach must not
+  /// close the exposed streams (they outlive the port).
+  Future<void> attach() async {
+    if (_attached) return;
+    ui.IsolateNameServer.removePortNameMapping(kUiPortName);
+    final port = ReceivePort();
+    ui.IsolateNameServer.registerPortWithName(port.sendPort, kUiPortName);
+    port.listen(_onMessage);
+    _port = port;
+    _attached = true;
+    try {
+      final keys = await _request('welcomeKeys', <String, dynamic>{});
+      if (keys is Map) {
+        keys.forEach((dynamic fp, dynamic key) {
+          if (fp is String && key is String) _welcomeKeys[fp] = key;
+        });
+      }
+      final snapshot = await _request('snapshot', <String, dynamic>{});
+      if (snapshot is List) {
+        for (final entry in snapshot) {
+          final session = PendingSession.fromJson(
+              Map<String, dynamic>.from(entry as Map));
+          _pending.add(session);
+        }
+      }
+      await _request('start', <String, dynamic>{});
+    } catch (e) {
+      await detach();
+      rethrow;
+    }
+  }
+
+  /// Unregisters and closes the UI port only; the streams stay open so a
+  /// later [attach] can replay into them.
+  Future<void> detach() async {
+    if (!_attached) return;
+    _attached = false;
+    ui.IsolateNameServer.removePortNameMapping(kUiPortName);
+    _port?.close();
+    _port = null;
+    for (final c in _inflight.values) {
+      if (!c.isCompleted) c.completeError(StateError('bridge detached'));
+    }
+    _inflight.clear();
+  }
+
+  /// Final teardown: detach and close the exposed streams.
+  Future<void> dispose() async {
+    await detach();
+    if (!_pending.isClosed) await _pending.close();
+    if (!_decisions.isClosed) await _decisions.close();
+    if (!_unregistered.isClosed) await _unregistered.close();
+  }
+
+  Future<dynamic> _request(
+    String method,
+    Map<String, dynamic> args, {
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final replyPort = _port;
+    if (replyPort == null) {
+      throw StateError('ui bridge not attached');
+    }
+    final service = ui.IsolateNameServer.lookupPortByName(kServicePortName);
+    if (service == null) {
+      throw StateError('background service isolate not registered');
+    }
+    final id = _nextRequestId++;
+    final completer = Completer<Map<dynamic, dynamic>>();
+    _inflight[id] = completer;
+    service.send(<String, dynamic>{
+      'type': 'request',
+      'id': id,
+      'method': method,
+      'args': args,
+      'replyTo': replyPort.sendPort,
+    });
+    final reply = await completer.future.timeout(timeout);
+    _inflight.remove(id);
+    final error = reply['error'];
+    if (error != null) throw StateError('$error');
+    return reply['value'];
+  }
+
+  void _onMessage(dynamic raw) {
+    if (raw is! Map) return;
+    switch (raw['type']) {
+      case 'reply':
+        final id = raw['id'];
+        final completer = id is int ? _inflight[id] : null;
+        completer?.complete(Map<dynamic, dynamic>.from(raw));
+      case 'pending':
+        final session = raw['session'];
+        if (session is Map && !_pending.isClosed) {
+          _pending.add(
+              PendingSession.fromJson(Map<String, dynamic>.from(session)));
+        }
+      case 'decision':
+        final result = raw['result'];
+        if (result is Map && !_decisions.isClosed) {
+          _decisions.add(
+              DecisionResult.fromJson(Map<String, dynamic>.from(result)));
+        }
+        final myKey = raw['myKey'];
+        final source = (raw['result'] as Map?)?['source'];
+        if (myKey is String && source is String) _welcomeKeys[source] = myKey;
+      case 'unregistered':
+        final fingerprint = raw['fingerprint'];
+        if (fingerprint is String && !_unregistered.isClosed) {
+          _unregistered.add(fingerprint);
+        }
+    }
+  }
+
+  String? welcomeKeyFor(String fingerprint) => _welcomeKeys[fingerprint];
+
+  Future<DecisionResult> postDecision({
+    required PendingSession session,
+    required String decision,
+    required String signatureBase64,
+  }) async {
+    final value = await _request(
+      'postDecision',
+      <String, dynamic>{
+        'session': session.toJson(),
+        'decision': decision,
+        'sig': signatureBase64,
+      },
+      timeout: const Duration(seconds: 20),
+    );
+    return DecisionResult.fromJson(Map<String, dynamic>.from(value as Map));
+  }
+
+  Future<void> forgetComputer(String fingerprint) =>
+      _request('forgetComputer', <String, dynamic>{'fingerprint': fingerprint});
+}
+
+/// UI-engine facade with the [ConnectionManager] surface. The approval screen
+/// keeps talking to a [ConnectionManager]; in production this implementation
+/// never dials — every operation rides the bridge to the service engine, the
+/// single socket owner.
+class ServiceLinkManager extends ConnectionManager {
+  ServiceLinkManager({required super.keyStore, required super.identity});
+
+  final UiBridge _bridge = UiBridge();
+  Timer? _attachRetry;
+
+  @override
+  Future<void> start() => _attachWithRetry();
+
+  Future<void> _attachWithRetry() async {
+    _attachRetry?.cancel();
+    try {
+      await _bridge.attach();
+    } catch (e) {
+      debugPrint('phone-fprint-auth: ui bridge attach failed: $e');
+      _attachRetry = Timer(
+          const Duration(seconds: 5), () => unawaited(_attachWithRetry()));
+    }
+  }
+
+  @override
+  Stream<PendingSession> pending() => _bridge.pendingStream;
+
+  @override
+  Stream<DecisionResult> decisions() => _bridge.decisionsStream;
+
+  @override
+  Stream<String> unregistered() => _bridge.unregisteredStream;
+
+  @override
+  String? welcomeKeyFor(String fingerprint) => _bridge.welcomeKeyFor(fingerprint);
+
+  @override
+  Future<DecisionResult> postDecision({
+    required PendingSession session,
+    required String decision,
+    required String signatureBase64,
+  }) =>
+      _bridge.postDecision(
+        session: session,
+        decision: decision,
+        signatureBase64: signatureBase64,
+      );
+
+  @override
+  Future<void> forgetComputer(String fingerprint) =>
+      _bridge.forgetComputer(fingerprint);
+
+  @override
+  Future<void> dispose() async {
+    _attachRetry?.cancel();
+    _attachRetry = null;
+    await _bridge.dispose();
+  }
+}

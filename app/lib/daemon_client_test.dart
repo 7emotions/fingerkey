@@ -356,4 +356,39 @@ void main() {
     await client.dispose();
     await link.close();
   });
+
+  test('PendingSession survives the bridge JSON round-trip', () {
+    final original = PendingSession.fromFrameJson(
+      json.decode(_pendingJson('s7')) as Map<String, dynamic>,
+      source: 'fp1',
+      sourceName: 'desk',
+    );
+    final copy = PendingSession.fromJson(
+        Map<String, dynamic>.from(original.toJson()));
+
+    expect(copy.id, original.id);
+    expect(copy.nonce, original.nonce);
+    expect(copy.user, 'alice');
+    expect(copy.service, 'sudo');
+    expect(copy.tty, original.tty);
+    expect(copy.reason, original.reason);
+    expect(copy.command, original.command);
+    expect(copy.expiresAt, original.expiresAt);
+    expect(copy.source, 'fp1');
+    expect(copy.sourceName, 'desk');
+  });
+
+  test('DecisionResult survives the bridge JSON round-trip', () {
+    const original = DecisionResult(
+        id: 's7', status: 'approved', key: 'mypc', error: null, source: 'fp1');
+    final copy = DecisionResult.fromJson(
+        Map<String, dynamic>.from(original.toJson()));
+
+    expect(copy.id, 's7');
+    expect(copy.status, 'approved');
+    expect(copy.key, 'mypc');
+    expect(copy.error, isNull);
+    expect(copy.source, 'fp1');
+    expect(copy.isError, isFalse);
+  });
 }

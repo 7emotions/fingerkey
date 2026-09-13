@@ -5,10 +5,24 @@ import 'package:flutter/material.dart';
 import 'approval_screen.dart';
 import 'key_store.dart';
 import 'pairing_screen.dart';
+import 'service_bridge.dart';
 
 void main() {
   runApp(const PhoneFprintApp());
 }
+
+/// Background entrypoint executed by the headless engine inside
+/// `ApprovalForegroundService` (Android) via
+/// `DartExecutor.DartEntrypoint(path, "mainBackground")`. This isolate is the
+/// single socket owner: it runs the real [ConnectionManager] over the
+/// service-engine's TcpTlsChannel and forwards pending/decision events to the
+/// UI engine over the cross-engine bridge (service_bridge.dart). No UI is
+/// created here and no biometric prompt may run in this isolate.
+///
+/// The entry point is only referenced from Kotlin by name, so it must be
+/// marked for the VM or release-mode tree-shaking would strip it.
+@pragma('vm:entry-point')
+Future<void> mainBackground() => startBackgroundService();
 
 class PhoneFprintApp extends StatefulWidget {
   const PhoneFprintApp({super.key});

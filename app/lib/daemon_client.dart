@@ -76,6 +76,36 @@ class PendingSession {
   /// The source computer's display name (mirrors [source]).
   final String? sourceName;
 
+  /// Plain-JSON form for the cross-engine bridge (service engine → UI engine
+  /// and UI → service decision RPC); [nonce] travels as base64.
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'id': id,
+        'nonce': base64.encode(nonce),
+        'user': user,
+        'service': service,
+        'tty': tty,
+        'reason': reason,
+        'command': command,
+        'expiresAt': expiresAt.millisecondsSinceEpoch,
+        'source': source,
+        'sourceName': sourceName,
+      };
+
+  /// Inverse of [toJson]; used by the UI engine to replay bridged sessions.
+  factory PendingSession.fromJson(Map<String, dynamic> json) => PendingSession(
+        id: json['id'] as String,
+        nonce: base64.decode(json['nonce'] as String),
+        user: json['user'] as String? ?? '',
+        service: json['service'] as String? ?? '',
+        tty: json['tty'] as String? ?? '',
+        reason: json['reason'] as String? ?? '',
+        command: json['command'] as String? ?? '',
+        expiresAt:
+            DateTime.fromMillisecondsSinceEpoch(json['expiresAt'] as int),
+        source: json['source'] as String?,
+        sourceName: json['sourceName'] as String?,
+      );
+
   static DateTime _unixSeconds(dynamic v) {
     if (v is int) return DateTime.fromMillisecondsSinceEpoch(v * 1000);
     if (v is num) return DateTime.fromMillisecondsSinceEpoch((v * 1000).round());
@@ -109,6 +139,24 @@ class DecisionResult {
 
   /// Which roster computer this result came from (its TLS fingerprint).
   final String? source;
+
+  /// Plain-JSON form for the cross-engine bridge.
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'id': id,
+        'status': status,
+        'key': key,
+        'error': error,
+        'source': source,
+      };
+
+  /// Inverse of [toJson].
+  factory DecisionResult.fromJson(Map<String, dynamic> json) => DecisionResult(
+        id: json['id'] as String?,
+        status: json['status'] as String?,
+        key: json['key'] as String?,
+        error: json['error'] as String?,
+        source: json['source'] as String?,
+      );
 
   /// True when the daemon rejected the decision.
   bool get isError => error != null;

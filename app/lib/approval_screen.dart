@@ -18,6 +18,7 @@ import 'connection_manager.dart';
 import 'daemon_client.dart';
 import 'format.dart';
 import 'key_store.dart';
+import 'service_bridge.dart';
 import 'settings_screen.dart';
 
 class ApprovalScreen extends StatefulWidget {
@@ -63,9 +64,12 @@ class ApprovalScreen extends StatefulWidget {
 }
 
 class _ApprovalScreenState extends State<ApprovalScreen> {
+  // In production the UI engine never dials: the foreground service's
+  // headless engine owns every socket, and this facade rides the
+  // cross-engine bridge (pending stream + decision RPC) instead.
   late final ConnectionManager _manager =
       widget.manager ??
-      ConnectionManager(keyStore: widget.keyStore, identity: widget.identity);
+      ServiceLinkManager(keyStore: widget.keyStore, identity: widget.identity);
 
   final LocalAuthentication _auth = LocalAuthentication();
 
