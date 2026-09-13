@@ -1,7 +1,10 @@
 package com.phonefprint.auth
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -26,6 +29,10 @@ import io.flutter.plugins.GeneratedPluginRegistrant
  */
 class MainActivity : FlutterFragmentActivity() {
 
+    companion object {
+        private const val REQUEST_POST_NOTIFICATIONS = 1401
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Keep the approval link alive whenever the app is in use.
@@ -33,6 +40,19 @@ class MainActivity : FlutterFragmentActivity() {
         // An overlay APPROVE tap launches this Activity with the session
         // payload; store it for the Dart approval flow (task 12).
         OverlayLaunchBridge.ingest(intent)
+        // Android 13+ (API 33) hides notifications until the user grants
+        // POST_NOTIFICATIONS at runtime. Request it here on first launch so
+        // the high-priority approval heads-up (ApprovalNotifier) is not
+        // silently dropped on fresh installs.
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                REQUEST_POST_NOTIFICATIONS,
+            )
+        }
     }
 
     override fun onNewIntent(intent: Intent) {

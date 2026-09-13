@@ -23,9 +23,10 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
  * isolate is not attached (app backgrounded/killed), the service engine
  * posts this heads-up notification AND shows the overlay card. The `sound`
  * flag mirrors the persisted `soundEnabled` preference read by the Dart
- * side; when false this post is silent even though the channel carries the
- * default sound. The channel is high importance (heads-up + default sound);
- * the persistent low-importance `approval_link` FGS channel is untouched.
+ * side and picks between two high-importance channels — `approval` (default
+ * sound) and `approval_silent` (muted) — because Android 8+ makes a
+ * channel's sound immutable after first creation. The persistent
+ * low-importance `approval_link` FGS channel is untouched.
  *
  * SINGLE OWNERSHIP: like [OverlayWindow], exactly one instance exists per
  * process, held by [EngineHolder] and attached to the headless engine of
@@ -37,8 +38,15 @@ class ApprovalNotifier(context: Context? = null) :
     companion object {
         const val METHOD_CHANNEL = "com.phonefprint.auth/notify"
 
-        /** High-importance alert channel for incoming requests. */
+        /**
+         * High-importance alert channels for incoming requests. Two channels
+         * are needed because Android 8+ makes a channel's sound immutable
+         * after first creation: `approval` carries the default notification
+         * sound, `approval_silent` is silent. The per-post `sound` flag from
+         * the Dart side picks the channel.
+         */
         private const val CHANNEL_ID = "approval"
+        private const val CHANNEL_ID_SILENT = "approval_silent"
 
         /** Base offset for per-request notification ids (the FGS uses 1001). */
         private const val NOTIFICATION_ID_BASE = 2000
@@ -88,6 +96,38 @@ class ApprovalNotifier(context: Context? = null) :
 
     // ---- notification ----------------------------------------------------
 
+    /**
+     * Creates the two high-importance channels on Android 8+. Sound is
+     * immutable after creation, so one channel carries the default sound and
+     * the other is silent; the per-post `sound` flag picks between them. The
+     * low-importance `approval_link` FGS channel is untouched.
+     */
+    private fun ensureChannels(nm: NotificationManager) {
+        nm.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_ID,
+                "Approval requests",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Incoming sudo/pkexec approval requests"
+                setSound(
+                    Settings.System.DEFAULT_NOTIFICATION_URI,
+                    Notification.AUDIO_ATTRIBUTES_DEFAULT,
+                )
+            },
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_ID_SILENT,
+                "Approval requests (silent)",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Incoming sudo/pkexec approval requests without sound"
+                setSound(null, null)
+            },
+        )
+    }
+
     private fun postApprovalNotification(
         context: Context,
         id: String,
@@ -98,29 +138,14 @@ class ApprovalNotifier(context: Context? = null) :
         sound: Boolean,
     ) {
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // IMPORTANCE_HIGH brings the heads-up behaviour. The channel's
-            // sound is mutable after creation, so re-submitting it with the
-            // current soundEnabled gate silences (or restores) the alert per
-            // post — the per-post `sound` flag from the Dart side. The
-            // low-importance `approval_link` FGS channel is untouched.
-            nm.createNotificationChannel(
-                NotificationChannel(
-                    CHANNEL_ID,
-                    "Approval requests",
-                    NotificationManager.IMPORTANCE_HIGH,
-                ).apply {
-                    description = "Incoming sudo/pkexec approval requests"
-                    if (sound) {
-                        setSound(
-                            Settings.System.DEFAULT_NOTIFICATION_URI,
-                            Notification.AUDIO_ATTRIBUTES_DEFAULT,
-                        )
-                    } else {
-                        setSound(null, null)
-                    }
-                },
-            )
+        // Android 8+ ignores channel sound changes after the channel exists,
+        // so the sound decision is made by choosing between two pre-created
+        // channels instead of mutating one.
+        val channelId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ensureChannels(nm)
+            if (sound) CHANNEL_ID else CHANNEL_ID_SILENT
+        } else {
+            CHANNEL_ID
         }
 
         val title = when {
@@ -143,7 +168,7 @@ class ApprovalNotifier(context: Context? = null) :
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(context, CHANNEL_ID)
+            Notification.Builder(context, channelId)
         } else {
             @Suppress("DEPRECATION")
             Notification.Builder(context)

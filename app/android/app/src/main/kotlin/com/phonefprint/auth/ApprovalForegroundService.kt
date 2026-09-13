@@ -91,8 +91,8 @@ class ApprovalForegroundService : Service() {
         }
 
         // Android 13+ hides the notification until POST_NOTIFICATIONS is
-        // granted, but the service still runs; that permission is surfaced
-        // to the user by the UI, not here.
+        // granted, but the service still runs; the permission is requested
+        // by MainActivity on launch.
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(
                 NOTIFICATION_ID,
