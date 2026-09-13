@@ -57,6 +57,7 @@ class _FakeManager extends ConnectionManager {
   final StreamController<String> unregisteredCtrl =
       StreamController<String>.broadcast();
   final List<String> forgotten = <String>[];
+  final List<String> postedDecisions = <String>[];
   String myKey = 'mypc';
 
   @override
@@ -79,8 +80,10 @@ class _FakeManager extends ConnectionManager {
     required PendingSession session,
     required String decision,
     required String signatureBase64,
-  }) async =>
-      DecisionResult(id: session.id, status: decision, key: myKey);
+  }) async {
+    postedDecisions.add(decision);
+    return DecisionResult(id: session.id, status: decision, key: myKey);
+  }
 
   @override
   Future<void> forgetComputer(String fingerprint) async {
@@ -350,6 +353,86 @@ void main() {
     expect(find.text('desk'), findsNothing);
     expect(find.text('密钥已失效'), findsOneWidget);
     expect(find.textContaining('不再认可此密钥'), findsOneWidget);
+
+    await _dispose(tester);
+  });
+
+  testWidgets('swipe-to-dismiss removes the card locally, sends no decision',
+      (tester) async {
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          authenticate: (_) async => false,
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester);
+
+    manager.pendingCtrl.add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+    expect(find.text('desk'), findsOneWidget);
+
+    await tester.drag(find.byType(Dismissible), const Offset(-500, 0));
+    await tester.pumpAndSettle();
+
+    expect(find.text('desk'), findsNothing);
+    expect(find.text('No pending requests'), findsOneWidget);
+    expect(manager.postedDecisions, isEmpty);
+
+    await _dispose(tester);
+  });
+
+  testWidgets('clear-all X empties the list and is a no-op when empty',
+      (tester) async {
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          authenticate: (_) async => false,
+          onReset: () {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester);
+
+    // No-op on an empty list: no crash, no decision, empty state stays.
+    await tester.tap(find.byIcon(Icons.close));
+    await _settle(tester);
+    expect(find.text('No pending requests'), findsOneWidget);
+    expect(manager.postedDecisions, isEmpty);
+
+    manager.pendingCtrl.add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    manager.pendingCtrl.add(
+        _pending(id: 's2', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+    expect(find.byType(Card), findsNWidgets(2));
+
+    await tester.tap(find.byIcon(Icons.close));
+    await _settle(tester);
+
+    expect(find.text('No pending requests'), findsOneWidget);
+    expect(find.byType(Card), findsNothing);
+    expect(manager.postedDecisions, isEmpty);
 
     await _dispose(tester);
   });

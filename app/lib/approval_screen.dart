@@ -335,6 +335,11 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
         title: const Text('PHONE FPRINT AUTH'),
         actions: [
           IconButton(
+            tooltip: 'Clear all requests',
+            icon: const Icon(Icons.close),
+            onPressed: () => _removeCardsWhere((_) => true),
+          ),
+          IconButton(
             tooltip: 'Settings',
             icon: const Icon(Icons.settings),
             onPressed: _showMenu,
@@ -369,11 +374,16 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
                     : ListView(
                         children: [
                           for (final card in _cards)
-                            _RequestCardView(
-                              card: card,
-                              busy: _busy,
-                              onApprove: () => _approve(card),
-                              onDeny: () => _deny(card),
+                            Dismissible(
+                              key: ValueKey(
+                                  '${card.session.id}:${card.session.source}'),
+                              onDismissed: (_) => _removeCard(card),
+                              child: _RequestCardView(
+                                card: card,
+                                busy: _busy,
+                                onApprove: () => _approve(card),
+                                onDeny: () => _deny(card),
+                              ),
                             ),
                         ],
                       ),
