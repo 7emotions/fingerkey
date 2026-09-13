@@ -19,7 +19,7 @@ func TestStoreSubscribeBroadcast(t *testing.T) {
 	ch2, unsub2 := st.Subscribe()
 	defer unsub2()
 
-	s, err := st.Create("alice", "sudo", "")
+	s, err := st.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestStoreSubscribeUnsubscribe(t *testing.T) {
 	unsub()
 	unsub() // idempotent: second call must not panic
 
-	if _, err := st.Create("alice", "sudo", ""); err != nil {
+	if _, err := st.Create("alice", "sudo", "", "", ""); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	select {
@@ -63,11 +63,11 @@ func TestStoreSubscribeSkipWhenFull(t *testing.T) {
 	ch, unsub := st.Subscribe()
 	defer unsub()
 
-	first, err := st.Create("alice", "sudo", "")
+	first, err := st.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("first Create: %v", err)
 	}
-	second, err := st.Create("bob", "su", "")
+	second, err := st.Create("bob", "su", "", "", "")
 	if err != nil {
 		t.Fatalf("second Create: %v", err)
 	}
@@ -102,7 +102,7 @@ func testDecideStore(t *testing.T) (*Store, *keyProvider, ed25519.PrivateKey, *S
 	store := NewStore()
 	pub, priv := newKey(t)
 	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
-	s, err := store.Create("alice", "sudo", "")
+	s, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestDecideNoPhoneLink503(t *testing.T) {
 func TestDecideUnpairedKeyMissingDir(t *testing.T) {
 	store := NewStore()
 	_, priv := newKey(t)
-	s, err := store.Create("alice", "sudo", "")
+	s, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -17,7 +18,7 @@ import (
 
 func TestCreateSession(t *testing.T) {
 	st := NewStore()
-	s, err := st.Create("alice", "sudo", "/dev/pts/0")
+	s, err := st.Create("alice", "sudo", "/dev/pts/0", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -50,7 +51,7 @@ func TestSessionExpiry(t *testing.T) {
 	defer func() { sessionTTL = old }()
 
 	st := NewStore()
-	s, err := st.Create("alice", "", "")
+	s, err := st.Create("alice", "", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -62,7 +63,7 @@ func TestSessionExpiry(t *testing.T) {
 
 func TestApprovePendingToApproved(t *testing.T) {
 	st := NewStore()
-	s, err := st.Create("alice", "sudo", "")
+	s, err := st.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -80,7 +81,7 @@ func TestApprovePendingToApproved(t *testing.T) {
 
 func TestApproveOnceOnly(t *testing.T) {
 	st := NewStore()
-	s, err := st.Create("alice", "sudo", "")
+	s, err := st.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -101,7 +102,7 @@ func TestApproveOnceOnly(t *testing.T) {
 
 func TestDecideDeny(t *testing.T) {
 	st := NewStore()
-	s, err := st.Create("alice", "sudo", "")
+	s, err := st.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -135,15 +136,15 @@ func TestUnknownSession(t *testing.T) {
 // sessions, oldest first; decided and expired ones are excluded.
 func TestStorePending(t *testing.T) {
 	st := NewStore()
-	first, err := st.Create("alice", "sudo", "")
+	first, err := st.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	second, err := st.Create("bob", "su", "")
+	second, err := st.Create("bob", "su", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	third, err := st.Create("carol", "pkexec", "")
+	third, err := st.Create("carol", "pkexec", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -169,7 +170,7 @@ func TestStorePendingExcludesExpired(t *testing.T) {
 	defer func() { sessionTTL = old }()
 
 	st := NewStore()
-	if _, err := st.Create("alice", "sudo", ""); err != nil {
+	if _, err := st.Create("alice", "sudo", "", "", ""); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -188,7 +189,7 @@ func TestStoreBoundEvictsOldestTerminal(t *testing.T) {
 	st := NewStore()
 	var terminals []*Session
 	for i := 0; i < 4; i++ {
-		s, err := st.Create("alice", "sudo", "")
+		s, err := st.Create("alice", "sudo", "", "", "")
 		if err != nil {
 			t.Fatalf("Create #%d: %v", i, err)
 		}
@@ -198,7 +199,7 @@ func TestStoreBoundEvictsOldestTerminal(t *testing.T) {
 		terminals = append(terminals, s)
 	}
 
-	fresh, err := st.Create("alice", "sudo", "")
+	fresh, err := st.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create at bound: %v", err)
 	}
@@ -224,11 +225,11 @@ func TestStoreFullRejects(t *testing.T) {
 
 	st := NewStore()
 	for i := 0; i < 3; i++ {
-		if _, err := st.Create("alice", "sudo", ""); err != nil {
+		if _, err := st.Create("alice", "sudo", "", "", ""); err != nil {
 			t.Fatalf("Create #%d: %v", i, err)
 		}
 	}
-	if _, err := st.Create("alice", "sudo", ""); err != errStoreFull {
+	if _, err := st.Create("alice", "sudo", "", "", ""); err != errStoreFull {
 		t.Fatalf("Create at bound err = %v, want errStoreFull", err)
 	}
 }
@@ -241,12 +242,12 @@ func TestStoreExpiredEvictedOnCreate(t *testing.T) {
 	defer func() { sessionTTL = old }()
 
 	st := NewStore()
-	expired, err := st.Create("alice", "sudo", "")
+	expired, err := st.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if _, err := st.Create("alice", "sudo", ""); err != nil {
+	if _, err := st.Create("alice", "sudo", "", "", ""); err != nil {
 		t.Fatalf("Create after expiry: %v", err)
 	}
 	if _, ok := st.Get(expired.ID); ok {
@@ -355,7 +356,7 @@ func TestHandlerCreateSessionDefaults(t *testing.T) {
 
 func TestHandlerGetSession(t *testing.T) {
 	env := newTestServer(t)
-	s, err := env.store.Create("alice", "sudo", "/dev/pts/0")
+	s, err := env.store.Create("alice", "sudo", "/dev/pts/0", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -386,7 +387,7 @@ func TestHandlerGetUnknownSession(t *testing.T) {
 // The T0 unsigned approve endpoint must be GONE.
 func TestHandlerNoUnsignedApprove(t *testing.T) {
 	env := newTestServer(t)
-	s, err := env.store.Create("alice", "sudo", "")
+	s, err := env.store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -402,7 +403,7 @@ func TestHandlerSessionExpiredStatus(t *testing.T) {
 	defer func() { sessionTTL = old }()
 
 	env := newTestServer(t)
-	s, err := env.store.Create("alice", "", "")
+	s, err := env.store.Create("alice", "", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -415,5 +416,61 @@ func TestHandlerSessionExpiredStatus(t *testing.T) {
 	m := decodeJSON(t, resp)
 	if m["status"] != StatusExpired {
 		t.Errorf("status = %v, want %q", m["status"], StatusExpired)
+	}
+}
+
+// TestPendingFrameReasonCommandRoundTrip: a session created with reason and
+// command carries them in its pending frame JSON; empty reason/command are
+// omitted from the wire frame.
+func TestPendingFrameReasonCommandRoundTrip(t *testing.T) {
+	st := NewStore()
+	s, err := st.Create("alice", "sudo", "/dev/pts/0", "weekly update", "sudo apt upgrade")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if s.Reason != "weekly update" || s.Command != "sudo apt upgrade" {
+		t.Fatalf("stored reason/command = %q/%q", s.Reason, s.Command)
+	}
+
+	payload := frameJSON(pendingFrameFromSession(s))
+	if !bytes.Contains(payload, []byte(`"reason":"weekly update"`)) {
+		t.Errorf("frame must carry reason: %s", payload)
+	}
+	if !bytes.Contains(payload, []byte(`"command":"sudo apt upgrade"`)) {
+		t.Errorf("frame must carry command: %s", payload)
+	}
+
+	empty, err := st.Create("bob", "su", "", "", "")
+	if err != nil {
+		t.Fatalf("Create(empty reason/command): %v", err)
+	}
+	payload = frameJSON(pendingFrameFromSession(empty))
+	if bytes.Contains(payload, []byte(`"reason"`)) {
+		t.Errorf("empty reason must be omitted from the frame: %s", payload)
+	}
+	if bytes.Contains(payload, []byte(`"command"`)) {
+		t.Errorf("empty command must be omitted from the frame: %s", payload)
+	}
+}
+
+// TestHandlerCreateSessionReasonCommand: reason and command sent to
+// POST /v1/session are stored on the session as display-only context.
+func TestHandlerCreateSessionReasonCommand(t *testing.T) {
+	env := newTestServer(t)
+	linkPhone(t)
+	resp := postJSON(t, env.local.URL+"/v1/session",
+		`{"user":"alice","service":"sudo","tty":"/dev/pts/0","reason":"weekly update","command":"sudo apt upgrade"}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	m := decodeJSON(t, resp)
+	id, _ := m["id"].(string)
+	s, ok := env.store.Get(id)
+	if !ok {
+		t.Fatal("created session not found in store")
+	}
+	if s.Reason != "weekly update" || s.Command != "sudo apt upgrade" {
+		t.Errorf("stored reason/command = %q/%q, want %q/%q",
+			s.Reason, s.Command, "weekly update", "sudo apt upgrade")
 	}
 }

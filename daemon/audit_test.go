@@ -69,7 +69,7 @@ func TestAuditDecisionApprove(t *testing.T) {
 	store := NewStore()
 	pub, priv := newKey(t)
 	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
-	s, err := store.Create("alice", "sudo", "")
+	s, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestAuditDecisionFailed(t *testing.T) {
 	store := NewStore()
 	pub, _ := newKey(t)
 	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
-	s, err := store.Create("alice", "sudo", "")
+	s, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestAuditDecisionFailedSanitizesID(t *testing.T) {
 	store := NewStore()
 	pub, _ := newKey(t)
 	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
-	s, err := store.Create("alice", "sudo", "")
+	s, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

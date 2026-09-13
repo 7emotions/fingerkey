@@ -421,7 +421,7 @@ func TestPhoneLinkTokenRegisteredReceivesPendingAndDecides(t *testing.T) {
 		t.Fatalf("registered.key = %q, want pixel-8", reg.Key)
 	}
 
-	s, err := store.Create("alice", "sudo", "")
+	s, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
