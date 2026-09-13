@@ -73,7 +73,7 @@ flowchart LR
 | `scripts/install.sh` | Root install: builds and installs the daemon, pair CLI and PAM module; creates the `phonefprint` user plus the key and TLS directories; installs and starts the systemd unit (TLS on `:4443`); wires the module into `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`. |
 | `scripts/rollback.sh` | Reverses the install and restores the original PAM files. |
 | `scripts/e2e-local.sh` | One-command local end-to-end test (no root, no phone): builds the daemon and simulator into a throwaway tmpdir and runs the approve, deny, reconnect, unregistered-gating, timeout and wrong-fingerprint scenarios. Needs `go`, `curl` and `jq`; about 90 seconds. |
-| `scripts/fingerkey/` | Pair CLI (root): `pair-qr <name>`, `pair <name> <pubkey_b64>`, `list`, `remove <name>`. |
+| `scripts/fingerkey/` | Pair CLI: `pair-qr <name>`, `pair <name> <pubkey_b64>`, `list`, `remove <name>` (pair, remove and pair-qr need root; list does not). |
 | `scripts/phone-sim/` | Simulator for testing. Dials the daemon's TLS listener, pins it by fingerprint, and speaks the same framed protocol as the app: `-addr <host:port> -fp <hex> -key <priv_b64> [-decision approve|deny|hold] [-once]`; `-keygen` prints a fresh keypair. |
 | `scripts/format/` | Shared Go helper for the pinned signed-message byte format, used by the simulator. |
 | `app/` | Flutter Android app **FingerKey** (package `com.phonefprint.auth`). Scans the pairing QR, pins the certificate fingerprint, connects to every reachable computer, and signs approvals with BiometricPrompt. |
@@ -108,7 +108,7 @@ Run as root (the script refuses otherwise; `sudo` is fine). The script is **idem
 
 1. Builds `fingerkeyd`, the `fingerkey` pair CLI, and the PAM module (`make -C pam`).
 2. Creates the system user `phonefprint` (no home, `nologin`).
-3. Creates `/var/lib/phone-fprint-auth` (0755), plus `keys/` and `tls/` (both `phonefprint` 0700).
+3. Creates `/var/lib/phone-fprint-auth` (0755), plus `keys/` (`phonefprint` 0755, world-listable) and `tls/` (`phonefprint` 0700).
 4. Installs the daemon to `/usr/local/libexec/fingerkeyd`, the pair CLI to `/usr/local/bin/fingerkey`, the module to `/usr/lib/x86_64-linux-gnu/security/pam_fingerkey.so`, and the systemd unit to `/etc/systemd/system/fingerkeyd.service`.
 5. Enables and starts `fingerkeyd` as `phonefprint`, listening on `:4443` for TLS plus the root-only unix socket.
 6. Waits for `/run/phone-fprint-auth/daemon.sock`, then inserts `auth sufficient pam_fingerkey.so` as the first auth line in both `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`.
@@ -138,11 +138,11 @@ There is no copy-paste step and no daemon restart. Paired keys are read on every
 Manage paired phones:
 
 ```sh
-sudo fingerkey list              # names of paired keys
+fingerkey list                   # names of paired keys
 sudo fingerkey remove my-phone   # unpair; takes effect immediately
 ```
 
-`pair <name> <pubkey_b64>` still works for registering a key by hand. `pair`, `remove`, `pair-qr` and `list` all require root (the key store is root/`phonefprint`-owned).
+`pair <name> <pubkey_b64>` still works for registering a key by hand. `pair`, `remove`, and `pair-qr` require root (they write the root/`phonefprint`-owned key store); `list` does not.
 
 ## Usage
 

@@ -40,8 +40,11 @@ fi
 
 echo "== key store + tls dirs =="
 install -d -m 0755 "${KEYS_PARENT}"
-install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${KEYS_DIR}"
+install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0755 "${KEYS_DIR}"
 install -d -o "${DAEMON_USER}" -g "${DAEMON_USER}" -m 0700 "${TLS_DIR}"
+# Migrate any public keys written with the old 0600 mode (public keys carry
+# no secret); the directory itself is handled by install -d above.
+find "${KEYS_DIR}" -maxdepth 1 -type f -name '*.pub' -exec chmod 0644 {} + 2>/dev/null || true
 
 echo "== binaries =="
 install -o root -g root -m 0755 "${HERE}/fingerkeyd" "${DAEMON_BIN}"

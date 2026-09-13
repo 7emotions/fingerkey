@@ -123,12 +123,20 @@ func (pm *pairManager) consume(token string, pub ed25519.PublicKey) (name string
 		replaced = true
 	}
 	data := base64.StdEncoding.EncodeToString(pub) + "\n"
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
 		return "", false, err
 	}
 	if _, err := f.Write([]byte(data)); err != nil {
+		f.Close()
+		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
+		return "", false, err
+	}
+	// OpenFile's mode is umask-masked and ignored for an existing file, so a
+	// re-paired key (or one created by the old 0600 code) stays private unless
+	// the mode is enforced here. Public keys carry no secret, so 0644 is safe.
+	if err := f.Chmod(0644); err != nil {
 		f.Close()
 		audit("pair-failed", "reason", "key-write-failed", "key", entry.Name)
 		return "", false, err

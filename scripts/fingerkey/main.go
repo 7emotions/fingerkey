@@ -1,8 +1,8 @@
 // Command fingerkey manages the paired phone public keys that the
 // phone-fprint-auth daemon verifies decisions against. Each paired key is a
 // file /var/lib/phone-fprint-auth/keys/<name>.pub containing the standard,
-// padded base64 encoding of a 32-byte Ed25519 public key, mode 0600, owned by
-// the phonefprint user (so the daemon can read it and nobody else can write
+// padded base64 encoding of a 32-byte Ed25519 public key, mode 0644, owned by
+// the phonefprint user (so any user can list it and nobody else can write
 // it).
 //
 // Usage:
@@ -88,7 +88,7 @@ func usage(w io.Writer) {
 }
 
 // pair validates the public key and stores it under keysDir as <name>.pub,
-// mode 0600, owned by the phonefprint user (falling back to the current
+// mode 0644, owned by the phonefprint user (falling back to the current
 // euid when no phonefprint user exists).
 func pair(name, pubkeyB64 string) error {
 	if err := requireRoot("pair"); err != nil {
@@ -106,13 +106,20 @@ func pair(name, pubkeyB64 string) error {
 	}
 
 	uid, gid, ok := lookupPhonefprint()
-	if err := os.MkdirAll(keysDir, 0700); err != nil {
+	if err := os.MkdirAll(keysDir, 0755); err != nil {
 		return err
 	}
-	// MkdirAll also creates missing parents with the same 0700 mode; the
+	// MkdirAll does not change the mode of an existing directory, and its
+	// requested mode is umask-masked, so an upgraded 0700 store (or a 077
+	// umask) would otherwise stay non-world-listable. Enforce 0755 explicitly.
+	if err := os.Chmod(keysDir, 0755); err != nil {
+		return err
+	}
+	// MkdirAll also creates missing parents with the same 0755 mode; the
 	// parent /var/lib/phone-fprint-auth must be world-traversable (0755) so
 	// the daemon, running as phonefprint, can reach the keys dir. The keys
-	// dir itself stays 0700.
+	// dir is world-listable (0755) so any user can run `fingerkey list`;
+	// writes stay root/phonefprint-owned.
 	_ = os.Chmod(filepath.Dir(keysDir), 0755)
 	if ok {
 		if err := os.Chown(keysDir, uid, gid); err != nil {
@@ -120,8 +127,18 @@ func pair(name, pubkeyB64 string) error {
 		}
 	}
 	path := filepath.Join(keysDir, name+".pub")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte(pubkeyB64)); err != nil {
+		f.Close()
+		return err
+	}
+	// OpenFile's mode is umask-masked and ignored for an existing file, so
+	// enforce 0644 here too (public key — no secret).
+	if err := f.Chmod(0644); err != nil {
+		f.Close()
 		return err
 	}
 	if ok {
@@ -129,10 +146,6 @@ func pair(name, pubkeyB64 string) error {
 			f.Close()
 			return fmt.Errorf("chown %s: %v", path, err)
 		}
-	}
-	if _, err := f.Write([]byte(pubkeyB64)); err != nil {
-		f.Close()
-		return err
 	}
 	if err := f.Close(); err != nil {
 		return err
