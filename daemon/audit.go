@@ -6,7 +6,33 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
+
+// maxAuditFieldLen caps how many bytes one audit field value may occupy, so
+// a hostile multi-megabyte decision frame cannot flood the journal with a
+// single line.
+const maxAuditFieldLen = 256
+
+// sanitizeField makes a value safe for a single-line, bounded audit field:
+// control characters (including \r and \n) become spaces, and the value is
+// truncated to maxAuditFieldLen bytes on a UTF-8 boundary.
+func sanitizeField(v string) string {
+	v = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7F {
+			return ' '
+		}
+		return r
+	}, v)
+	if len(v) <= maxAuditFieldLen {
+		return v
+	}
+	cut := v[:maxAuditFieldLen]
+	for !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
+}
 
 // auditWriter is where audit lines are written. It is package-level and
 // swap-able so tests can capture output with a buffer, and it is guarded by
@@ -34,7 +60,7 @@ func audit(event string, fields ...string) {
 		b.WriteString(" ")
 		b.WriteString(fields[i])
 		b.WriteString("=")
-		b.WriteString(fields[i+1])
+		b.WriteString(sanitizeField(fields[i+1]))
 	}
 	b.WriteString("\n")
 	auditMu.Lock()

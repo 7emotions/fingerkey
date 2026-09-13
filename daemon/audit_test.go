@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // swapAudit redirects the package audit writer to a fresh buffer and
@@ -117,6 +118,87 @@ func TestAuditDecisionFailed(t *testing.T) {
 	}
 	if strings.Contains(got, base64.StdEncoding.EncodeToString(s.Nonce)) {
 		t.Errorf("audit line leaks the nonce value: %q", got)
+	}
+	assertCleanAuditLine(t, got)
+}
+
+func TestAuditSanitizesControlChars(t *testing.T) {
+	buf := swapAudit(t)
+	audit("decision-failed", "id", "a\nb", "reason", "x\ry")
+	got := buf.String()
+	if !strings.HasSuffix(got, "\n") {
+		t.Errorf("audit output must be newline-terminated: %q", got)
+	}
+	line := strings.TrimSuffix(got, "\n")
+	if strings.Contains(line, "\n") || strings.Contains(line, "\r") {
+		t.Errorf("audit output contains raw control chars: %q", got)
+	}
+	if !strings.Contains(line, "id=a b") {
+		t.Errorf("id value not sanitized (want \"id=a b\"): %q", got)
+	}
+	if !strings.Contains(line, "reason=x y") {
+		t.Errorf("reason value not sanitized (want \"reason=x y\"): %q", got)
+	}
+	assertCleanAuditLine(t, got)
+}
+
+func TestAuditTruncatesLongField(t *testing.T) {
+	t.Run("caps ASCII value at 256 bytes", func(t *testing.T) {
+		buf := swapAudit(t)
+		audit("session-created", "id", strings.Repeat("A", 1000))
+		got := buf.String()
+		if strings.Contains(got, strings.Repeat("A", 257)) {
+			t.Errorf("value exceeds 256 bytes: %q", got)
+		}
+		if !strings.Contains(got, "id="+strings.Repeat("A", 256)) {
+			t.Errorf("value not capped at 256 bytes: %q", got)
+		}
+	})
+	t.Run("truncates multi-byte runes on a UTF-8 boundary", func(t *testing.T) {
+		buf := swapAudit(t)
+		audit("session-created", "id", strings.Repeat("é", 200)) // 400 bytes
+		got := buf.String()
+		line := strings.TrimSuffix(got, "\n")
+		const prefix = "id="
+		idx := strings.Index(line, prefix)
+		if idx < 0 {
+			t.Fatalf("missing id field: %q", got)
+		}
+		val := line[idx+len(prefix):]
+		if !utf8.ValidString(val) {
+			t.Errorf("truncated value is not valid UTF-8: %q", val)
+		}
+		if len(val) > 256 {
+			t.Errorf("truncated value is %d bytes, want <= 256", len(val))
+		}
+	})
+}
+
+func TestAuditDecisionFailedSanitizesID(t *testing.T) {
+	buf := swapAudit(t)
+	store := NewStore()
+	pub, _ := newKey(t)
+	keys := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
+	s, err := store.Create("alice", "sudo", "")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Any registered phone can send a decision frame with an arbitrary id;
+	// a newline in it must not forge a second audit line.
+	id := s.ID + "\nid=forged"
+	code, _, _ := decide(store, keys, id, "approve", "!!!not-base64!!!")
+	if code != http.StatusNotFound {
+		t.Fatalf("decide code = %d, want 404 (unknown crafted id)", code)
+	}
+	got := buf.String()
+	if !strings.Contains(got, "event=decision-failed") {
+		t.Fatalf("missing decision-failed audit line: %q", got)
+	}
+	if !strings.Contains(got, "reason=unknown-session") {
+		t.Errorf("decision-failed line missing reason=unknown-session: %q", got)
+	}
+	if !strings.Contains(got, "id="+s.ID+" id=forged") {
+		t.Errorf("decision-failed line missing sanitized id: %q", got)
 	}
 	assertCleanAuditLine(t, got)
 }
