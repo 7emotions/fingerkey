@@ -276,6 +276,37 @@ void main() {
     await link.close();
   });
 
+  test('PendingSession.fromFrameJson parses reason/command when present',
+      () async {
+    final session = PendingSession.fromFrameJson(json.decode(json.encode(
+      <String, dynamic>{
+        'type': 'pending',
+        'id': 's1',
+        'nonce': base64.encode(List<int>.filled(32, 1)),
+        'user': 'alice',
+        'service': 'sudo',
+        'tty': '',
+        'reason': 'system update',
+        'command': 'apt upgrade',
+        'expires_at': 2000000000,
+      },
+    )) as Map<String, dynamic>);
+
+    expect(session.id, 's1');
+    expect(session.reason, 'system update');
+    expect(session.command, 'apt upgrade');
+  });
+
+  test('PendingSession.fromFrameJson defaults reason/command to empty',
+      () async {
+    final session = PendingSession.fromFrameJson(
+        json.decode(_pendingJson('s1')) as Map<String, dynamic>);
+
+    expect(session.id, 's1');
+    expect(session.reason, '');
+    expect(session.command, '');
+  });
+
   test('in-flight decision is re-posted idempotently on reconnect', () async {
     final link = _FakeLink();
     final client = DaemonClient(link: link, pubkey: 'PUBKEY');

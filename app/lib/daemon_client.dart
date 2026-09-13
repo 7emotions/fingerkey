@@ -24,6 +24,8 @@ class PendingSession {
     required this.user,
     required this.service,
     required this.tty,
+    this.reason = '',
+    this.command = '',
     required this.expiresAt,
     this.source,
     this.sourceName,
@@ -31,7 +33,7 @@ class PendingSession {
 
   /// Parses a daemon→phone `pending` frame
   /// (`{"type":"pending","id":...,"nonce":...,"user":...,"service":...,
-  /// "tty":...,"expires_at":...}`).
+  /// "tty":...,"reason":...,"command":...,"expires_at":...}`).
   factory PendingSession.fromFrameJson(
     Map<String, dynamic> json, {
     String? source,
@@ -44,6 +46,8 @@ class PendingSession {
         user: json['user'] as String? ?? '',
         service: json['service'] as String? ?? '',
         tty: json['tty'] as String? ?? '',
+        reason: json['reason'] as String? ?? '',
+        command: json['command'] as String? ?? '',
         expiresAt: _unixSeconds(json['expires_at']),
         source: source,
         sourceName: sourceName,
@@ -54,6 +58,13 @@ class PendingSession {
   final String user;
   final String service;
   final String tty;
+
+  /// Agent-supplied justification (untrusted, self-reported); '' when the
+  /// daemon omitted it.
+  final String reason;
+
+  /// The objective command line the daemon captured; '' when omitted.
+  final String command;
 
   /// Absolute deadline, from the daemon's `expires_at` (unix seconds).
   final DateTime expiresAt;

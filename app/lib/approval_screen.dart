@@ -486,6 +486,10 @@ class _RequestCardView extends StatelessWidget {
             _row(theme, 'USER', session.user),
             _row(theme, 'SERVICE', session.service),
             _row(theme, 'TTY', session.tty.isEmpty ? '(none)' : session.tty),
+            if (session.reason.isNotEmpty)
+              _row(theme, 'REASON', session.reason),
+            if (session.command.isNotEmpty)
+              _row(theme, 'COMMAND', session.command),
             _row(theme, 'SESSION', session.id),
             const SizedBox(height: 12),
             Row(
