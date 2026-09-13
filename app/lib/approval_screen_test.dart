@@ -1,9 +1,9 @@
 /// Widget tests for the multi-computer approval screen, driven by a fake
 /// [ConnectionManager] so no platform channel or real transport is involved.
-/// Covers: gear menu split (forget vs reset identity), multi-computer card
-/// grouping, deadline countdown disabling APPROVE/DENY, deferred biometric
-/// prompt (fires on APPROVE tap, not on arrival), and "approved by
-/// another phone" card reconciliation.
+/// Covers: gear → settings page (sound toggle, forget vs reset identity),
+/// multi-computer card grouping, deadline countdown disabling APPROVE/DENY,
+/// deferred biometric prompt (fires on APPROVE tap, not on arrival), and
+/// "approved by another phone" card reconciliation.
 ///
 /// Canonical location per the build plan is lib/approval_screen_test.dart;
 /// the test/approval_screen_test.dart delegator makes `flutter test`
@@ -18,6 +18,7 @@ import 'package:flutter/material.dart';
 // ignore: depend_on_referenced_packages
 import 'package:flutter_test/flutter_test.dart';
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'package:auth/approval_screen.dart';
 import 'package:auth/connection_manager.dart';
@@ -109,8 +110,10 @@ Future<void> _dispose(WidgetTester tester) async {
 }
 
 void main() {
-  testWidgets('gear menu splits forget-this-computer from reset-identity',
+  testWidgets('gear opens settings page with sound toggle, forget, and reset',
       (tester) async {
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
     final identity = await _identity();
     var resetCalls = 0;
     await tester.pumpWidget(
@@ -132,14 +135,16 @@ void main() {
 
     await tester.tap(find.byIcon(Icons.settings));
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 400)); // sheet animates in
+    await tester.pump(const Duration(milliseconds: 400)); // route animates in
+    await _settle(tester); // loadSoundEnabled resolves
 
+    expect(find.text('审批提示音'), findsOneWidget);
     expect(find.text('Forget desk'), findsOneWidget);
     expect(find.text('Reset identity'), findsOneWidget);
 
     await tester.tap(find.widgetWithText(ListTile, 'Reset identity'));
     await tester.pump();
-    await tester.pump(const Duration(milliseconds: 400)); // sheet animates out
+    await tester.pump(const Duration(milliseconds: 400)); // route animates out
     expect(resetCalls, 1);
 
     await _dispose(tester);

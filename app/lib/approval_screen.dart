@@ -3,7 +3,7 @@
 /// shows one card per request (tagged with the source computer) with a
 /// monotonic deadline countdown, prompts for biometrics when the user taps
 /// APPROVE, and reconciles cards that another phone decided or that expired.
-/// The gear menu
+/// The gear opens the settings page (approval-sound toggle), which also
 /// splits "forget this computer" (keeps the key) from "reset identity"
 /// (wipes the key + roster).
 library;
@@ -17,6 +17,7 @@ import 'connection_manager.dart';
 import 'daemon_client.dart';
 import 'format.dart';
 import 'key_store.dart';
+import 'settings_screen.dart';
 
 class ApprovalScreen extends StatefulWidget {
   const ApprovalScreen({
@@ -269,48 +270,14 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     }
   }
 
-  void _showMenu() {
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.computer),
-              title: Text(
-                'Paired computers (${widget.roster.length})',
-                style: Theme.of(ctx).textTheme.labelLarge,
-              ),
-            ),
-            for (final computer in widget.roster)
-              ListTile(
-                leading: const Icon(Icons.link_off),
-                title: Text('Forget ${computer.name}'),
-                subtitle: Text(
-                  computer.fingerprint,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _forget(computer);
-                },
-              ),
-            const Divider(),
-            ListTile(
-              leading: const Icon(Icons.delete_forever,
-                  color: Color(0xFFF0B4B4)),
-              title: const Text(
-                'Reset identity',
-                style: TextStyle(color: Color(0xFFF0B4B4)),
-              ),
-              subtitle: const Text('Delete this phone\'s key and all pairings'),
-              onTap: () {
-                Navigator.pop(ctx);
-                widget.onReset();
-              },
-            ),
-          ],
+  void _openSettings() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsScreen(
+          keyStore: widget.keyStore,
+          roster: widget.roster,
+          onForget: _forget,
+          onReset: widget.onReset,
         ),
       ),
     );
@@ -342,7 +309,7 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
           IconButton(
             tooltip: 'Settings',
             icon: const Icon(Icons.settings),
-            onPressed: _showMenu,
+            onPressed: _openSettings,
           ),
         ],
       ),

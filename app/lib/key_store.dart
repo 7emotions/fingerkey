@@ -49,6 +49,7 @@ class RosterComputer {
 class KeyStore {
   static const String _kPrivateKey = 'ed25519_private_key';
   static const String _kRoster = 'roster';
+  static const String _kSoundEnabled = 'sound_enabled';
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
@@ -124,10 +125,24 @@ class KeyStore {
   }
 
   /// Deletes the Ed25519 private key AND clears the roster: a full identity
-  /// reset back to the pairing screen with a freshly generated key.
+  /// reset back to the pairing screen with a freshly generated key. The
+  /// approval-sound preference is kept — it is a user setting, not identity.
   Future<void> resetIdentity() async {
     await _storage.delete(key: _kRoster);
     await _storage.delete(key: _kPrivateKey);
+  }
+
+  /// The approval-sound preference. Defaults to `true` when the key is
+  /// missing or holds anything other than the explicit off marker `'0'`
+  /// (a corrupt value falls back to on rather than silently muting).
+  Future<bool> loadSoundEnabled() async {
+    final raw = await _storage.read(key: _kSoundEnabled);
+    return raw != '0';
+  }
+
+  /// Persists the approval-sound preference as `'1'`/`'0'`.
+  Future<void> setSoundEnabled(bool enabled) async {
+    await _storage.write(key: _kSoundEnabled, value: enabled ? '1' : '0');
   }
 
   Future<void> _writeRoster(List<RosterComputer> roster) async {

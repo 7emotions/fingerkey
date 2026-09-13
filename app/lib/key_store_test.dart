@@ -118,4 +118,51 @@ void main() {
       expect(await store.load(), isNull);
     });
   });
+
+  group('soundEnabled pref', () {
+    test('missing key defaults to true', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({});
+      expect(await KeyStore().loadSoundEnabled(), isTrue);
+    });
+
+    test('setSoundEnabled(false) persists and reads back false', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({});
+      final store = KeyStore();
+
+      await store.setSoundEnabled(false);
+      expect(await store.loadSoundEnabled(), isFalse);
+
+      await store.setSoundEnabled(true);
+      expect(await store.loadSoundEnabled(), isTrue);
+    });
+
+    test('corrupt value falls back to true', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({'sound_enabled': 'garbage'});
+      expect(await KeyStore().loadSoundEnabled(), isTrue);
+    });
+
+    test('explicit "0" reads back false', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({'sound_enabled': '0'});
+      expect(await KeyStore().loadSoundEnabled(), isFalse);
+    });
+
+    test('resetIdentity keeps the sound pref', () async {
+      final seed = base64.encode(List<int>.filled(32, 7));
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({
+        'ed25519_private_key': seed,
+        'sound_enabled': '0',
+      });
+      final store = KeyStore();
+
+      await store.resetIdentity();
+
+      expect(await store.load(), isNull);
+      expect(await store.loadSoundEnabled(), isFalse); // pref survives reset
+    });
+  });
 }
