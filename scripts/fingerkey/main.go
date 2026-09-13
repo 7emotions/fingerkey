@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // keysDir is where the daemon loads <name>.pub files from (daemon default
@@ -119,13 +120,22 @@ func pair(name, pubkeyB64 string) error {
 		}
 	}
 	path := filepath.Join(keysDir, name+".pub")
-	if err := os.WriteFile(path, []byte(pubkeyB64), 0600); err != nil {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
 		return err
 	}
 	if ok {
-		if err := os.Chown(path, uid, gid); err != nil {
+		if err := f.Chown(uid, gid); err != nil {
+			f.Close()
 			return fmt.Errorf("chown %s: %v", path, err)
 		}
+	}
+	if _, err := f.Write([]byte(pubkeyB64)); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
 	}
 	fmt.Printf("paired %q: %s\n", name, path)
 	return nil
