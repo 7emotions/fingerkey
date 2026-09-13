@@ -178,13 +178,17 @@ func TestPairTokenRejectsBadNames(t *testing.T) {
 }
 
 // TestPairConsumeRefusesSymlink: a symlink planted at <name>.pub pointing at
-// an arbitrary file must be refused, not followed — the target's bytes must
-// survive the consume attempt untouched (CWE-59).
+// an arbitrary file must be refused, not followed — the target's bytes and
+// mtime must survive the consume attempt untouched (CWE-59).
 func TestPairConsumeRefusesSymlink(t *testing.T) {
 	pm := newTestPairManager(t)
 	target := filepath.Join(t.TempDir(), "target")
 	if err := os.WriteFile(target, []byte("SENTINEL"), 0600); err != nil {
 		t.Fatalf("write sentinel target: %v", err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat sentinel target: %v", err)
 	}
 	if err := os.Symlink(target, filepath.Join(pm.keysDir, "alice.pub")); err != nil {
 		t.Fatalf("plant symlink: %v", err)
@@ -205,6 +209,13 @@ func TestPairConsumeRefusesSymlink(t *testing.T) {
 	}
 	if string(got) != "SENTINEL" {
 		t.Fatalf("target bytes = %q, want SENTINEL (not truncated/overwritten)", got)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat sentinel target after consume: %v", err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Errorf("target mtime changed from %v to %v; a write-through would update it", before.ModTime(), after.ModTime())
 	}
 }
 
