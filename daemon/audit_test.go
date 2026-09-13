@@ -156,7 +156,9 @@ func TestAuditTruncatesLongField(t *testing.T) {
 	})
 	t.Run("truncates multi-byte runes on a UTF-8 boundary", func(t *testing.T) {
 		buf := swapAudit(t)
-		audit("session-created", "id", strings.Repeat("é", 200)) // 400 bytes
+		// "€" is a 3-byte rune: 100 repeats = 300 bytes, so the 256-byte cut
+		// lands mid-rune and must back off to a valid UTF-8 boundary (255).
+		audit("session-created", "id", strings.Repeat("€", 100))
 		got := buf.String()
 		line := strings.TrimSuffix(got, "\n")
 		const prefix = "id="
@@ -170,6 +172,9 @@ func TestAuditTruncatesLongField(t *testing.T) {
 		}
 		if len(val) > 256 {
 			t.Errorf("truncated value is %d bytes, want <= 256", len(val))
+		}
+		if len(val) != 255 {
+			t.Errorf("truncated value is %d bytes, want 255 (256 minus one 1-byte partial-rune tail)", len(val))
 		}
 	})
 }
