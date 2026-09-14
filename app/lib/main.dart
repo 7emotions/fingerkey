@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'app_theme.dart';
 import 'approval_screen.dart';
 import 'key_store.dart';
 import 'pairing_screen.dart';
@@ -96,17 +97,12 @@ class _PhoneFprintAppState extends State<PhoneFprintApp> {
 
   @override
   Widget build(BuildContext context) {
-    const accent = Color(0xFFFFB000);
-    final colorScheme = ColorScheme.fromSeed(
-      seedColor: accent,
-      brightness: Brightness.dark,
-    );
     return MaterialApp(
       title: 'phone-fprint-auth',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: colorScheme.copyWith(surface: const Color(0xFF0B0E11)),
-        scaffoldBackgroundColor: const Color(0xFF0B0E11),
+        colorScheme: buildColorScheme(),
+        scaffoldBackgroundColor: kPageSurface,
         useMaterial3: true,
       ),
       home: _buildHome(),

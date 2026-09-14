@@ -26,6 +26,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import 'app_theme.dart';
 import 'connection_manager.dart';
 import 'daemon_client.dart';
 import 'format.dart';
@@ -226,7 +227,12 @@ class BackgroundLinkService {
   /// foreground path never gets here because the UI port is registered.
   /// Both calls are fire-and-forget from [_onPending] and must not throw.
   Future<void> _alertInBackground(Map<String, dynamic> json) async {
-    final overlay = OverlayChannel.show(json).catchError((Object e) {
+    // Resolve the overlay palette from the app theme at runtime (task 18):
+    // the native card derives its colors from the very scheme the app runs,
+    // so it can never drift from the design language.
+    final overlay = OverlayChannel
+        .show(<String, dynamic>{...json, 'palette': overlayPalette()})
+        .catchError((Object e) {
       debugPrint('phone-fprint-auth: bg overlay show failed: $e');
       return '';
     });

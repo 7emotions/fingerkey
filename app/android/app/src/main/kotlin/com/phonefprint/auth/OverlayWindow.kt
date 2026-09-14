@@ -71,25 +71,46 @@ class OverlayWindow(context: Context? = null) :
         /** Fallback expiry when the caller omits expiresAt (60s, like the daemon). */
         private const val DEFAULT_TTL_MS = 60_000L
 
-        // App palette (app/lib/main.dart: amber seed 0xFFFFB000 over the dark
-        // surface 0xFF0B0E11); the card floats one elevation above it.
-        private val COLOR_CARD = Color.parseColor("#161A20")
-        private val COLOR_BORDER = Color.parseColor("#2A2F38")
-        private val COLOR_TONAL = Color.parseColor("#1D2129")
-        private val COLOR_TRACK = Color.parseColor("#2A2F38")
-        private val COLOR_ACCENT = Color.parseColor("#FFB000")
-        private val COLOR_ACCENT_SOFT = Color.argb(0x26, 0xFF, 0xB0, 0x00)
-        private val COLOR_ON_ACCENT = Color.parseColor("#1A1300")
-        private val COLOR_TEXT = Color.parseColor("#E8EBF0")
-        private val COLOR_MUTED = Color.parseColor("#9AA1AC")
-        private val COLOR_LABEL = Color.parseColor("#79828F")
-        private val COLOR_DENY_STROKE = Color.parseColor("#3A414B")
+        // Warm fallback palette: the literal values buildColorScheme()
+        // (app/lib/app_theme.dart, amber seed 0xFFFFB000, dark) resolves to.
+        // The Dart side asserts these stay in sync (test/app_theme_test.dart);
+        // at runtime the service isolate sends the live palette in the show()
+        // payload and these are overridden, so the overlay follows the app
+        // theme instead of drifting to a stale copy.
+        private const val FALLBACK_CARD = "#241F17"
+        private const val FALLBACK_BORDER = "#4F4539"
+        private const val FALLBACK_TONAL = "#2F2921"
+        private const val FALLBACK_TRACK = "#3A342B"
+        private const val FALLBACK_ACCENT = "#F2BE6E"
+        private const val FALLBACK_ACCENT_SOFT_ALPHA = 0x26
+        private const val FALLBACK_ON_ACCENT = "#432C00"
+        private const val FALLBACK_TEXT = "#EDE1D4"
+        private const val FALLBACK_MUTED = "#D2C4B4"
+        private const val FALLBACK_LABEL = "#9B8F80"
+        private const val FALLBACK_DENY_STROKE = "#9B8F80"
     }
 
     private var applicationContext: Context? = context
     private var methodChannel: MethodChannel? = null
     private var eventChannel: EventChannel? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    // Overlay palette: warm fallbacks below, overridden from the "palette"
+    // map of the show() payload at runtime (task 18), so the card always
+    // matches the scheme the app is actually running.
+    private var cardColor = Color.parseColor(FALLBACK_CARD)
+    private var borderColor = Color.parseColor(FALLBACK_BORDER)
+    private var tonalColor = Color.parseColor(FALLBACK_TONAL)
+    private var trackColor = Color.parseColor(FALLBACK_TRACK)
+    private var accentColor = Color.parseColor(FALLBACK_ACCENT)
+    private var accentSoftColor = Color.parseColor(FALLBACK_ACCENT).let {
+        Color.argb(FALLBACK_ACCENT_SOFT_ALPHA, Color.red(it), Color.green(it), Color.blue(it))
+    }
+    private var onAccentColor = Color.parseColor(FALLBACK_ON_ACCENT)
+    private var textColor = Color.parseColor(FALLBACK_TEXT)
+    private var mutedColor = Color.parseColor(FALLBACK_MUTED)
+    private var labelColor = Color.parseColor(FALLBACK_LABEL)
+    private var denyStrokeColor = Color.parseColor(FALLBACK_DENY_STROKE)
 
     /** Sink of this engine's own Dart subscription (at most one per channel). */
     @Volatile
@@ -198,6 +219,7 @@ class OverlayWindow(context: Context? = null) :
                 return@post
             }
             permissionPrompted = false // granted again; a future revocation may re-prompt
+            applyPalette(call.argument<Map<*, *>>("palette"))
             val id = call.argument<String>("id") ?: ""
             val user = call.argument<String>("user") ?: ""
             val service = call.argument<String>("service") ?: ""
@@ -208,6 +230,46 @@ class OverlayWindow(context: Context? = null) :
             val request = call.arguments as? Map<*, *>
             showOverlay(context, id, user, service, reason, command, expiresAt, request)
             result.success("shown")
+        }
+    }
+
+    /**
+     * Overrides the palette from the show() payload's "palette" map (hex
+     * strings without `#`, plus a decimal "accentSoftAlpha"). Absent or
+     * malformed entries keep the warm fallback for that slot, so a stale
+     * client can never break the card.
+     */
+    private fun applyPalette(palette: Map<*, *>?) {
+        if (palette == null) return
+        fun hex(key: String): Int? {
+            val value = palette[key] as? String ?: return null
+            return runCatching { Color.parseColor("#$value") }.getOrNull()
+        }
+        hex("card")?.let { cardColor = it }
+        hex("cardHigh")?.let { tonalColor = it }
+        hex("border")?.let { borderColor = it }
+        hex("track")?.let { trackColor = it }
+        hex("onAccent")?.let { onAccentColor = it }
+        hex("text")?.let { textColor = it }
+        hex("muted")?.let { mutedColor = it }
+        hex("label")?.let { labelColor = it }
+        hex("denyStroke")?.let { denyStrokeColor = it }
+        val accent = hex("accent")
+        if (accent != null) accentColor = accent
+        val softAlpha = palette["accentSoftAlpha"]?.let { raw ->
+            when (raw) {
+                is String -> raw.toIntOrNull()
+                is Number -> raw.toInt()
+                else -> null
+            }
+        }
+        if (softAlpha != null && accent != null) {
+            accentSoftColor = Color.argb(
+                softAlpha.coerceIn(0, 255),
+                Color.red(accent),
+                Color.green(accent),
+                Color.blue(accent),
+            )
         }
     }
 
@@ -388,8 +450,8 @@ class OverlayWindow(context: Context? = null) :
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
                 cornerRadius = 28f * dp
-                setColor(COLOR_CARD)
-                setStroke(dpf(1f), COLOR_BORDER)
+                setColor(cardColor)
+                setStroke(dpf(1f), borderColor)
             }
             // The rounded background provides the outline, so this elevation
             // casts a real shadow over the app below.
@@ -410,12 +472,12 @@ class OverlayWindow(context: Context? = null) :
                     FrameLayout(context).apply {
                         background = GradientDrawable().apply {
                             shape = GradientDrawable.OVAL
-                            setColor(COLOR_ACCENT_SOFT)
+                            setColor(accentSoftColor)
                         }
                         addView(
                             ImageView(context).apply {
                                 setImageResource(R.drawable.ic_fingerprint)
-                                imageTintList = ColorStateList.valueOf(COLOR_ACCENT)
+                                imageTintList = ColorStateList.valueOf(accentColor)
                             },
                             FrameLayout.LayoutParams(dpf(24f), dpf(24f), Gravity.CENTER),
                         )
@@ -427,13 +489,13 @@ class OverlayWindow(context: Context? = null) :
                         orientation = LinearLayout.VERTICAL
                         addView(TextView(context).apply {
                             text = "Approve this request"
-                            setTextColor(COLOR_TEXT)
+                            setTextColor(textColor)
                             textSize = 16f
                             typeface = Typeface.DEFAULT_BOLD
                         })
                         addView(TextView(context).apply {
                             text = sourceName.ifBlank { "(unknown computer)" }
-                            setTextColor(COLOR_MUTED)
+                            setTextColor(mutedColor)
                             textSize = 12f
                         })
                     },
@@ -450,7 +512,7 @@ class OverlayWindow(context: Context? = null) :
         card.addView(
             TextView(context).apply {
                 text = headline
-                setTextColor(COLOR_TEXT)
+                setTextColor(textColor)
                 textSize = 15f
                 typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             },
@@ -463,7 +525,7 @@ class OverlayWindow(context: Context? = null) :
             card.addView(
                 TextView(context).apply {
                     text = "on $service"
-                    setTextColor(COLOR_LABEL)
+                    setTextColor(labelColor)
                     textSize = 13f
                 },
                 LinearLayout.LayoutParams(
@@ -484,11 +546,11 @@ class OverlayWindow(context: Context? = null) :
         // updates both; the text string is unchanged.
         val track = GradientDrawable().apply {
             cornerRadius = 999f
-            setColor(COLOR_TRACK)
+            setColor(trackColor)
         }
         val fill = GradientDrawable().apply {
             cornerRadius = 999f
-            setColor(COLOR_ACCENT)
+            setColor(accentColor)
         }
         val barLayers = LayerDrawable(
             arrayOf(track, ClipDrawable(fill, Gravity.START, ClipDrawable.HORIZONTAL)),
@@ -507,7 +569,7 @@ class OverlayWindow(context: Context? = null) :
             progress = countdownMaxSec
         }
         countdownText = TextView(context).apply {
-            setTextColor(COLOR_ACCENT)
+            setTextColor(accentColor)
             textSize = 12f
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             text = "Expires in —s"
@@ -571,7 +633,7 @@ class OverlayWindow(context: Context? = null) :
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
                 cornerRadius = 14f * dp
-                setColor(COLOR_TONAL)
+                setColor(tonalColor)
             }
             setPadding(dpf(12f), dpf(10f), dpf(12f), dpf(10f))
             layoutParams = LinearLayout.LayoutParams(
@@ -580,14 +642,14 @@ class OverlayWindow(context: Context? = null) :
             ).apply { topMargin = dpf(10f) }
             addView(TextView(context).apply {
                 text = label
-                setTextColor(COLOR_LABEL)
+                setTextColor(labelColor)
                 textSize = 11f
                 typeface = Typeface.DEFAULT_BOLD
                 letterSpacing = 0.08f
             })
             addView(TextView(context).apply {
                 text = value
-                setTextColor(COLOR_TEXT)
+                setTextColor(textColor)
                 textSize = 14f
                 if (monospace) typeface = Typeface.MONOSPACE
                 setPadding(0, dpf(4f), 0, 0)
@@ -602,10 +664,10 @@ class OverlayWindow(context: Context? = null) :
         val shape = GradientDrawable().apply {
             cornerRadius = 16f * dp
             if (filled) {
-                setColor(COLOR_ACCENT)
+                setColor(accentColor)
             } else {
                 setColor(Color.TRANSPARENT)
-                setStroke(dpf(1f), COLOR_DENY_STROKE)
+                setStroke(dpf(1f), denyStrokeColor)
             }
         }
         val mask = GradientDrawable().apply {
@@ -620,14 +682,14 @@ class OverlayWindow(context: Context? = null) :
         return Button(context).apply {
             text = label
             isAllCaps = false
-            setTextColor(if (filled) COLOR_ON_ACCENT else COLOR_TEXT)
+            setTextColor(if (filled) onAccentColor else textColor)
             textSize = 14f
             typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             letterSpacing = 0.02f
             background = RippleDrawable(ColorStateList.valueOf(rippleColor), shape, mask)
             if (filled) {
                 setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_fingerprint, 0, 0, 0)
-                compoundDrawableTintList = ColorStateList.valueOf(COLOR_ON_ACCENT)
+                compoundDrawableTintList = ColorStateList.valueOf(onAccentColor)
                 compoundDrawablePadding = dpf(8f)
             }
             setOnClickListener {

@@ -25,9 +25,11 @@ class OverlayChannel {
   /// Shows the approval card for one pending request. [request] mirrors
   /// [PendingSession.toJson] (`id`, `user`, `service`, `reason`, `command`,
   /// `expiresAt` in ms, plus the full payload the overlay keeps for the
-  /// APPROVE handoff). Returns `shown`, or `permission_required` when the
-  /// SYSTEM_ALERT_WINDOW access is missing (the user is routed to the
-  /// Settings grant page).
+  /// APPROVE handoff) plus an optional `palette` map of hex colors
+  /// (app_theme.dart) that the overlay resolves at runtime; every entry is
+  /// forwarded unchanged to the native side. Returns `shown`, or
+  /// `permission_required` when the SYSTEM_ALERT_WINDOW access is missing
+  /// (the user is routed to the Settings grant page).
   static Future<String> show(Map<String, dynamic> request) async {
     final Object? result = await _method.invokeMethod<dynamic>('show', request);
     return result as String? ?? '';
