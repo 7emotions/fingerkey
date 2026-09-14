@@ -108,12 +108,20 @@ class _FakeServiceLinkManager extends ServiceLinkManager {
 
   final List<bool> foregroundCalls = <bool>[];
 
+  /// Records the reset-link RPC issued by the reset flow (task 21).
+  int resetLinkCalls = 0;
+
   @override
   Future<void> start() async {} // no bridge attach in tests
 
   @override
   Future<void> setForeground(bool foreground) async {
     foregroundCalls.add(foreground);
+  }
+
+  @override
+  Future<void> resetLink() async {
+    resetLinkCalls++;
   }
 
   @override
@@ -147,7 +155,7 @@ void main() {
                 name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
           ],
           manager: _FakeManager(identity),
-          onReset: () => resetCalls++,
+          onReset: () async => resetCalls++,
           onRosterChanged: () {},
         ),
       ),
@@ -171,6 +179,111 @@ void main() {
     await _dispose(tester);
   });
 
+  testWidgets('sound toggle in settings refreshes the approval screen',
+      (tester) async {
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
+    final identity = await _identity();
+    final manager = _FakeManager(identity);
+    var soundCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          playSound: () async {
+            soundCalls++;
+          },
+          onReset: () async {},
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester); // loadSoundEnabled resolves (defaults on)
+
+    // Default on: the alert sound plays for the first request.
+    manager.pendingCtrl
+        .add(_pending(id: 's1', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+    expect(soundCalls, 1);
+
+    // Open settings and switch the sound off.
+    await tester.tap(find.byIcon(Icons.settings));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400)); // route animates in
+    await _settle(tester);
+    await tester.tap(find.byType(Switch));
+    await _settle(tester);
+
+    // Back: _openSettings must reload the pref (Finding A) — the stale
+    // initState copy would otherwise keep playing the sound.
+    await tester.pageBack();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400)); // route animates out
+    await _settle(tester);
+
+    manager.pendingCtrl
+        .add(_pending(id: 's2', source: 'fp1', sourceName: 'desk'));
+    await _settle(tester);
+    expect(soundCalls, 1); // no second sound: the toggle took effect
+
+    await _dispose(tester);
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
+  });
+
+  testWidgets('reset identity wipes storage first, then resets the link',
+      (tester) async {
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
+    final identity = await _identity();
+    final manager = _FakeServiceLinkManager(identity);
+    var reset = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ApprovalScreen(
+          identity: identity,
+          keyStore: KeyStore(),
+          roster: const [
+            RosterComputer(
+                name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
+          ],
+          manager: manager,
+          // The wipe must precede the reset RPC (Finding C): the service's
+          // re-bootstrap may not re-load the deleted identity.
+          onReset: () async {
+            expect(manager.resetLinkCalls, 0, reason: 'wipe before link reset');
+            reset++;
+          },
+          onRosterChanged: () {},
+        ),
+      ),
+    );
+    await _settle(tester);
+
+    await tester.tap(find.byIcon(Icons.settings));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400)); // route animates in
+    await _settle(tester);
+
+    await tester.tap(find.widgetWithText(ListTile, 'Reset identity'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 400)); // route animates out
+    await _settle(tester);
+
+    expect(reset, 1);
+    expect(manager.resetLinkCalls, 1); // the stale service link was reset
+
+    await _dispose(tester);
+    // ignore: invalid_use_of_visible_for_testing_member
+    FlutterSecureStorage.setMockInitialValues({});
+  });
+
   testWidgets('renders one card per source computer', (tester) async {
     final identity = await _identity();
     final manager = _FakeManager(identity);
@@ -187,7 +300,7 @@ void main() {
           ],
           manager: manager,
           authenticate: (_) async => false,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -221,7 +334,7 @@ void main() {
           ],
           manager: manager,
           authenticate: (_) async => false,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -271,7 +384,7 @@ void main() {
           ],
           manager: manager,
           authenticate: (_) async => false,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -313,7 +426,7 @@ void main() {
             authCalls++;
             return true;
           },
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -368,7 +481,7 @@ void main() {
             return true;
           },
           overlayApproveStream: launch.stream,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -436,7 +549,7 @@ void main() {
             return true;
           },
           overlayApproveStream: launch.stream,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -489,7 +602,7 @@ void main() {
             return true;
           },
           overlayApproveStream: launch.stream,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -532,7 +645,7 @@ void main() {
           ],
           manager: manager,
           authenticate: (_) async => false,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -569,7 +682,7 @@ void main() {
           ],
           manager: manager,
           authenticate: (_) async => false,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -605,7 +718,7 @@ void main() {
           ],
           manager: manager,
           authenticate: (_) async => false,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -654,7 +767,7 @@ void main() {
           playSound: () async {
             soundCalls++;
           },
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -695,7 +808,7 @@ void main() {
           playSound: () async {
             soundCalls++;
           },
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),
@@ -729,7 +842,7 @@ void main() {
                 name: 'desk', fingerprint: 'fp1', lastAddr: '1.2.3.4:4443'),
           ],
           manager: manager,
-          onReset: () {},
+          onReset: () async {},
           onRosterChanged: () {},
         ),
       ),

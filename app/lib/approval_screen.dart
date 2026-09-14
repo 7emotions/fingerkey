@@ -42,8 +42,9 @@ class ApprovalScreen extends StatefulWidget {
   /// menu. Refreshed by the caller after a forget.
   final List<RosterComputer> roster;
 
-  /// Full identity reset (wipe key + roster).
-  final VoidCallback onReset;
+  /// Full identity reset (wipe key + roster). Async so the reset flow can
+  /// await the wipe before ordering the service-side link reset (task 21).
+  final Future<void> Function() onReset;
 
   /// The roster changed (a computer was forgotten); the caller re-reads it
   /// and falls back to pairing when it emptied.
@@ -409,17 +410,44 @@ class _ApprovalScreenState extends State<ApprovalScreen>
     }
   }
 
-  void _openSettings() {
-    Navigator.of(context).push(
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => SettingsScreen(
           keyStore: widget.keyStore,
           roster: widget.roster,
           onForget: _forget,
-          onReset: widget.onReset,
+          onReset: _resetIdentity,
         ),
       ),
     );
+    // The sound preference is read once at init; the settings page may have
+    // toggled it, so reload it on return (task 21) or a pending request
+    // would keep playing the stale value until this screen is recreated.
+    if (!mounted || _disposed) return;
+    final enabled = await widget.keyStore.loadSoundEnabled();
+    if (!mounted || _disposed) return;
+    setState(() => _soundEnabled = enabled);
+  }
+
+  /// Full identity reset, wired through the settings page (task 21). Order
+  /// matters: wipe the identity storage FIRST so the service engine's
+  /// re-bootstrap (kicked off by the reset RPC below) can never re-load the
+  /// deleted identity, then ask the service to dispose its stale link
+  /// manager and re-bootstrap; its loop waits until the user re-pairs.
+  Future<void> _resetIdentity() async {
+    await widget.onReset();
+    final manager = _manager;
+    if (manager is ServiceLinkManager) {
+      try {
+        await manager.resetLink();
+      } catch (e) {
+        // The screen may already be unmounting (the reset swaps the home to
+        // the pairing screen and detaches the bridge); the RPC itself was
+        // sent before the detach, so this is not a reset failure.
+        debugPrint('phone-fprint-auth: reset link failed: $e');
+      }
+    }
   }
 
   void _forget(RosterComputer computer) {

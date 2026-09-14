@@ -40,6 +40,13 @@ class OverlayChannel {
     await _method.invokeMethod<dynamic>('hide');
   }
 
+  /// Hides the overlay card for one session (native `OverlayWindow.hideForId`,
+  /// task 21). Idempotent: a no-op when no card for [id] is showing.
+  static Future<void> hideForId(String id) async {
+    await _method.invokeMethod<dynamic>(
+        'hideForId', <String, dynamic>{'id': id});
+  }
+
   /// DENY presses and timeouts from the overlay:
   /// `{"type": "decision", "id": ..., "decision": "deny", "source": ...}`
   /// and `{"type": "expired", "id": ...}`. APPROVE taps never appear here —

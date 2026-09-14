@@ -64,6 +64,11 @@ class BackgroundLinkService {
   KeyStore? _keyStore;
   DeviceIdentity? _identity;
 
+  /// Bumped on every identity reset; a superseded [_bootstrap] run aborts at
+  /// its next checkpoint and tears down the manager it created, so exactly
+  /// one bootstrap generation owns the links at any time (task 21).
+  int _bootstrapGeneration = 0;
+
   /// Most recent pending sessions, replayed to the UI on attach so a request
   /// pushed while the UI was dead is not lost. Keyed by session id; pruned
   /// on decision-result and on expiry.
@@ -85,10 +90,17 @@ class BackgroundLinkService {
   /// entrypoint starts before the engine's plugins are attached on a cold
   /// start, so the first secure-storage reads can miss the channel; and the
   /// identity does not exist until the UI has generated it once.
+  ///
+  /// Re-entrant (task 21): a reset bumps [_bootstrapGeneration], which makes
+  /// any superseded run stop and dispose the manager it created; this method
+  /// can then be called again, and the new run loops until the fresh
+  /// identity the UI generates after re-pairing exists.
   Future<void> _bootstrap() async {
+    final generation = ++_bootstrapGeneration;
     final keyStore = KeyStore();
     DeviceIdentity? identity;
     while (identity == null) {
+      if (generation != _bootstrapGeneration) return; // superseded by a reset
       try {
         identity = await keyStore.load();
       } catch (e) {
@@ -98,6 +110,7 @@ class BackgroundLinkService {
         await Future<void>.delayed(const Duration(seconds: 5));
       }
     }
+    if (generation != _bootstrapGeneration) return;
     _keyStore = keyStore;
     _identity = identity;
     final manager = ConnectionManager(keyStore: keyStore, identity: identity);
@@ -106,8 +119,21 @@ class BackgroundLinkService {
     manager.decisions().listen(_onDecision);
     manager.unregistered().listen(_onUnregistered);
     while (true) {
+      if (generation != _bootstrapGeneration) {
+        // A reset happened while this run owned the links: dispose THIS run's
+        // manager (idempotent — the reset path may already have disposed it)
+        // and let the new bootstrap generation take over.
+        if (identical(_manager, manager)) _manager = null;
+        await manager.dispose();
+        return;
+      }
       try {
         await manager.start();
+        if (generation != _bootstrapGeneration) {
+          if (identical(_manager, manager)) _manager = null;
+          await manager.dispose();
+          return;
+        }
         return;
       } catch (e) {
         debugPrint('phone-fprint-auth: bg link start failed: $e');
@@ -139,6 +165,12 @@ class BackgroundLinkService {
     if (result.id != null) {
       _pendingCache.remove('${result.id}@${result.source ?? ''}');
     }
+    // A terminal verdict settles the session: dismiss the native alert pair
+    // (overlay card + notification) the background path may have shown for it
+    // (task 21). Fire-and-forget; both calls are idempotent.
+    if (result.id != null && result.isTerminal) {
+      unawaited(dismissAlertsFor(result.id!));
+    }
     final source = result.source;
     _sendToUi(<String, dynamic>{
       'type': 'decision',
@@ -163,10 +195,42 @@ class BackgroundLinkService {
     if (id == null) return;
     if (type == 'expired') {
       _pendingCache.removeWhere((key, _) => key.startsWith('$id@'));
+      // The session timed out in the overlay: clear its stale alert pair.
+      unawaited(dismissAlertsFor(id));
       return;
     }
     if (type != 'decision' || event['decision'] != 'deny') return;
+    // A DENY tap settles the session from here: dismiss the card/notification
+    // now (the native card already hid itself on tap), then post the signed
+    // deny. The terminal decision-result that follows also dismisses — both
+    // calls are idempotent (task 21).
+    unawaited(dismissAlertsFor(id));
     unawaited(_signAndPostDeny(id, event['source'] as String?));
+  }
+
+  /// Dismisses the native alert pair for one session: hides the overlay card
+  /// (native `OverlayWindow.hideForId`, task 21) and cancels the
+  /// high-priority notification (`ApprovalNotifier.cancel`, task 21). Called
+  /// on terminal decision results and on the overlay's own expired/deny
+  /// events so a stale card/notification never lingers after the session
+  /// settled. Idempotent and failure-tolerant: both natives are no-ops when
+  /// nothing is showing, and a missing channel must never break the decision
+  /// path.
+  @visibleForTesting
+  Future<void> dismissAlertsFor(String id) async {
+    try {
+      await OverlayChannel.hideForId(id);
+    } catch (e) {
+      debugPrint('phone-fprint-auth: bg overlay dismiss failed: $e');
+    }
+    try {
+      await _notifyChannel
+          .invokeMethod<void>('cancel', <String, dynamic>{'id': id});
+    } on MissingPluginException catch (e) {
+      debugPrint('phone-fprint-auth: bg notify cancel handler missing: $e');
+    } on PlatformException catch (e) {
+      debugPrint('phone-fprint-auth: bg notify cancel failed: $e');
+    }
   }
 
   Future<void> _signAndPostDeny(String id, String? source) async {
@@ -274,6 +338,30 @@ class BackgroundLinkService {
         ?.send(<String, dynamic>{'type': 'reply', 'id': id, 'value': value});
     void replyError(Object error) => replyTo
         ?.send(<String, dynamic>{'type': 'reply', 'id': id, 'error': '$error'});
+
+    if (method == 'reset') {
+      // Identity reset (task 21): drop the stale link owner — it still holds
+      // the pre-reset identity, so the freshly generated key could never
+      // connect — and re-bootstrap, which loops until the UI re-pairs and a
+      // new identity exists. Handled before the manager-null guard because a
+      // reset must work even when no manager is running yet (bootstrap still
+      // waiting for a first identity). The reply goes out up front: the
+      // re-bootstrap can take as long as the user takes to re-pair.
+      reply(null);
+      final old = _manager;
+      _manager = null;
+      _identity = null;
+      _keyStore = null;
+      _pendingCache.clear();
+      _bootstrapGeneration++; // supersede any bootstrap run in flight
+      try {
+        await old?.dispose();
+        await _bootstrap();
+      } catch (e) {
+        debugPrint('phone-fprint-auth: bg reset failed: $e');
+      }
+      return;
+    }
 
     final manager = _manager;
     if (manager == null) {
@@ -484,6 +572,12 @@ class UiBridge {
   /// Idempotent: a no-op RPC when nothing is showing.
   Future<void> hideOverlay() =>
       _request('hideOverlay', const <String, dynamic>{});
+
+  /// Asks the service engine to drop its stale link manager and re-bootstrap
+  /// after an identity reset (task 21): the service disposes the manager that
+  /// still holds the pre-reset identity and its bootstrap loop waits until
+  /// the UI re-pairs and generates the fresh identity.
+  Future<void> reset() => _request('reset', const <String, dynamic>{});
 }
 
 /// UI-engine facade with the [ConnectionManager] surface. The approval screen
@@ -569,6 +663,13 @@ class ServiceLinkManager extends ConnectionManager {
   /// UI-side hook for task 12: hides the service-owned native overlay after
   /// an overlay-triggered approval ran in this Activity.
   Future<void> hideOverlay() => _bridge.hideOverlay();
+
+  /// UI-side hook for identity reset (task 21): asks the service engine to
+  /// dispose its stale manager and re-bootstrap, so the freshly generated
+  /// identity (after re-pairing) is picked up by the service's bootstrap
+  /// loop. Call AFTER wiping the identity storage, so the re-bootstrap can
+  /// never re-load the deleted key.
+  Future<void> resetLink() => _bridge.reset();
 
   @override
   Future<void> dispose() async {

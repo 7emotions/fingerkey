@@ -163,6 +163,12 @@ class DecisionResult {
 
   /// True when the session expired before any decision landed.
   bool get isExpired => status == 'expired';
+
+  /// True when this result settles the session: the daemon accepted a
+  /// decision (`approved`/`denied`) or the session expired. Error results
+  /// leave the session pending, so its alerts are kept (task 21).
+  bool get isTerminal =>
+      status == 'approved' || status == 'denied' || status == 'expired';
 }
 
 /// The control frame answering [DaemonClient.connect]: whether the pubkey is

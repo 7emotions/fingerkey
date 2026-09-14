@@ -31,8 +31,10 @@ class SettingsScreen extends StatefulWidget {
   final void Function(RosterComputer computer) onForget;
 
   /// Full identity reset (wipe key + roster). Called after this page is
-  /// popped; the caller falls back to the pairing screen.
-  final VoidCallback onReset;
+  /// popped; the caller falls back to the pairing screen. Returns a Future so
+  /// the caller can await the wipe before resetting the service-side link
+  /// (task 21).
+  final Future<void> Function() onReset;
 
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();

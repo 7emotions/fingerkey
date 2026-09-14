@@ -97,6 +97,12 @@ class KeyStore {
     } on FormatException {
       return <RosterComputer>[];
     }
+    // Self-heal the boot marker on READ (task 21): installs upgraded from an
+    // older version already hold a non-empty roster but never wrote the
+    // marker — it used to be mirrored only on roster WRITE — so their first
+    // reboot would skip the foreground service. Mirrored on every successful
+    // decode; fire-and-forget like every other [_syncConfiguredFlag] call.
+    _syncConfiguredFlag(decoded.isNotEmpty);
     return decoded
         .map((dynamic e) =>
             RosterComputer.fromJson(e as Map<String, dynamic>))
