@@ -69,14 +69,14 @@ flowchart LR
 | Path | What it is |
 | --- | --- |
 | `daemon/` | Go single binary `fingerkeyd`, run as the `phonefprint` user. Holds pending sessions, issues nonces, verifies signed decisions. Two surfaces: the root-only unix socket `/run/phone-fprint-auth/daemon.sock` (`POST /v1/session`, `GET /v1/session/{id}`, `POST /v1/pair`, used by the PAM module and the pair CLI) and the TLS phone listener. Flags include `-keys-dir`, `-addr` (default `:4443`), `-tls-dir`, `-max-conns` (default 16), and `-max-conns-per-ip` (default 4). |
-| `pam/pam_fingerkey.c` | Native C PAM module. `pam_sm_authenticate` creates a session and polls up to 60 seconds, returns `PAM_SUCCESS` on approve, `PAM_AUTH_ERR` otherwise. A non-2xx session creation (daemon down, no paired keys, no phone connected) fails fast instead of hanging the 60 seconds. The `socket=<path>` argument overrides the daemon socket (used by tests and throwaway PAM services). |
-| `scripts/install.sh` | Root install: builds and installs the daemon, pair CLI and PAM module; creates the `phonefprint` user plus the key and TLS directories; installs and starts the systemd unit (TLS on `:4443`); wires the module into `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`. |
+| `pam/pam_fingerkey.c` | Native C PAM module. `pam_sm_authenticate` creates a session and polls up to 60 seconds, returns `PAM_SUCCESS` on approve, `PAM_AUTH_ERR` otherwise. A non-2xx session creation (daemon down, no paired keys, no phone connected) fails fast instead of hanging the 60 seconds. The `socket=<path>` argument overrides the daemon socket (used by tests and throwaway PAM services). It also forwards the caller's `FINGERKEY_REASON` (if set) and the objective `/proc/self/cmdline` as display-only metadata. |
+| `scripts/install.sh` | Root install: builds and installs the daemon, pair CLI and PAM module; creates the `phonefprint` user plus the key and TLS directories; installs and starts the systemd unit (TLS on `:4443`); wires the module into `/etc/pam.d/sudo` and `/etc/pam.d/polkit-1`. It also drops a sudoers snippet (`/etc/sudoers.d/phone-fprint-auth`) that keeps `FINGERKEY_REASON` across sudo. |
 | `scripts/rollback.sh` | Reverses the install and restores the original PAM files. |
 | `scripts/e2e-local.sh` | One-command local end-to-end test (no root, no phone): builds the daemon and simulator into a throwaway tmpdir and runs the approve, deny, reconnect, unregistered-gating, timeout and wrong-fingerprint scenarios. Needs `go`, `curl` and `jq`; about 90 seconds. |
 | `scripts/fingerkey/` | Pair CLI: `pair-qr <name>`, `pair <name> <pubkey_b64>`, `list`, `remove <name>` (pair, remove and pair-qr need root; list does not). |
 | `scripts/phone-sim/` | Simulator for testing. Dials the daemon's TLS listener, pins it by fingerprint, and speaks the same framed protocol as the app: `-addr <host:port> -fp <hex> -key <priv_b64> [-decision approve|deny|hold] [-once]`; `-keygen` prints a fresh keypair. |
 | `scripts/format/` | Shared Go helper for the pinned signed-message byte format, used by the simulator. |
-| `app/` | Flutter Android app **FingerKey** (package `com.phonefprint.auth`). Scans the pairing QR, pins the certificate fingerprint, connects to every reachable computer, and signs approvals with BiometricPrompt. |
+| `app/` | Flutter Android app **FingerKey** (package `com.phonefprint.auth`). Scans the pairing QR, pins the certificate fingerprint, connects to every reachable computer, and signs approvals with BiometricPrompt. Keeps the link alive in a foreground service (a headless Flutter engine owns the sockets) and shows a native overlay card for background requests; settings page for the approval sound and paired computers. |
 | `etc/` | systemd unit. |
 
 ## Prerequisites
@@ -94,7 +94,7 @@ mDNS discovery runs inside the daemon, so no external discovery service is neede
 For the app:
 
 - Flutter with the Android SDK toolchain (`flutter analyze`, `flutter test`, `flutter build apk --release`)
-- An Android phone on the same LAN as the computer
+- An Android phone on the same LAN as the computer; the background popup needs the app permissions listed under Usage
 
 ## Build and install
 
@@ -148,11 +148,25 @@ sudo fingerkey remove my-phone   # unpair; takes effect immediately
 
 ## Usage
 
-1. Keep the app open and the phone on the same LAN as the computer. The daemon pushes pending requests only to registered, connected phones; a closed app or a disconnected phone sees nothing.
+1. Keep the phone on the same LAN as the computer. The app runs a **background service** that keeps a link to every paired computer, so it keeps working when not in the foreground.
 2. Run `sudo`, a pkexec action (for example `pkexec ...` or a GUI policy dialog), or any other PAM-authenticated command (`su`, `login`, `sshd`, …).
-3. The app shows the request with the user, service and tty context, plus a countdown. Approve with your fingerprint.
+3. The app shows the request with the user, service and tty context, the **reason** (a short note the caller may attach via the `FINGERKEY_REASON` env var) and the **command** it is about to run, plus a countdown. Approve with your fingerprint.
 4. The command proceeds. If you deny, or nothing happens within 60 seconds, the normal password prompt appears.
-5. If the app is closed or no phone is connected, the daemon answers session creation with 503 and PAM falls back to the password prompt immediately.
+5. **Background popup.** When the app is backgrounded, the request pops up as a card over whatever is on screen (native overlay window) plus a notification; approving brings the app forward for the fingerprint prompt.
+6. **Dismissing.** Swipe a request away, or tap the ✕ in the app bar to clear them all, to ignore it locally — no decision is sent; the daemon session times out back to the password prompt.
+7. If no phone is connected (app force-stopped or no registered phone), the daemon answers session creation with 503 and PAM falls back to the password prompt immediately.
+
+The reason and command are display-only: not signed, not audit-logged.
+
+The **approval sound** — a settings-page toggle, on by default — rings once when a request arrives, foreground and background.
+
+### App permissions
+
+The background popup needs:
+
+- **Display over other apps** (`SYSTEM_ALERT_WINDOW`)
+- **Notifications** (Android 13+)
+- On some OEM ROMs (ColorOS/MIUI) also **"Display pop-ups while running in the background"**, so tapping the card can bring the app forward.
 
 ### Multiple devices
 
@@ -227,6 +241,7 @@ Rollback removes `/var/lib/phone-fprint-auth/tls`, so a later reinstall generate
 - **Certificate pinning is the trust anchor.** The phone trusts exactly one server identity: the lowercase hex SHA-256 fingerprint of the daemon's self-signed certificate. A machine on the LAN without the private key cannot impersonate the daemon, and there is no CA to compromise.
 - **Regenerating the certificate changes the fingerprint.** If you roll back and reinstall, delete or wipe `/var/lib/phone-fprint-auth/tls`, or the certificate is otherwise lost, the daemon creates a new identity. The app still pins the old fingerprint, so it refuses the new server until you re-pair every phone with `pair-qr`. Treat the TLS directory as part of the pairing state.
 - **Signed, nonce-bound decisions.** The phone signs `"phone-fprint-auth/v1" || 0x00 || action || 0x00 || u8len(user) || user || u8len(service) || service || u8len(tty) || tty || nonce` with Ed25519. The nonce is one-time, the session expires after 60 seconds, and the context is inside the signed bytes, so a captured decision cannot be replayed against a different request.
+- **Reason and command are display-only.** The `FINGERKEY_REASON` note and the command shown on the approval card are not signed, not audit-logged, and take no part in the approval decision.
 - **Approval authority is explicit registration.** Only public keys added by `pair-qr` (or `pair`) can produce an accepted decision; anything else is rejected as `unpaired-key`. Holding the TLS fingerprint alone does not grant approval.
 - **Unregistered clients get nothing.** A TLS client without a paired key is answered with `welcome{registered:false}` and closed before it can subscribe: no pending sessions and no decision results. A phone that is removed stops receiving pushes immediately.
 - **The unix socket is root-only.** `POST /v1/session`, `GET /v1/session/{id}` and `POST /v1/pair` live on `/run/phone-fprint-auth/daemon.sock` (socket and parent dir 0700). Only root, or a setuid-root process such as the PAM module, can create sessions or mint pairing tokens, so nobody else can forge prompt spam or decoy requests.
@@ -245,7 +260,7 @@ Residual risks:
 
 | Path | Contents |
 | --- | --- |
-| `app/` | Flutter Android app (`com.phonefprint.auth`). Release APK at `app/build/app/outputs/flutter-apk/app-release.apk`. |
+| `app/` | Flutter Android app (`com.phonefprint.auth`): keeps the link alive in a foreground service (headless Flutter engine) and shows a native overlay card for background requests; settings page for the approval sound and paired computers. Release APK at `app/build/app/outputs/flutter-apk/app-release.apk`. |
 | `daemon/` | Go approval daemon: unix socket surface, TLS phone listener, pairing tokens, mDNS, session store, lazy key loading, Ed25519 verification, unit tests. |
 | `etc/` | systemd unit. |
 | `pam/` | PAM module C source and build Makefile. |
