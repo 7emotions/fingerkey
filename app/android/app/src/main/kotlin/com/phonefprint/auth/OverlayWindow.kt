@@ -2,10 +2,14 @@ package com.phonefprint.auth
 
 import android.content.Context
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
+import android.graphics.drawable.ClipDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
+import android.graphics.drawable.RippleDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -15,7 +19,10 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
@@ -23,6 +30,7 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import java.util.concurrent.CopyOnWriteArraySet
+import kotlin.math.min
 
 /**
  * Native approval overlay — the "华强北 AirPods 弹窗" of FingerKey. Shows an
@@ -62,6 +70,20 @@ class OverlayWindow(context: Context? = null) :
 
         /** Fallback expiry when the caller omits expiresAt (60s, like the daemon). */
         private const val DEFAULT_TTL_MS = 60_000L
+
+        // App palette (app/lib/main.dart: amber seed 0xFFFFB000 over the dark
+        // surface 0xFF0B0E11); the card floats one elevation above it.
+        private val COLOR_CARD = Color.parseColor("#161A20")
+        private val COLOR_BORDER = Color.parseColor("#2A2F38")
+        private val COLOR_TONAL = Color.parseColor("#1D2129")
+        private val COLOR_TRACK = Color.parseColor("#2A2F38")
+        private val COLOR_ACCENT = Color.parseColor("#FFB000")
+        private val COLOR_ACCENT_SOFT = Color.argb(0x26, 0xFF, 0xB0, 0x00)
+        private val COLOR_ON_ACCENT = Color.parseColor("#1A1300")
+        private val COLOR_TEXT = Color.parseColor("#E8EBF0")
+        private val COLOR_MUTED = Color.parseColor("#9AA1AC")
+        private val COLOR_LABEL = Color.parseColor("#79828F")
+        private val COLOR_DENY_STROKE = Color.parseColor("#3A414B")
     }
 
     private var applicationContext: Context? = context
@@ -79,6 +101,8 @@ class OverlayWindow(context: Context? = null) :
     // Overlay state. One request at a time; a new show() replaces the old one.
     private var rootView: View? = null
     private var countdownText: TextView? = null
+    private var countdownBar: ProgressBar? = null
+    private var countdownMaxSec: Int = 0
     private var sessionId: String? = null
     private var expiresAtMs: Long = 0L
 
@@ -94,6 +118,7 @@ class OverlayWindow(context: Context? = null) :
             val remaining = ((expiresAtMs - System.currentTimeMillis()) / 1000)
                 .coerceAtLeast(0)
             countdownText?.text = if (remaining > 0) "Expires in ${remaining}s" else "Expired"
+            countdownBar?.progress = remaining.toInt().coerceIn(0, countdownMaxSec)
             if (remaining <= 0) {
                 expire()
             } else {
@@ -198,7 +223,11 @@ class OverlayWindow(context: Context? = null) :
     ) {
         // One request at a time: a newer request replaces the old window.
         removeView()
-        val view = buildCard(context, id, user, service, reason, command)
+        countdownMaxSec = ((expiresAt - System.currentTimeMillis()) / 1000)
+            .coerceAtLeast(1)
+            .toInt()
+        val sourceName = (request?.get("sourceName") as? String).orEmpty()
+        val view = buildCard(context, id, user, service, reason, command, sourceName)
         sessionId = id
         expiresAtMs = expiresAt
         pendingRequest = request
@@ -226,6 +255,7 @@ class OverlayWindow(context: Context? = null) :
         val view = rootView ?: return
         rootView = null
         countdownText = null
+        countdownBar = null
         sessionId = null
         pendingRequest = null
         try {
@@ -343,104 +373,269 @@ class OverlayWindow(context: Context? = null) :
         service: String,
         reason: String,
         command: String,
+        sourceName: String,
     ): View {
         val dp = context.resources.displayMetrics.density
         fun dpf(value: Float): Int = (value * dp).toInt()
 
-        val title = when {
-            user.isNotBlank() && service.isNotBlank() ->
-                "Approve sudo/pkexec for $user on $service?"
-            user.isNotBlank() -> "Approve sudo/pkexec for $user?"
-            else -> "Approve sudo/pkexec?"
+        val headline = if (user.isNotBlank()) {
+            "Approve sudo/pkexec for $user"
+        } else {
+            "Approve sudo/pkexec"
         }
 
         val card = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
-                cornerRadius = 24f * dp
-                setColor(Color.parseColor("#1E1E2E"))
+                cornerRadius = 28f * dp
+                setColor(COLOR_CARD)
+                setStroke(dpf(1f), COLOR_BORDER)
             }
-            setPadding(dpf(24f), dpf(20f), dpf(24f), dpf(20f))
+            // The rounded background provides the outline, so this elevation
+            // casts a real shadow over the app below.
+            elevation = 16f * dp
+            setPadding(dpf(22f), dpf(20f), dpf(22f), dpf(20f))
+            // Card, not sheet: cap the width so it doesn't stretch
+            // edge-to-edge on tablets, with a margin on phones.
+            val screenWidth = context.resources.displayMetrics.widthPixels
+            minimumWidth = min(screenWidth - dpf(48f), dpf(420f))
         }
 
-        card.addView(TextView(context).apply {
-            text = title
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            typeface = Typeface.DEFAULT_BOLD
-        })
+        // Header: tonal fingerprint chip + title + originating computer.
+        card.addView(
+            LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(
+                    FrameLayout(context).apply {
+                        background = GradientDrawable().apply {
+                            shape = GradientDrawable.OVAL
+                            setColor(COLOR_ACCENT_SOFT)
+                        }
+                        addView(
+                            ImageView(context).apply {
+                                setImageResource(R.drawable.ic_fingerprint)
+                                imageTintList = ColorStateList.valueOf(COLOR_ACCENT)
+                            },
+                            FrameLayout.LayoutParams(dpf(24f), dpf(24f), Gravity.CENTER),
+                        )
+                    },
+                    LinearLayout.LayoutParams(dpf(42f), dpf(42f)),
+                )
+                addView(
+                    LinearLayout(context).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(TextView(context).apply {
+                            text = "Approve this request"
+                            setTextColor(COLOR_TEXT)
+                            textSize = 16f
+                            typeface = Typeface.DEFAULT_BOLD
+                        })
+                        addView(TextView(context).apply {
+                            text = sourceName.ifBlank { "(unknown computer)" }
+                            setTextColor(COLOR_MUTED)
+                            textSize = 12f
+                        })
+                    },
+                    LinearLayout.LayoutParams(
+                        0,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        1f,
+                    ).apply { marginStart = dpf(12f) },
+                )
+            },
+        )
+
+        // The ask itself, prominent; the service is de-emphasised below it.
+        card.addView(
+            TextView(context).apply {
+                text = headline
+                setTextColor(COLOR_TEXT)
+                textSize = 15f
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dpf(16f) },
+        )
+        if (service.isNotBlank()) {
+            card.addView(
+                TextView(context).apply {
+                    text = "on $service"
+                    setTextColor(COLOR_LABEL)
+                    textSize = 13f
+                },
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dpf(2f) },
+            )
+        }
 
         if (reason.isNotBlank()) {
-            card.addView(row(context, "REASON", reason))
+            card.addView(fieldBlock(context, "REASON", reason, monospace = false))
         }
         if (command.isNotBlank()) {
-            card.addView(row(context, "COMMAND", command))
+            card.addView(fieldBlock(context, "COMMAND", command, monospace = true))
         }
 
+        // Countdown: a slim draining bar plus the seconds text. The tick
+        // updates both; the text string is unchanged.
+        val track = GradientDrawable().apply {
+            cornerRadius = 999f
+            setColor(COLOR_TRACK)
+        }
+        val fill = GradientDrawable().apply {
+            cornerRadius = 999f
+            setColor(COLOR_ACCENT)
+        }
+        val barLayers = LayerDrawable(
+            arrayOf(track, ClipDrawable(fill, Gravity.START, ClipDrawable.HORIZONTAL)),
+        ).apply {
+            setId(0, android.R.id.background)
+            setId(1, android.R.id.progress)
+        }
+        countdownBar = ProgressBar(
+            context,
+            null,
+            android.R.attr.progressBarStyleHorizontal,
+        ).apply {
+            isIndeterminate = false
+            progressDrawable = barLayers
+            max = countdownMaxSec
+            progress = countdownMaxSec
+        }
         countdownText = TextView(context).apply {
-            setTextColor(Color.parseColor("#FAB387"))
-            textSize = 14f
+            setTextColor(COLOR_ACCENT)
+            textSize = 12f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             text = "Expires in —s"
         }
-        card.addView(countdownText)
+        card.addView(
+            LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(
+                    countdownBar,
+                    LinearLayout.LayoutParams(0, dpf(4f), 1f),
+                )
+                addView(
+                    countdownText,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { marginStart = dpf(10f) },
+                )
+            },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dpf(18f) },
+        )
 
         card.addView(
             LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
-                setPadding(0, dpf(12f), 0, 0)
                 addView(
-                    decisionButton(context, "DENY", Color.parseColor("#D64545")),
-                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                        marginEnd = dpf(8f)
+                    decisionButton(context, "DENY", filled = false),
+                    LinearLayout.LayoutParams(0, dpf(48f), 1f).apply {
+                        marginEnd = dpf(6f)
                     },
                 )
                 addView(
-                    decisionButton(context, "APPROVE", Color.parseColor("#3A9D5D")),
-                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                        marginStart = dpf(8f)
+                    decisionButton(context, "APPROVE", filled = true),
+                    LinearLayout.LayoutParams(0, dpf(48f), 1f).apply {
+                        marginStart = dpf(6f)
                     },
                 )
             },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dpf(18f) },
         )
         return card
     }
 
-    /** Two-line label/value row; the label is muted, the value is white. */
-    private fun row(context: Context, label: String, value: String): View {
+    /** Tonal labeled block: small letterspaced label above a readable value. */
+    private fun fieldBlock(
+        context: Context,
+        label: String,
+        value: String,
+        monospace: Boolean,
+    ): View {
         val dp = context.resources.displayMetrics.density
         fun dpf(value: Float): Int = (value * dp).toInt()
         return LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dpf(10f), 0, 0)
+            background = GradientDrawable().apply {
+                cornerRadius = 14f * dp
+                setColor(COLOR_TONAL)
+            }
+            setPadding(dpf(12f), dpf(10f), dpf(12f), dpf(10f))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dpf(10f) }
             addView(TextView(context).apply {
                 text = label
-                setTextColor(Color.parseColor("#A6ADC8"))
+                setTextColor(COLOR_LABEL)
                 textSize = 11f
                 typeface = Typeface.DEFAULT_BOLD
+                letterSpacing = 0.08f
             })
             addView(TextView(context).apply {
                 text = value
-                setTextColor(Color.parseColor("#CDD6F4"))
+                setTextColor(COLOR_TEXT)
                 textSize = 14f
+                if (monospace) typeface = Typeface.MONOSPACE
+                setPadding(0, dpf(4f), 0, 0)
             })
         }
     }
 
-    private fun decisionButton(context: Context, label: String, color: Int): Button =
-        Button(context).apply {
+    /** APPROVE is the filled amber primary; DENY is the outlined secondary. */
+    private fun decisionButton(context: Context, label: String, filled: Boolean): Button {
+        val dp = context.resources.displayMetrics.density
+        fun dpf(value: Float): Int = (value * dp).toInt()
+        val shape = GradientDrawable().apply {
+            cornerRadius = 16f * dp
+            if (filled) {
+                setColor(COLOR_ACCENT)
+            } else {
+                setColor(Color.TRANSPARENT)
+                setStroke(dpf(1f), COLOR_DENY_STROKE)
+            }
+        }
+        val mask = GradientDrawable().apply {
+            cornerRadius = 16f * dp
+            setColor(Color.WHITE)
+        }
+        val rippleColor = if (filled) {
+            Color.argb(0x33, 0x00, 0x00, 0x00)
+        } else {
+            Color.argb(0x26, 0xFF, 0xFF, 0xFF)
+        }
+        return Button(context).apply {
             text = label
-            setTextColor(Color.WHITE)
+            isAllCaps = false
+            setTextColor(if (filled) COLOR_ON_ACCENT else COLOR_TEXT)
             textSize = 14f
-            typeface = Typeface.DEFAULT_BOLD
-            background = GradientDrawable().apply {
-                cornerRadius = 999f
-                setColor(color)
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
+            letterSpacing = 0.02f
+            background = RippleDrawable(ColorStateList.valueOf(rippleColor), shape, mask)
+            if (filled) {
+                setCompoundDrawablesWithIntrinsicBounds(R.drawable.ic_fingerprint, 0, 0, 0)
+                compoundDrawableTintList = ColorStateList.valueOf(COLOR_ON_ACCENT)
+                compoundDrawablePadding = dpf(8f)
             }
             setOnClickListener {
                 val id = sessionId ?: return@setOnClickListener
                 onDecision(id, label.lowercase())
             }
         }
+    }
 
     // ---- events ----------------------------------------------------------
 
