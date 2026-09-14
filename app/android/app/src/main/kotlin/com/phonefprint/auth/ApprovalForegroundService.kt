@@ -14,6 +14,7 @@ import com.it_nomads.fluttersecurestorage.FlutterSecureStoragePlugin
 import io.flutter.FlutterInjector
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.dart.DartExecutor
+import io.flutter.plugin.platform.PlatformViewsController
 
 /**
  * Foreground service that keeps the daemon approval link alive when the app
@@ -137,19 +138,37 @@ class ApprovalForegroundService : Service() {
                 FlutterInjector.instance().flutterLoader().findAppBundlePath(),
                 "mainBackground",
             )
-            val engine = EngineHolder.engineGroup(this)
-                .createAndRunEngine(applicationContext, entrypoint)
-            // Register only what the background isolate uses. Deliberately NOT
+            // FlutterEngineGroup has no public "create without running" API
+            // (createEngine is package-private), so the engine is built with
+            // the public constructor that createEngine itself uses, passing
+            // the shared group. It still attaches to the process-wide Dart VM
+            // (DartVMRef reuses the running VM), so the cross-engine
+            // IsolateNameServer bridge keeps working, but the entrypoint is
+            // NOT executed until every plugin is attached below.
+            val engine = FlutterEngine(
+                applicationContext,
+                null, // FlutterLoader — the injector's shared instance
+                FlutterInjector.instance().getFlutterJNIFactory().provideFlutterJNI(),
+                PlatformViewsController(),
+                null, // dartVmArgs — the VM is already running
+                true, // automaticallyRegisterPlugins (createAndRunEngine's default)
+                false, // waitForRestorationData
+                EngineHolder.engineGroup(this),
+            )
+            // Register only what the background isolate uses, BEFORE the Dart
+            // entrypoint runs, so a cold-start EventChannel subscribe cannot
+            // hit a not-yet-attached handler and be lost. Deliberately NOT
             // GeneratedPluginRegistrant: local_auth/mobile_scanner are
             // Activity-bound and never run headless (no biometric here).
             engine.plugins.add(FlutterSecureStoragePlugin())
             engine.plugins.add(EngineHolder.serviceChannel(this))
-            engine.plugins.add(EngineHolder.overlayChannel(this))
             engine.plugins.add(EngineHolder.notifier(this))
+            engine.plugins.add(EngineHolder.overlayChannel(this))
             // Roster writes happen in this engine too (forget + mDNS lastAddr
             // refresh), so the boot-receiver marker channel is registered here
             // as well as on the UI engine (task 13).
             KeepalivePrefs.register(engine.dartExecutor.binaryMessenger, applicationContext)
+            engine.dartExecutor.executeDartEntrypoint(entrypoint)
             EngineHolder.serviceEngine = engine
         }
     }

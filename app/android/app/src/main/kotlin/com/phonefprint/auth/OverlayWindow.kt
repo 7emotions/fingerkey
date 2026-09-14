@@ -43,6 +43,7 @@ import kotlin.math.min
  *     (or "permission_required" when SYSTEM_ALERT_WINDOW access is missing;
  *     the user is routed to the Settings grant page once instead of crashing)
  *   - hide()
+ *   - hideForId({id}) — removes the card only when it shows this session
  *
  * EventChannel "com.phonefprint.auth/overlay_events":
  *   - {type: decision, id, decision: "deny", source} on DENY (task 12: the
@@ -177,8 +178,24 @@ class OverlayWindow(context: Context? = null) :
                 removeView()
                 result.success(null)
             }
+            "hideForId" -> hideForId(call, result)
             else -> result.notImplemented()
         }
+    }
+
+    /**
+     * Removes the view ONLY when the currently shown card belongs to [id];
+     * a no-op otherwise, so a stale session's dismissal cannot tear down the
+     * card of a newer one.
+     */
+    private fun hideForId(call: MethodCall, result: MethodChannel.Result) {
+        val id = call.argument<String>("id")
+        if (id == null || sessionId != id) {
+            result.success(null)
+            return
+        }
+        removeView()
+        result.success(null)
     }
 
     // ---- EventChannel.StreamHandler -------------------------------------

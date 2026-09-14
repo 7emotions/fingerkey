@@ -78,9 +78,8 @@ class TcpTlsChannel(context: Context? = null) : FlutterPlugin, MethodCallHandler
     private var methodChannel: MethodChannel? = null
     private var eventChannel: EventChannel? = null
 
-    /** Sink of this engine's own Dart subscription (at most one per channel). */
-    @Volatile
-    private var engineSink: EventChannel.EventSink? = null
+    /** Sinks of this engine's own Dart subscriptions (one per listen). */
+    private val engineSinks = CopyOnWriteArraySet<EventChannel.EventSink>()
 
     /** Sinks of delegating engines (e.g. the Activity via [TcpTlsChannelDelegate]). */
     private val delegateSinks = CopyOnWriteArraySet<EventChannel.EventSink>()
@@ -138,11 +137,14 @@ class TcpTlsChannel(context: Context? = null) : FlutterPlugin, MethodCallHandler
     // ---- EventChannel.StreamHandler -------------------------------------
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-        engineSink = events
+        if (events != null) engineSinks.add(events)
     }
 
     override fun onCancel(arguments: Any?) {
-        engineSink = null
+        // The engine invalidates the previous sink with onCancel before each
+        // new onListen (single active sink per channel), and a cancel message
+        // tears the active one down; either way every engine sink is stale.
+        engineSinks.clear()
     }
 
     /** Adds a sink mirroring this channel's events to another engine. */
@@ -386,7 +388,7 @@ class TcpTlsChannel(context: Context? = null) : FlutterPlugin, MethodCallHandler
     }
 
     private fun postEvent(event: Map<String, Any?>) {
-        val sinks = delegateSinks.toList() + listOfNotNull(engineSink)
+        val sinks = delegateSinks.toList() + engineSinks.toList()
         if (sinks.isEmpty()) return
         mainHandler.post {
             for (sink in sinks) {

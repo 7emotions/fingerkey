@@ -18,6 +18,7 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
  * "com.phonefprint.auth/notify":
  *
  *   - showApproval({id, user, service, reason, command, sound}) -> "posted"
+ *   - cancel({id}) -> null (dismisses the notification that showApproval posted)
  *
  * Pairs with [OverlayWindow]: when a pending request arrives while the UI
  * isolate is not attached (app backgrounded/killed), the service engine
@@ -74,8 +75,23 @@ class ApprovalNotifier(context: Context? = null) :
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "showApproval" -> showApproval(call, result)
+            "cancel" -> cancel(call, result)
             else -> result.notImplemented()
         }
+    }
+
+    private fun cancel(call: MethodCall, result: MethodChannel.Result) {
+        val context = applicationContext
+        if (context == null) {
+            result.error("no_context", "Plugin not attached", null)
+            return
+        }
+        val id = call.argument<String>("id") ?: ""
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        // Same id math as postApprovalNotification: a resolved/expired session
+        // must cancel the exact notification its pending request posted.
+        nm.cancel(NOTIFICATION_ID_BASE + (id.hashCode() and 0x7fffffff))
+        result.success(null)
     }
 
     private fun showApproval(call: MethodCall, result: MethodChannel.Result) {
