@@ -144,17 +144,22 @@ class _ApprovalScreenState extends State<ApprovalScreen>
     super.dispose();
   }
 
-  /// Keeps the bridge's foreground claim in sync with the app lifecycle:
-  /// whenever the app leaves [AppLifecycleState.resumed] (paused, hidden,
-  /// inactive — or detached), the UI port `phonefprint.ui` is unregistered so
-  /// the service engine's `_sendToUi` reports "backgrounded" and a pushed
-  /// request fires the overlay + notification alert. On resume the port is
-  /// re-registered and the pending snapshot replayed (task 15).
+  /// Keeps the bridge's foreground claim in sync with the app lifecycle.
+  /// Only real backgrounding (paused, hidden, or detached) unregisters the
+  /// UI port `phonefprint.ui`, so the service engine's `_sendToUi` reports
+  /// "backgrounded" and a pushed request fires the overlay + notification
+  /// alert. A transient [AppLifecycleState.inactive] — Android sends it on
+  /// every Activity pause, e.g. while the BiometricPrompt system dialog is
+  /// up — must NOT detach, or the post-decision RPC dies mid-approve with
+  /// "ui bridge not attached". On resume/inactive the port is re-registered
+  /// and the pending snapshot replayed (task 15/16).
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final manager = _manager;
     if (manager is ServiceLinkManager) {
-      unawaited(manager.setForeground(state == AppLifecycleState.resumed));
+      final foreground = state == AppLifecycleState.resumed ||
+          state == AppLifecycleState.inactive;
+      unawaited(manager.setForeground(foreground));
     }
   }
 
@@ -395,11 +400,12 @@ class _ApprovalScreenState extends State<ApprovalScreen>
       } else {
         setState(() => _status = 'Daemon rejected decision (${result.error}).');
       }
-    } catch (_) {
+    } catch (e) {
       if (_disposed) return;
-      // The card stays in-flight; the client re-posts the decision idempotently
-      // on reconnect so the verdict is not lost.
-      setState(() => _status = 'Sending… will retry on reconnect.');
+      // The card stays in-flight, so the user can tap APPROVE again to retry.
+      // Surface the real error: a swallowed "will retry on reconnect" hid the
+      // "ui bridge not attached" failure that silently dropped decisions.
+      setState(() => _status = 'Send failed: $e');
     }
   }
 

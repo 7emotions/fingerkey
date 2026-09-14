@@ -500,11 +500,14 @@ class ServiceLinkManager extends ConnectionManager {
   Future<void> start() => _attachWithRetry();
 
   /// Lifecycle hook driven by the approval screen's [WidgetsBindingObserver].
-  /// On background ([foreground] false: paused/hidden/inactive) it detaches
+  /// On background ([foreground] false: paused/hidden/detached) it detaches
   /// the UI bridge — unregistering the `phonefprint.ui` port, which is the
   /// service engine's "UI foregrounded" signal — while keeping the exposed
-  /// streams open. On resume it re-attaches, which re-registers the port and
-  /// replays the pending snapshot.
+  /// streams open. A transient `inactive` (BiometricPrompt and other system
+  /// dialogs pause the Activity without stopping it) counts as foreground so
+  /// a decision RPC issued right after the prompt still finds the port. On
+  /// resume/inactive it re-attaches, which re-registers the port and replays
+  /// the pending snapshot.
   Future<void> setForeground(bool foreground) async {
     _foreground = foreground;
     if (foreground) {

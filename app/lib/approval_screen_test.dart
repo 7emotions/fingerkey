@@ -715,8 +715,8 @@ void main() {
   });
 
   testWidgets(
-      'backgrounding detaches the bridge (foreground=false) and resume '
-      're-attaches it (task 15)', (tester) async {
+      'backgrounding detaches the bridge (foreground=false), transient '
+      'inactive and resume keep it attached (task 15/16)', (tester) async {
     final identity = await _identity();
     final manager = _FakeServiceLinkManager(identity);
     await tester.pumpWidget(
@@ -746,18 +746,20 @@ void main() {
     await _settle(tester);
     expect(manager.foregroundCalls, <bool>[false]);
 
-    // Any further non-resumed state keeps it detached (idempotent calls are
-    // harmless; the real ServiceLinkManager.detach is a no-op when detached).
+    // Transient inactive — Android pauses the Activity for system dialogs
+    // such as BiometricPrompt without stopping it — must NOT detach: the
+    // bridge stays up so the post-decision RPC issued after the prompt
+    // succeeds instead of throwing "ui bridge not attached".
     // ignore: invalid_use_of_protected_member
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
     await _settle(tester);
-    expect(manager.foregroundCalls, <bool>[false, false]);
+    expect(manager.foregroundCalls, <bool>[false, true]);
 
     // Resumed: re-attach re-registers the port and replays the snapshot.
     // ignore: invalid_use_of_protected_member
     tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
     await _settle(tester);
-    expect(manager.foregroundCalls, <bool>[false, false, true]);
+    expect(manager.foregroundCalls, <bool>[false, true, true]);
 
     await _dispose(tester);
   });
