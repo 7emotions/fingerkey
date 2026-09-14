@@ -11,6 +11,8 @@ import 'dart:convert';
 // Test-only file pinned at lib/ per the build plan; the runner entry point
 // is test/key_store_test.dart.
 // ignore: depend_on_referenced_packages
+import 'package:flutter/services.dart';
+// ignore: depend_on_referenced_packages
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
@@ -116,6 +118,94 @@ void main() {
 
       expect(await store.roster(), isEmpty);
       expect(await store.load(), isNull);
+    });
+  });
+
+  group('boot marker (task 21)', () {
+    test('roster() read self-heals the marker for a non-empty roster',
+        () async {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      final calls = <MethodCall>[];
+      const channel = MethodChannel('com.phonefprint.auth/keepalive');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        calls.add(call);
+        return null;
+      });
+      try {
+        // An install upgraded from an older version: the roster exists in
+        // secure storage but the marker was never written (it used to be
+        // mirrored only on roster WRITE), so the boot receiver would skip
+        // the service after the first reboot.
+        // ignore: invalid_use_of_visible_for_testing_member
+        FlutterSecureStorage.setMockInitialValues({
+          'roster': json.encode([
+            {
+              'name': 'desk',
+              'fingerprint': 'abc123',
+              'lastAddr': '192.168.1.5:4443',
+            },
+          ]),
+        });
+        final roster = await KeyStore().roster();
+        expect(roster, hasLength(1));
+        await pumpEventQueue(); // let the fire-and-forget channel call land
+
+        final markerCalls =
+            calls.where((c) => c.method == 'setRosterConfigured').toList();
+        expect(markerCalls, hasLength(1));
+        expect((markerCalls.single.arguments as Map)['configured'], isTrue);
+      } finally {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null);
+      }
+    });
+  });
+
+  group('soundEnabled pref', () {
+    test('missing key defaults to true', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({});
+      expect(await KeyStore().loadSoundEnabled(), isTrue);
+    });
+
+    test('setSoundEnabled(false) persists and reads back false', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({});
+      final store = KeyStore();
+
+      await store.setSoundEnabled(false);
+      expect(await store.loadSoundEnabled(), isFalse);
+
+      await store.setSoundEnabled(true);
+      expect(await store.loadSoundEnabled(), isTrue);
+    });
+
+    test('corrupt value falls back to true', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({'sound_enabled': 'garbage'});
+      expect(await KeyStore().loadSoundEnabled(), isTrue);
+    });
+
+    test('explicit "0" reads back false', () async {
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({'sound_enabled': '0'});
+      expect(await KeyStore().loadSoundEnabled(), isFalse);
+    });
+
+    test('resetIdentity keeps the sound pref', () async {
+      final seed = base64.encode(List<int>.filled(32, 7));
+      // ignore: invalid_use_of_visible_for_testing_member
+      FlutterSecureStorage.setMockInitialValues({
+        'ed25519_private_key': seed,
+        'sound_enabled': '0',
+      });
+      final store = KeyStore();
+
+      await store.resetIdentity();
+
+      expect(await store.load(), isNull);
+      expect(await store.loadSoundEnabled(), isFalse); // pref survives reset
     });
   });
 }

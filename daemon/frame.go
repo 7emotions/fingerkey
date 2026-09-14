@@ -80,7 +80,8 @@ type registeredFrame struct {
 
 // pendingFrame is the daemon→phone notification for a new pending session.
 // The nonce is standard-base64 of the 32 raw bytes. The shape is the
-// cross-language contract mirrored by app/lib/frame.dart.
+// cross-language contract mirrored by app/lib/frame.dart. reason and command
+// are display-only context and omitted when empty.
 type pendingFrame struct {
 	Type      string `json:"type"`
 	ID        string `json:"id"`
@@ -88,6 +89,8 @@ type pendingFrame struct {
 	User      string `json:"user"`
 	Service   string `json:"service"`
 	TTY       string `json:"tty"`
+	Reason    string `json:"reason,omitempty"`
+	Command   string `json:"command,omitempty"`
 	ExpiresAt int64  `json:"expires_at"`
 }
 
@@ -131,6 +134,8 @@ func pendingFrameFromSession(s *Session) pendingFrame {
 		User:      s.User,
 		Service:   s.Service,
 		TTY:       s.TTY,
+		Reason:    s.Reason,
+		Command:   s.Command,
 		ExpiresAt: s.ExpiresAt.Unix(),
 	}
 }

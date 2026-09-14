@@ -18,6 +18,7 @@ import java.security.SecureRandom
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -48,8 +49,15 @@ import javax.net.ssl.X509TrustManager
  *
  * Every connection gets its own id so the app can keep one live socket per
  * roster computer ("connect all").
+ *
+ * SINGLE OWNERSHIP: this class is the only socket owner in the process. It is
+ * attached to the headless engine of [ApprovalForegroundService]; the
+ * Activity's engine never attaches its own instance but delegates through
+ * [TcpTlsChannelDelegate]. [addEventSink]/[removeEventSink] let that delegate
+ * mirror the event stream to a second engine without owning any socket, so
+ * the Activity engine's teardown cannot kill the service's connections.
  */
-class TcpTlsChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
+class TcpTlsChannel(context: Context? = null) : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
 
     companion object {
         const val METHOD_CHANNEL = "com.phonefprint.auth/tcp"
@@ -66,16 +74,19 @@ class TcpTlsChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandl
         private val nextId = AtomicInteger(0)
     }
 
-    private var applicationContext: Context? = null
+    private var applicationContext: Context? = context
     private var methodChannel: MethodChannel? = null
     private var eventChannel: EventChannel? = null
 
-    @Volatile
-    private var eventSink: EventChannel.EventSink? = null
+    /** Sinks of this engine's own Dart subscriptions (one per listen). */
+    private val engineSinks = CopyOnWriteArraySet<EventChannel.EventSink>()
+
+    /** Sinks of delegating engines (e.g. the Activity via [TcpTlsChannelDelegate]). */
+    private val delegateSinks = CopyOnWriteArraySet<EventChannel.EventSink>()
 
     private val connections = ConcurrentHashMap<Int, Connection>()
-    private val readExecutor = Executors.newCachedThreadPool()
-    private val writeExecutor = Executors.newSingleThreadExecutor()
+    private var readExecutor = Executors.newCachedThreadPool()
+    private var writeExecutor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private class Connection(val id: Int) {
@@ -89,6 +100,10 @@ class TcpTlsChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandl
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         applicationContext = binding.applicationContext
+        // A START_STICKY service restart re-attaches this instance to a fresh
+        // engine after tearDown() shut the pools down; arm fresh ones.
+        if (readExecutor.isShutdown) readExecutor = Executors.newCachedThreadPool()
+        if (writeExecutor.isShutdown) writeExecutor = Executors.newSingleThreadExecutor()
         methodChannel = MethodChannel(binding.binaryMessenger, METHOD_CHANNEL)
         methodChannel?.setMethodCallHandler(this)
         eventChannel = EventChannel(binding.binaryMessenger, EVENT_CHANNEL)
@@ -122,11 +137,24 @@ class TcpTlsChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandl
     // ---- EventChannel.StreamHandler -------------------------------------
 
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-        eventSink = events
+        if (events != null) engineSinks.add(events)
     }
 
     override fun onCancel(arguments: Any?) {
-        eventSink = null
+        // The engine invalidates the previous sink with onCancel before each
+        // new onListen (single active sink per channel), and a cancel message
+        // tears the active one down; either way every engine sink is stale.
+        engineSinks.clear()
+    }
+
+    /** Adds a sink mirroring this channel's events to another engine. */
+    fun addEventSink(sink: EventChannel.EventSink) {
+        delegateSinks.add(sink)
+    }
+
+    /** Removes a previously added mirroring sink. */
+    fun removeEventSink(sink: EventChannel.EventSink) {
+        delegateSinks.remove(sink)
     }
 
     // ---- connect ---------------------------------------------------------
@@ -137,6 +165,12 @@ class TcpTlsChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandl
         val fp = call.argument<String>("fp")
         if (host.isNullOrBlank() || port == null || fp.isNullOrBlank()) {
             result.error("bad_args", "host, port and fp are required", null)
+            return
+        }
+        if (readExecutor.isShutdown) {
+            // The owning service engine was destroyed; a delegate could still
+            // be forwarding calls. Fail gracefully instead of crashing.
+            result.error("service_stopped", "Background link service has stopped", null)
             return
         }
         val id = nextId.incrementAndGet()
@@ -354,8 +388,17 @@ class TcpTlsChannel : FlutterPlugin, MethodCallHandler, EventChannel.StreamHandl
     }
 
     private fun postEvent(event: Map<String, Any?>) {
-        val sink = eventSink ?: return
-        mainHandler.post { sink.success(event) }
+        val sinks = delegateSinks.toList() + engineSinks.toList()
+        if (sinks.isEmpty()) return
+        mainHandler.post {
+            for (sink in sinks) {
+                try {
+                    sink.success(event)
+                } catch (_: RuntimeException) {
+                    // A sink from a destroyed engine may throw on use; drop it.
+                }
+            }
+        }
     }
 
     private fun isFingerprintMismatch(t: Throwable): Boolean {

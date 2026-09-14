@@ -1,8 +1,9 @@
 /// Multi-computer approval flow: the [ConnectionManager] keeps one TLS link
 /// per roster computer and aggregates their pending requests; this screen
 /// shows one card per request (tagged with the source computer) with a
-/// monotonic deadline countdown, pops the biometric prompt to approve, and
-/// reconciles cards that another phone decided or that expired. The gear menu
+/// monotonic deadline countdown, prompts for biometrics when the user taps
+/// APPROVE, and reconciles cards that another phone decided or that expired.
+/// The gear opens the settings page (approval-sound toggle), which also
 /// splits "forget this computer" (keeps the key) from "reset identity"
 /// (wipes the key + roster).
 library;
@@ -10,12 +11,15 @@ library;
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:local_auth/local_auth.dart';
 
 import 'connection_manager.dart';
 import 'daemon_client.dart';
 import 'format.dart';
 import 'key_store.dart';
+import 'service_bridge.dart';
+import 'settings_screen.dart';
 
 class ApprovalScreen extends StatefulWidget {
   const ApprovalScreen({
@@ -27,6 +31,8 @@ class ApprovalScreen extends StatefulWidget {
     required this.onRosterChanged,
     this.manager,
     this.authenticate,
+    this.playSound,
+    this.overlayApproveStream,
   });
 
   final DeviceIdentity identity;
@@ -36,8 +42,9 @@ class ApprovalScreen extends StatefulWidget {
   /// menu. Refreshed by the caller after a forget.
   final List<RosterComputer> roster;
 
-  /// Full identity reset (wipe key + roster).
-  final VoidCallback onReset;
+  /// Full identity reset (wipe key + roster). Async so the reset flow can
+  /// await the wipe before ordering the service-side link reset (task 21).
+  final Future<void> Function() onReset;
 
   /// The roster changed (a computer was forgotten); the caller re-reads it
   /// and falls back to pairing when it emptied.
@@ -50,46 +57,111 @@ class ApprovalScreen extends StatefulWidget {
   /// authenticated. Defaults to the real [LocalAuthentication] flow.
   final Future<bool> Function(String reason)? authenticate;
 
+  /// Test seam: plays the alert sound when a new request arrives. Defaults
+  /// to [SystemSound.play] with [SystemSoundType.alert].
+  final Future<void> Function()? playSound;
+
+  /// Test seam: overlay-APPROVE payloads (task 12). Defaults to the native
+  /// launch EventChannel (`com.phonefprint.auth/launch_events`), which
+  /// emits the session payload carried by the Activity's launch Intent.
+  final Stream<Map<String, dynamic>>? overlayApproveStream;
+
   @override
   State<ApprovalScreen> createState() => _ApprovalScreenState();
 }
 
-class _ApprovalScreenState extends State<ApprovalScreen> {
+class _ApprovalScreenState extends State<ApprovalScreen>
+    with WidgetsBindingObserver {
+  /// Native launch EventChannel replaying the overlay-APPROVE payload
+  /// (see OverlayLaunchBridge.kt). Replaced by the injected seam in tests.
+  static const EventChannel _overlayApproveEvents =
+      EventChannel('com.phonefprint.auth/launch_events');
+
+  // In production the UI engine never dials: the foreground service's
+  // headless engine owns every socket, and this facade rides the
+  // cross-engine bridge (pending stream + decision RPC) instead.
   late final ConnectionManager _manager =
       widget.manager ??
-      ConnectionManager(keyStore: widget.keyStore, identity: widget.identity);
+      ServiceLinkManager(keyStore: widget.keyStore, identity: widget.identity);
 
   final LocalAuthentication _auth = LocalAuthentication();
 
   StreamSubscription<PendingSession>? _pendingSub;
   StreamSubscription<DecisionResult>? _decisionsSub;
   StreamSubscription<String>? _unregisteredSub;
+  StreamSubscription<Map<String, dynamic>>? _overlayApproveSub;
   Timer? _ticker;
 
   bool _disposed = false;
   bool _busy = false;
+
+  /// Overlay APPROVE taps waiting for their card: the card is delivered by
+  /// the bridge snapshot replay after this Activity's engine attaches, so
+  /// the biometric prompt fires exactly once, only once the bridge is up.
+  final List<_OverlayApproveRequest> _overlayApproves =
+      <_OverlayApproveRequest>[];
+
+  /// The persisted approval-sound preference, read once at init; defaults
+  /// to on while the load is in flight.
+  bool _soundEnabled = true;
   String _status = 'Listening for requests…';
   final List<_RequestCard> _cards = <_RequestCard>[];
 
   @override
   void initState() {
     super.initState();
+    // Observe the app lifecycle so the bridge can detach on backgrounding:
+    // the registered `phonefprint.ui` port is the service engine's
+    // "UI foregrounded" signal, and it must vanish when this screen is no
+    // longer resumed or the background alert (overlay + notification) never
+    // fires for a request pushed after the app was once opened.
+    WidgetsBinding.instance.addObserver(this);
     _pendingSub = _manager.pending().listen(_onPending);
     _decisionsSub = _manager.decisions().listen(_onDecisionResult);
     _unregisteredSub = _manager.unregistered().listen(_onUnregistered);
+    _overlayApproveSub = (widget.overlayApproveStream ??
+            _overlayApproveEvents
+                .receiveBroadcastStream()
+                .map((dynamic event) =>
+                    Map<String, dynamic>.from(event as Map)))
+        .listen(_onOverlayApprove);
     _ticker = Timer.periodic(const Duration(seconds: 1), _tick);
     unawaited(_manager.start());
+    widget.keyStore.loadSoundEnabled().then((enabled) {
+      _soundEnabled = enabled;
+    });
   }
 
   @override
   void dispose() {
     _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     _ticker?.cancel();
     unawaited(_pendingSub?.cancel());
     unawaited(_decisionsSub?.cancel());
     unawaited(_unregisteredSub?.cancel());
+    unawaited(_overlayApproveSub?.cancel());
     unawaited(_manager.dispose());
     super.dispose();
+  }
+
+  /// Keeps the bridge's foreground claim in sync with the app lifecycle.
+  /// Only real backgrounding (paused, hidden, or detached) unregisters the
+  /// UI port `phonefprint.ui`, so the service engine's `_sendToUi` reports
+  /// "backgrounded" and a pushed request fires the overlay + notification
+  /// alert. A transient [AppLifecycleState.inactive] — Android sends it on
+  /// every Activity pause, e.g. while the BiometricPrompt system dialog is
+  /// up — must NOT detach, or the post-decision RPC dies mid-approve with
+  /// "ui bridge not attached". On resume/inactive the port is re-registered
+  /// and the pending snapshot replayed (task 15/16).
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final manager = _manager;
+    if (manager is ServiceLinkManager) {
+      final foreground = state == AppLifecycleState.resumed ||
+          state == AppLifecycleState.inactive;
+      unawaited(manager.setForeground(foreground));
+    }
   }
 
   void _onPending(PendingSession session) {
@@ -100,12 +172,20 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
     final card = _RequestCard(session);
     setState(() {
       _cards.add(card);
-      _status = 'Request pending — approve or deny.';
+      _status =
+          'Request pending — review reason/command, then approve or deny.';
     });
-    // Pop the biometric prompt immediately, so a request is approved with a
-    // single fingerprint scan instead of a tap on APPROVE first.
-    unawaited(_approve(card));
+    // One alert per request; _onPending is deduped by session id above.
+    if (_soundEnabled) unawaited(_playAlert());
+    // The card is shown first; the biometric prompt fires only when the user
+    // taps APPROVE (see _RequestCardView.onApprove). The one exception is an
+    // overlay APPROVE tap that landed while the UI was detached (task 12):
+    // its card arrives here via the snapshot replay, so try to match it.
+    _drainOverlayApproves();
   }
+
+  Future<void> _playAlert() =>
+      widget.playSound?.call() ?? SystemSound.play(SystemSoundType.alert);
 
   void _onDecisionResult(DecisionResult result) {
     if (_disposed) return;
@@ -168,6 +248,7 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
 
   void _tick(Timer _) {
     if (_disposed) return;
+    _overlayApproves.removeWhere((r) => r.expiry.isBefore(DateTime.now()));
     setState(() {
       for (final card in _cards) {
         if (!card.expired) {
@@ -195,6 +276,64 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
         .showSnackBar(SnackBar(content: Text(message)));
   }
 
+  /// An overlay APPROVE tap landed: the overlay launched this Activity with
+  /// the session payload (task 12). Record the request and approve its card
+  /// once the bridge snapshot replay delivers it — the prompt must fire
+  /// exactly once and only after the bridge is attached.
+  void _onOverlayApprove(Map<String, dynamic> payload) {
+    if (_disposed) return;
+    final id = payload['id'] as String?;
+    if (id == null) return;
+    final source = payload['source'] as String?;
+    final expiresAt = payload['expiresAt'];
+    final expiry = expiresAt is int
+        ? DateTime.fromMillisecondsSinceEpoch(expiresAt)
+        : DateTime.now().add(const Duration(seconds: 60));
+    // Idempotent: a replayed payload replaces the pending marker.
+    _overlayApproves.removeWhere((r) => r.id == id && r.source == source);
+    _overlayApproves
+        .add(_OverlayApproveRequest(id: id, source: source, expiry: expiry));
+    _drainOverlayApproves();
+  }
+
+  /// Runs the first overlay-APPROVE request whose card has arrived. Waits
+  /// while another approval is in flight (the biometric prompt must never
+  /// run twice at once); expired markers without a card are dropped.
+  void _drainOverlayApproves() {
+    if (_disposed || _busy) return;
+    _overlayApproves.removeWhere((r) => r.expiry.isBefore(DateTime.now()));
+    for (final request in _overlayApproves.toList()) {
+      _RequestCard? match;
+      for (final card in _cards) {
+        if (card.session.id == request.id &&
+            card.session.source == request.source) {
+          match = card;
+          break;
+        }
+      }
+      if (match == null) continue;
+      _overlayApproves.remove(request);
+      unawaited(_approveFromOverlay(match));
+      break;
+    }
+  }
+
+  /// Approve triggered by an overlay APPROVE tap: runs the shared `_approve`
+  /// flow (biometric + signed decision) and then makes sure the native
+  /// overlay is hidden (idempotent; the overlay already hid itself on tap).
+  Future<void> _approveFromOverlay(_RequestCard card) async {
+    await _approve(card);
+    final manager = _manager;
+    if (manager is ServiceLinkManager) {
+      try {
+        await manager.hideOverlay();
+      } catch (_) {
+        // The overlay hid itself when the Activity launched; this is
+        // belt-and-braces, so a failed RPC is not a decision failure.
+      }
+    }
+  }
+
   Future<void> _approve(_RequestCard card) async {
     if (_busy || card.expired) return;
     _busy = true;
@@ -214,6 +353,8 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
       setState(() => _status = 'Biometric error: $e');
     } finally {
       _busy = false;
+      // A queued overlay APPROVE may now run (task 12).
+      _drainOverlayApproves();
     }
   }
 
@@ -260,59 +401,53 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
       } else {
         setState(() => _status = 'Daemon rejected decision (${result.error}).');
       }
-    } catch (_) {
+    } catch (e) {
       if (_disposed) return;
-      // The card stays in-flight; the client re-posts the decision idempotently
-      // on reconnect so the verdict is not lost.
-      setState(() => _status = 'Sending… will retry on reconnect.');
+      // The card stays in-flight, so the user can tap APPROVE again to retry.
+      // Surface the real error: a swallowed "will retry on reconnect" hid the
+      // "ui bridge not attached" failure that silently dropped decisions.
+      setState(() => _status = 'Send failed: $e');
     }
   }
 
-  void _showMenu() {
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.computer),
-              title: Text(
-                'Paired computers (${widget.roster.length})',
-                style: Theme.of(ctx).textTheme.labelLarge,
-              ),
-            ),
-            for (final computer in widget.roster)
-              ListTile(
-                leading: const Icon(Icons.link_off),
-                title: Text('Forget ${computer.name}'),
-                subtitle: Text(
-                  computer.fingerprint,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _forget(computer);
-                },
-              ),
-            const Divider(),
-            ListTile(
-              leading: const Icon(Icons.delete_forever,
-                  color: Color(0xFFF0B4B4)),
-              title: const Text(
-                'Reset identity',
-                style: TextStyle(color: Color(0xFFF0B4B4)),
-              ),
-              subtitle: const Text('Delete this phone\'s key and all pairings'),
-              onTap: () {
-                Navigator.pop(ctx);
-                widget.onReset();
-              },
-            ),
-          ],
+  Future<void> _openSettings() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsScreen(
+          keyStore: widget.keyStore,
+          roster: widget.roster,
+          onForget: _forget,
+          onReset: _resetIdentity,
         ),
       ),
     );
+    // The sound preference is read once at init; the settings page may have
+    // toggled it, so reload it on return (task 21) or a pending request
+    // would keep playing the stale value until this screen is recreated.
+    if (!mounted || _disposed) return;
+    final enabled = await widget.keyStore.loadSoundEnabled();
+    if (!mounted || _disposed) return;
+    setState(() => _soundEnabled = enabled);
+  }
+
+  /// Full identity reset, wired through the settings page (task 21). Order
+  /// matters: wipe the identity storage FIRST so the service engine's
+  /// re-bootstrap (kicked off by the reset RPC below) can never re-load the
+  /// deleted identity, then ask the service to dispose its stale link
+  /// manager and re-bootstrap; its loop waits until the user re-pairs.
+  Future<void> _resetIdentity() async {
+    await widget.onReset();
+    final manager = _manager;
+    if (manager is ServiceLinkManager) {
+      try {
+        await manager.resetLink();
+      } catch (e) {
+        // The screen may already be unmounting (the reset swaps the home to
+        // the pairing screen and detaches the bridge); the RPC itself was
+        // sent before the detach, so this is not a reset failure.
+        debugPrint('phone-fprint-auth: reset link failed: $e');
+      }
+    }
   }
 
   void _forget(RosterComputer computer) {
@@ -334,9 +469,14 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
         title: const Text('PHONE FPRINT AUTH'),
         actions: [
           IconButton(
+            tooltip: 'Clear all requests',
+            icon: const Icon(Icons.close),
+            onPressed: () => _removeCardsWhere((_) => true),
+          ),
+          IconButton(
             tooltip: 'Settings',
             icon: const Icon(Icons.settings),
-            onPressed: _showMenu,
+            onPressed: _openSettings,
           ),
         ],
       ),
@@ -368,11 +508,16 @@ class _ApprovalScreenState extends State<ApprovalScreen> {
                     : ListView(
                         children: [
                           for (final card in _cards)
-                            _RequestCardView(
-                              card: card,
-                              busy: _busy,
-                              onApprove: () => _approve(card),
-                              onDeny: () => _deny(card),
+                            Dismissible(
+                              key: ValueKey(
+                                  '${card.session.id}:${card.session.source}'),
+                              onDismissed: (_) => _removeCard(card),
+                              child: _RequestCardView(
+                                card: card,
+                                busy: _busy,
+                                onApprove: () => _approve(card),
+                                onDeny: () => _deny(card),
+                              ),
                             ),
                         ],
                       ),
@@ -422,6 +567,20 @@ class _RequestCard {
   Duration remaining = Duration.zero;
 
   bool get expired => remaining <= Duration.zero;
+}
+
+/// An overlay APPROVE tap (task 12) awaiting its card: the card is delivered
+/// by the bridge snapshot replay, so the prompt runs only once it exists.
+class _OverlayApproveRequest {
+  _OverlayApproveRequest({
+    required this.id,
+    required this.source,
+    required this.expiry,
+  });
+
+  final String id;
+  final String? source;
+  final DateTime expiry;
 }
 
 class _RequestCardView extends StatelessWidget {
@@ -486,6 +645,10 @@ class _RequestCardView extends StatelessWidget {
             _row(theme, 'USER', session.user),
             _row(theme, 'SERVICE', session.service),
             _row(theme, 'TTY', session.tty.isEmpty ? '(none)' : session.tty),
+            if (session.reason.isNotEmpty)
+              _row(theme, 'REASON', session.reason),
+            if (session.command.isNotEmpty)
+              _row(theme, 'COMMAND', session.command),
             _row(theme, 'SESSION', session.id),
             const SizedBox(height: 12),
             Row(

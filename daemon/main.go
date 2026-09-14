@@ -184,10 +184,12 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request, store *Store, k
 		User    string `json:"user"`
 		Service string `json:"service"`
 		TTY     string `json:"tty"`
+		Reason  string `json:"reason"`
+		Command string `json:"command"`
 	}
 	// All fields optional; a missing/empty/malformed body falls back to "".
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	s, err := store.Create(req.User, req.Service, req.TTY)
+	s, err := store.Create(req.User, req.Service, req.TTY, req.Reason, req.Command)
 	if err != nil {
 		if errors.Is(err, errStoreFull) {
 			audit("session-store-full", "max", strconv.Itoa(maxSessions))

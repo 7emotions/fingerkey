@@ -30,7 +30,9 @@ const (
 	StatusExpired  = "expired"
 )
 
-// Session is one pending approval request.
+// Session is one pending approval request. Reason and Command are the
+// agent-supplied, display-only context pushed to the phone; they are not
+// signed and never audit-logged.
 type Session struct {
 	ID        string
 	Nonce     []byte
@@ -38,6 +40,8 @@ type Session struct {
 	User      string
 	Service   string
 	TTY       string
+	Reason    string
+	Command   string
 	CreatedAt time.Time
 	ExpiresAt time.Time
 	DecidedBy string
@@ -70,10 +74,12 @@ func NewStore() *Store {
 }
 
 // Create generates a new pending session with a random 128-bit id (hex
-// encoded) and a random 32-byte nonce. Expired sessions are evicted first;
-// at maxSessions the oldest terminal session is evicted to make room; with
-// no evictable terminal session Create returns errStoreFull.
-func (st *Store) Create(user, service, tty string) (*Session, error) {
+// encoded) and a random 32-byte nonce. reason and command are display-only
+// context; they are stored verbatim and neither signed nor audit-logged.
+// Expired sessions are evicted first; at maxSessions the oldest terminal
+// session is evicted to make room; with no evictable terminal session Create
+// returns errStoreFull.
+func (st *Store) Create(user, service, tty, reason, command string) (*Session, error) {
 	id, err := randomHex(16)
 	if err != nil {
 		return nil, err
@@ -90,6 +96,8 @@ func (st *Store) Create(user, service, tty string) (*Session, error) {
 		User:      user,
 		Service:   service,
 		TTY:       tty,
+		Reason:    reason,
+		Command:   command,
 		CreatedAt: now,
 		ExpiresAt: now.Add(sessionTTL),
 	}

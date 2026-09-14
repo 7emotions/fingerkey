@@ -24,6 +24,8 @@ class PendingSession {
     required this.user,
     required this.service,
     required this.tty,
+    this.reason = '',
+    this.command = '',
     required this.expiresAt,
     this.source,
     this.sourceName,
@@ -31,7 +33,7 @@ class PendingSession {
 
   /// Parses a daemon→phone `pending` frame
   /// (`{"type":"pending","id":...,"nonce":...,"user":...,"service":...,
-  /// "tty":...,"expires_at":...}`).
+  /// "tty":...,"reason":...,"command":...,"expires_at":...}`).
   factory PendingSession.fromFrameJson(
     Map<String, dynamic> json, {
     String? source,
@@ -44,6 +46,8 @@ class PendingSession {
         user: json['user'] as String? ?? '',
         service: json['service'] as String? ?? '',
         tty: json['tty'] as String? ?? '',
+        reason: json['reason'] as String? ?? '',
+        command: json['command'] as String? ?? '',
         expiresAt: _unixSeconds(json['expires_at']),
         source: source,
         sourceName: sourceName,
@@ -55,6 +59,13 @@ class PendingSession {
   final String service;
   final String tty;
 
+  /// Agent-supplied justification (untrusted, self-reported); '' when the
+  /// daemon omitted it.
+  final String reason;
+
+  /// The objective command line the daemon captured; '' when omitted.
+  final String command;
+
   /// Absolute deadline, from the daemon's `expires_at` (unix seconds).
   final DateTime expiresAt;
 
@@ -64,6 +75,36 @@ class PendingSession {
 
   /// The source computer's display name (mirrors [source]).
   final String? sourceName;
+
+  /// Plain-JSON form for the cross-engine bridge (service engine → UI engine
+  /// and UI → service decision RPC); [nonce] travels as base64.
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'id': id,
+        'nonce': base64.encode(nonce),
+        'user': user,
+        'service': service,
+        'tty': tty,
+        'reason': reason,
+        'command': command,
+        'expiresAt': expiresAt.millisecondsSinceEpoch,
+        'source': source,
+        'sourceName': sourceName,
+      };
+
+  /// Inverse of [toJson]; used by the UI engine to replay bridged sessions.
+  factory PendingSession.fromJson(Map<String, dynamic> json) => PendingSession(
+        id: json['id'] as String,
+        nonce: base64.decode(json['nonce'] as String),
+        user: json['user'] as String? ?? '',
+        service: json['service'] as String? ?? '',
+        tty: json['tty'] as String? ?? '',
+        reason: json['reason'] as String? ?? '',
+        command: json['command'] as String? ?? '',
+        expiresAt:
+            DateTime.fromMillisecondsSinceEpoch(json['expiresAt'] as int),
+        source: json['source'] as String?,
+        sourceName: json['sourceName'] as String?,
+      );
 
   static DateTime _unixSeconds(dynamic v) {
     if (v is int) return DateTime.fromMillisecondsSinceEpoch(v * 1000);
@@ -99,11 +140,35 @@ class DecisionResult {
   /// Which roster computer this result came from (its TLS fingerprint).
   final String? source;
 
+  /// Plain-JSON form for the cross-engine bridge.
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'id': id,
+        'status': status,
+        'key': key,
+        'error': error,
+        'source': source,
+      };
+
+  /// Inverse of [toJson].
+  factory DecisionResult.fromJson(Map<String, dynamic> json) => DecisionResult(
+        id: json['id'] as String?,
+        status: json['status'] as String?,
+        key: json['key'] as String?,
+        error: json['error'] as String?,
+        source: json['source'] as String?,
+      );
+
   /// True when the daemon rejected the decision.
   bool get isError => error != null;
 
   /// True when the session expired before any decision landed.
   bool get isExpired => status == 'expired';
+
+  /// True when this result settles the session: the daemon accepted a
+  /// decision (`approved`/`denied`) or the session expired. Error results
+  /// leave the session pending, so its alerts are kept (task 21).
+  bool get isTerminal =>
+      status == 'approved' || status == 'denied' || status == 'expired';
 }
 
 /// The control frame answering [DaemonClient.connect]: whether the pubkey is

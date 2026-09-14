@@ -71,7 +71,7 @@ func TestSimSocketEndToEnd(t *testing.T) {
 		t.Fatalf("welcome = %+v, want registered key alice", welcome)
 	}
 
-	s, err := store.Create("alice", "sudo", "/dev/pts/0")
+	s, err := store.Create("alice", "sudo", "/dev/pts/0", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

@@ -9,6 +9,7 @@ library;
 import 'dart:convert';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 class DeviceIdentity {
@@ -49,6 +50,15 @@ class RosterComputer {
 class KeyStore {
   static const String _kPrivateKey = 'ed25519_private_key';
   static const String _kRoster = 'roster';
+  static const String _kSoundEnabled = 'sound_enabled';
+
+  /// Mirrors "is the roster non-empty" into a native-readable SharedPreferences
+  /// flag (task 13): the Android boot receiver cannot read
+  /// FlutterSecureStorage, so it reads this marker instead and only restarts
+  /// the foreground service when the app is configured. Handled natively by
+  /// KeepalivePrefs.kt on both engines.
+  static const MethodChannel _keepaliveChannel =
+      MethodChannel('com.phonefprint.auth/keepalive');
 
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
 
@@ -87,6 +97,12 @@ class KeyStore {
     } on FormatException {
       return <RosterComputer>[];
     }
+    // Self-heal the boot marker on READ (task 21): installs upgraded from an
+    // older version already hold a non-empty roster but never wrote the
+    // marker — it used to be mirrored only on roster WRITE — so their first
+    // reboot would skip the foreground service. Mirrored on every successful
+    // decode; fire-and-forget like every other [_syncConfiguredFlag] call.
+    _syncConfiguredFlag(decoded.isNotEmpty);
     return decoded
         .map((dynamic e) =>
             RosterComputer.fromJson(e as Map<String, dynamic>))
@@ -124,10 +140,25 @@ class KeyStore {
   }
 
   /// Deletes the Ed25519 private key AND clears the roster: a full identity
-  /// reset back to the pairing screen with a freshly generated key.
+  /// reset back to the pairing screen with a freshly generated key. The
+  /// approval-sound preference is kept — it is a user setting, not identity.
   Future<void> resetIdentity() async {
     await _storage.delete(key: _kRoster);
     await _storage.delete(key: _kPrivateKey);
+    _syncConfiguredFlag(false);
+  }
+
+  /// The approval-sound preference. Defaults to `true` when the key is
+  /// missing or holds anything other than the explicit off marker `'0'`
+  /// (a corrupt value falls back to on rather than silently muting).
+  Future<bool> loadSoundEnabled() async {
+    final raw = await _storage.read(key: _kSoundEnabled);
+    return raw != '0';
+  }
+
+  /// Persists the approval-sound preference as `'1'`/`'0'`.
+  Future<void> setSoundEnabled(bool enabled) async {
+    await _storage.write(key: _kSoundEnabled, value: enabled ? '1' : '0');
   }
 
   Future<void> _writeRoster(List<RosterComputer> roster) async {
@@ -137,5 +168,27 @@ class KeyStore {
         roster.map((c) => c.toJson()).toList(),
       ),
     );
+    _syncConfiguredFlag(roster.isNotEmpty);
+  }
+
+  /// Updates the native boot-receiver marker (see [_keepaliveChannel]).
+  ///
+  /// Fire-and-forget on purpose: the mirror must never block or break a
+  /// roster write, and under flutter_test's FakeAsync an unhandled channel
+  /// call never completes (the future hangs), so awaiting it here would
+  /// deadlock pairing in widget tests. Errors are swallowed because the
+  /// flag is self-correcting — every roster mutation rewrites it — and a
+  /// stale value is harmless: the service's Dart `_bootstrap` waits for the
+  /// identity instead of crashing, and the boot receiver is best-effort.
+  void _syncConfiguredFlag(bool configured) {
+    _keepaliveChannel
+        .invokeMethod<void>(
+          'setRosterConfigured',
+          <String, dynamic>{'configured': configured},
+        )
+        .catchError((Object e) {
+      // No native handler (tests / non-Android), no ServicesBinding (plain
+      // unit tests), or the channel not yet attached on a cold engine start.
+    });
   }
 }

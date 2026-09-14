@@ -106,7 +106,7 @@ func TestPhoneLinkPendingFrame(t *testing.T) {
 	kp := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 	phone := startPipePhoneLink(t, store, kp, pub)
 
-	s, err := store.Create("alice", "sudo", "/dev/pts/0")
+	s, err := store.Create("alice", "sudo", "/dev/pts/0", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestPhoneLinkDecision(t *testing.T) {
 			kp := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 			phone := startPipePhoneLink(t, store, kp, pub)
 
-			s, err := store.Create("alice", "sudo", "")
+			s, err := store.Create("alice", "sudo", "", "", "")
 			if err != nil {
 				t.Fatalf("Create: %v", err)
 			}
@@ -326,7 +326,7 @@ func TestPhoneLinkUnregistered(t *testing.T) {
 
 	// The link is closed right after: a session created now must produce no
 	// frame — the next read only ever sees the close.
-	if _, err := store.Create("alice", "sudo", ""); err != nil {
+	if _, err := store.Create("alice", "sudo", "", "", ""); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	phoneSide.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -360,7 +360,7 @@ func TestPhoneLinkUnregisteredNotCounted(t *testing.T) {
 		}
 	}
 
-	if _, err := store.Create("alice", "sudo", ""); err != nil {
+	if _, err := store.Create("alice", "sudo", "", "", ""); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if phoneConnected() {
@@ -472,7 +472,7 @@ func TestTwoLinksFirstComeFirstServed(t *testing.T) {
 	linkAlice := startPipePhoneLink(t, store, kp, pubAlice)
 	linkBob := startPipePhoneLink(t, store, kp, pubBob)
 
-	s, err := store.Create("alice", "sudo", "")
+	s, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -559,11 +559,11 @@ func TestWelcomeSnapshotPending(t *testing.T) {
 	pub, _ := newKey(t)
 	kp := newTestKeyProvider(t, map[string]ed25519.PublicKey{"alice": pub})
 
-	first, err := store.Create("alice", "sudo", "")
+	first, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	second, err := store.Create("bob", "su", "")
+	second, err := store.Create("bob", "su", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -581,7 +581,7 @@ func TestWelcomeSnapshotPending(t *testing.T) {
 		t.Errorf("welcome.Pending[0].expires_at = %d, want %d", w.Pending[0].ExpiresAt, first.ExpiresAt.Unix())
 	}
 
-	third, err := store.Create("carol", "pkexec", "")
+	third, err := store.Create("carol", "pkexec", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -611,7 +611,7 @@ func TestPushQueueDropOnFull(t *testing.T) {
 
 	// Prime the link: one session fully delivered proves the pusher and
 	// writer goroutines are draining.
-	if _, err := store.Create("alice", "sudo", ""); err != nil {
+	if _, err := store.Create("alice", "sudo", "", "", ""); err != nil {
 		t.Fatalf("prime Create: %v", err)
 	}
 	if _, err := readFrame(phone); err != nil {
@@ -623,7 +623,7 @@ func TestPushQueueDropOnFull(t *testing.T) {
 	// pusher drain the store channel between deliveries, so the overflow
 	// happens at the bounded queue — the audited seam.
 	for i := 0; i < 12; i++ {
-		if _, err := store.Create("alice", "sudo", ""); err != nil {
+		if _, err := store.Create("alice", "sudo", "", "", ""); err != nil {
 			t.Fatalf("Create #%d: %v", i, err)
 		}
 		time.Sleep(time.Millisecond)
@@ -671,7 +671,7 @@ func TestPhoneLinkUnregisteredNoDecisionResult(t *testing.T) {
 	// Registered link decides a session; the unregistered link must see
 	// nothing of it — only its own close.
 	linkAlice := startPipePhoneLink(t, store, kp, pubAlice)
-	s, err := store.Create("alice", "sudo", "")
+	s, err := store.Create("alice", "sudo", "", "", "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
