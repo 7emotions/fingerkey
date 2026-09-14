@@ -45,6 +45,12 @@
 #define FIELD_MAX   255
 #define ESC_BUF_SIZE (FIELD_MAX * 6 + 1)
 
+/* Worst-case JSON body: 5 fields, each at most ESC_BUF_SIZE-1 escaped
+ * chars, plus the {"user":"",...} boilerplate (~51 bytes). */
+#define BODY_BUF_SIZE (5 * ESC_BUF_SIZE + 128)
+/* HTTP request: header (~120 bytes) + the worst-case body. */
+#define REQ_BUF_SIZE  (BODY_BUF_SIZE + 256)
+
 /* Module argument `socket=<path>` overrides the default daemon socket. */
 static const char *socket_path = SOCKET_PATH;
 
@@ -180,7 +186,7 @@ static int http_exchange(const char *method, const char *path, const char *body,
 {
     int fd;
     int reqlen;
-    char req[8192];
+    char req[REQ_BUF_SIZE];
 
     if (body != NULL) {
         reqlen = snprintf(req, sizeof(req),
@@ -311,7 +317,7 @@ static int create_session(const char *user, const char *service, const char *tty
     char f_reason[FIELD_MAX + 1], f_command[FIELD_MAX + 1];
     char esc_user[ESC_BUF_SIZE], esc_service[ESC_BUF_SIZE], esc_tty[ESC_BUF_SIZE];
     char esc_reason[ESC_BUF_SIZE], esc_command[ESC_BUF_SIZE];
-    char body[4096];
+    char body[BODY_BUF_SIZE];
     char buf[RESP_BUF_SIZE];
     const char *reason;
     char *resp_body = NULL, *idp;

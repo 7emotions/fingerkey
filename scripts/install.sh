@@ -57,19 +57,40 @@ wire_pam_file() {
 # survives sudo's environment sanitization. The PAM module reads it as the
 # display-only reason text shown on the phone (untrusted, self-reported).
 # Idempotent; the drop-in is validated with visudo before it is kept.
+# A pre-existing drop-in is never overwritten: the line is appended so any
+# administrator directives in it are preserved.
 wire_sudoers() {
+    local created=0
+    local backup=""
+
     if [[ -e "${SUDOERS_DROPIN}" ]] && grep -q 'FINGERKEY_REASON' "${SUDOERS_DROPIN}"; then
         echo "sudoers: '${SUDOERS_LINE}' already present in ${SUDOERS_DROPIN} — skipping"
         return 0
     fi
-    ( umask 022; printf '%s\n' "${SUDOERS_LINE}" > "${SUDOERS_DROPIN}" )
+    if [[ ! -e "${SUDOERS_DROPIN}" ]]; then
+        ( umask 022; printf '%s\n' "${SUDOERS_LINE}" > "${SUDOERS_DROPIN}" )
+        created=1
+    else
+        backup="$(mktemp "${SUDOERS_DROPIN}.bak.XXXXXX")"
+        cp -p "${SUDOERS_DROPIN}" "${backup}"
+        printf '%s\n' "${SUDOERS_LINE}" >> "${SUDOERS_DROPIN}"
+    fi
     chmod 0440 "${SUDOERS_DROPIN}"
     if ! visudo -cf "${SUDOERS_DROPIN}" >/dev/null; then
         echo "error: sudoers drop-in ${SUDOERS_DROPIN} failed validation" >&2
-        rm -f "${SUDOERS_DROPIN}"
+        if [[ ${created} -eq 1 ]]; then
+            rm -f "${SUDOERS_DROPIN}"
+        else
+            mv -f "${backup}" "${SUDOERS_DROPIN}"
+        fi
         exit 1
     fi
-    echo "sudoers: wrote '${SUDOERS_LINE}' to ${SUDOERS_DROPIN}"
+    [[ -z "${backup}" ]] || rm -f "${backup}"
+    if [[ ${created} -eq 1 ]]; then
+        echo "sudoers: wrote '${SUDOERS_LINE}' to ${SUDOERS_DROPIN}"
+    else
+        echo "sudoers: appended '${SUDOERS_LINE}' to ${SUDOERS_DROPIN} (existing content preserved)"
+    fi
 }
 
 echo "== build =="

@@ -54,10 +54,23 @@ echo "removed ${DBUS_POLICY} + ${DBUS_POLICY_LEFTOVER}, reloaded dbus"
 
 echo "== sudoers =="
 # Undo the install-time env_keep drop-in; without it sudo sanitizes
-# FINGERKEY_REASON away and the phone shows an empty reason.
+# FINGERKEY_REASON away and the phone shows an empty reason. Only the
+# app's own line is stripped: any administrator directives in the drop-in
+# are kept, and the file is deleted only when nothing remains.
 if [[ -e "${SUDOERS_DROPIN}" ]]; then
-    rm -f "${SUDOERS_DROPIN}"
-    echo "removed ${SUDOERS_DROPIN}"
+    if grep -q 'FINGERKEY_REASON' "${SUDOERS_DROPIN}"; then
+        sed -i '/^Defaults[[:space:]]\+env_keep[[:space:]]*+=[[:space:]]*"FINGERKEY_REASON"[[:space:]]*$/d' "${SUDOERS_DROPIN}"
+    fi
+    if [[ -s "${SUDOERS_DROPIN}" ]]; then
+        if visudo -cf "${SUDOERS_DROPIN}" >/dev/null; then
+            echo "kept ${SUDOERS_DROPIN} (app line stripped, remaining content preserved)"
+        else
+            echo "warning: ${SUDOERS_DROPIN} failed visudo validation after strip — review manually" >&2
+        fi
+    else
+        rm -f "${SUDOERS_DROPIN}"
+        echo "removed ${SUDOERS_DROPIN} (empty after stripping app line)"
+    fi
 else
     echo "${SUDOERS_DROPIN} not present — nothing to remove"
 fi
@@ -131,6 +144,6 @@ echo "== rollback complete =="
 echo "  unit:     disabled + removed"
 echo "  binaries: ${DAEMON_BIN}, ${PAIR_BIN}, ${PAM_MODULE} removed"
 echo "  dbus:     ${DBUS_POLICY} + ${DBUS_POLICY_LEFTOVER} removed, dbus reloaded"
-echo "  sudoers:  ${SUDOERS_DROPIN} removed"
+echo "  sudoers:  app line stripped from ${SUDOERS_DROPIN} (file removed only if empty)"
 echo "  pam:      ${PAM_FILES[*]} restored from backup (or module line stripped)"
 echo "  state:    ${TLS_DIR} + ${KEYS_DIR} removed (${STATE_PARENT} left in place)"
